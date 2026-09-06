@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  woolwire:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: woolwire-app
+    # Default to 127.0.0.1:7070 for loopback isolation.
+    # Set WOOLWIRE_HOST_PORT=0.0.0.0:7070 (or edit directly) to allow LAN device access.
+    ports:
+      - "${WOOLWIRE_HOST_PORT:-127.0.0.1:7070}:7070"
+    volumes:
+      - woolwire_state:/state
+      - woolwire_models:/models
+    environment:
+      - WOOLWIRE_STATE_DIR=/state
+      - WOOLWIRE_LISTEN=0.0.0.0:7070
+      - WOOLWIRE_MODELS_DIR=/models
+      - WOOLWIRE_RUNNER_URL=http://woolwire-runner:8080
+      - WOOLWIRE_RUNNER_TOKEN=managed-runner-private-token-123
+    networks:
+      - woolwire_internal
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8192M
+    user: "1000:1000"
+
+  runner:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.runner
+    container_name: woolwire-runner
+    restart: unless-stopped
+    # No ports exposed to host or internet - private internal network only!
+    volumes:
+      # Read-only mount of model weights
+      - woolwire_models:/models:ro
+    environment:
+      - RUNNER_TOKEN=managed-runner-private-token-123
+      - MODELS_DIR=/models
+    networks:
+      - woolwire_internal
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8192M
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    user: "1000:1000"
+
+networks:
+  woolwire_internal:
+    internal: true
+
+volumes:
+  woolwire_state:
+  woolwire_models:

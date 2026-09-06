@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  woolwire:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: woolwire-app
+    # Default to 127.0.0.1:7070 for loopback isolation.
+    # Set WOOLWIRE_HOST_PORT=0.0.0.0:7070 (or edit directly) to allow LAN device access.
+    # Note: If connecting to LLM servers running directly on the host (e.g., Unsloth, Ollama, LM Studio on 127.0.0.1),
+    # uncomment 'network_mode: host' (and comment out 'ports:').
+    # network_mode: host
+    ports:
+      - "${WOOLWIRE_HOST_PORT:-127.0.0.1:7070}:7070"
+    volumes:
+      - woolwire_state:/state
+    environment:
+      - WOOLWIRE_STATE_DIR=/state
+      - WOOLWIRE_LISTEN=0.0.0.0:7070
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    user: "1000:1000"
+
+volumes:
+  woolwire_state:

@@ -1,0 +1,21 @@
+# Build runner controller binary
+FROM golang:1.27-alpine AS runner-builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/bin/woolwire-runner ./cmd/woolwire-runner
+
+# Pinned llama.cpp server runtime image
+FROM ghcr.io/ggml-org/llama.cpp:server
+WORKDIR /app
+
+COPY --from=runner-builder /app/bin/woolwire-runner /usr/local/bin/woolwire-runner
+
+ENV MODELS_DIR=/models
+ENV RUNNER_TOKEN=""
+ENV ENGINE_PATH=/app/llama-server
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/woolwire-runner"]
+CMD ["-listen", "0.0.0.0:8080", "-models", "/models", "-engine-path", "/app/llama-server"]

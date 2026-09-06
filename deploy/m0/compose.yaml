@@ -1,0 +1,92 @@
+services:
+  room:
+    build:
+      context: ../..
+      dockerfile: deploy/m0/Dockerfile
+    command:
+      - room
+      - --state
+      - /state/room.json
+      - --room-id
+      - m0-compose-room
+      - --invitation
+      - /shared/invitation.code
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - room-state:/state
+      - invitation-share:/shared
+    networks:
+      - room-egress
+
+  member-a:
+    build:
+      context: ../..
+      dockerfile: deploy/m0/Dockerfile
+    command:
+      - client
+      - --invitation
+      - /shared/invitation.code
+      - --state
+      - /state/client.json
+      - --count
+      - "3"
+      - --message
+      - compose-member-a
+    restart: on-failure
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - member-a-state:/state
+      - invitation-share:/shared:ro
+    networks:
+      - member-a-egress
+
+  member-b:
+    build:
+      context: ../..
+      dockerfile: deploy/m0/Dockerfile
+    command:
+      - client
+      - --invitation
+      - /shared/invitation.code
+      - --state
+      - /state/client.json
+      - --count
+      - "3"
+      - --message
+      - compose-member-b
+    restart: on-failure
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - member-b-state:/state
+      - invitation-share:/shared:ro
+    networks:
+      - member-b-egress
+
+volumes:
+  room-state:
+  member-a-state:
+  member-b-state:
+  invitation-share:
+
+networks:
+  room-egress:
+  member-a-egress:
+  member-b-egress:

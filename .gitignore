@@ -1,0 +1,20 @@
+# Binaries
+/woolwire
+bin/
+*.exe
+*.test
+
+# State and databases
+state/
+data/
+*.db
+*.db-journal
+*.db-wal
+
+# Node dependencies
+web/node_modules/
+web/.vite/
+
+# Tool memory
+.codebase-memory/
+

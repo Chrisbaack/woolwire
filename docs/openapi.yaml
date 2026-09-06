@@ -1,0 +1,250 @@
+openapi: 3.1.0
+info:
+  title: Woolwire API
+  description: HTTP API specification for Woolwire local owner, room creator, bootstrap, and peer interfaces.
+  version: 1.0.0
+
+servers:
+  - url: http://127.0.0.1:7070
+    description: Local owner interface
+
+paths:
+  # Local Owner API
+  /api/v1/setup:
+    post:
+      summary: Exchange one-time setup token for session cookie
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+      responses:
+        '200':
+          description: Session established
+        '401':
+          description: Invalid setup token
+
+  /api/v1/state:
+    get:
+      summary: Get current local installation and room state
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configured:
+                    type: boolean
+                  display_name:
+                    type: string
+                  device_public:
+                    type: string
+                  room:
+                    type: object
+                    nullable: true
+                    properties:
+                      room_id:
+                        type: string
+                      room_name:
+                        type: string
+                      role:
+                        type: string
+                        enum: [creator, member]
+                      invitation_code:
+                        type: string
+                      approval_mode:
+                        type: boolean
+
+  /api/v1/profile:
+    post:
+      summary: Update display name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name]
+              properties:
+                display_name:
+                  type: string
+      responses:
+        '200':
+          description: Profile updated
+
+  /api/v1/room/host:
+    post:
+      summary: Host / create a new room
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_name]
+              properties:
+                room_name:
+                  type: string
+      responses:
+        '200':
+          description: Room created
+
+  /api/v1/room/join:
+    post:
+      summary: Join an existing room using invitation code
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invitation_code]
+              properties:
+                invitation_code:
+                  type: string
+      responses:
+        '200':
+          description: Room joined
+        '400':
+          description: Invalid code format
+        '403':
+          description: Admission rejected
+
+  /api/v1/room/leave:
+    post:
+      summary: Leave current room
+      responses:
+        '200':
+          description: Left room
+
+  # Room Admin API (Creator only)
+  /api/v1/room-admin/invitation/rotate:
+    post:
+      summary: Rotate active room invitation code
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invitation_code:
+                    type: string
+
+  /api/v1/room-admin/members:
+    get:
+      summary: List all room members
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    member_id:
+                      type: string
+                    display_name:
+                      type: string
+                    device_public:
+                      type: string
+                    status:
+                      type: string
+                      enum: [admitted, pending, removed]
+
+  /api/v1/room-admin/members/{id}/remove:
+    post:
+      summary: Remove a member from the room
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rotate_invitation:
+                  type: boolean
+                  default: true
+      responses:
+        '200':
+          description: Member removed
+
+  # Bootstrap API (Peer transport listener)
+  /bootstrap/v1/join:
+    post:
+      summary: Submit join request to room creator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_id, invitation_id, admission_secret, device_public, display_name, tailcat_addr]
+              properties:
+                room_id:
+                  type: string
+                invitation_id:
+                  type: string
+                admission_secret:
+                  type: string
+                device_public:
+                  type: string
+                display_name:
+                  type: string
+                tailcat_addr:
+                  type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [admitted, pending, rejected]
+                  membership:
+                    type: object
+                  roster:
+                    type: array
+                    items:
+                      type: object
+
+  # Peer API (Peer transport listener)
+  /peer/v1/membership/sync:
+    post:
+      summary: Exchange membership updates with a peer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                known_version:
+                  type: integer
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  roster_version:
+                    type: integer
+                  members:
+                    type: array
+                    items:
+                      type: object

@@ -1,0 +1,32 @@
+flowchart TB
+    subgraph local["Your installation"]
+        UI["Local web UI: Dashboard / My chats / Community / Settings"]
+        ADMIN["Room administration — creator only"]
+        APP["Go app: local API, peer authorization, catalog, queue, sync"]
+        DB[("SQLite + protected identity files")]
+        TC["Embedded Tailcat transport"]
+        UI --> APP
+        ADMIN --> APP
+        APP --> DB
+        APP --> TC
+    end
+    subgraph hosting["Optional model hosting on your machine"]
+        RUN["Isolated runner container: controller + llama.cpp"]
+        EXT["Owner-configured external inference endpoint"]
+    end
+    subgraph remote["Each friend's independent installation"]
+        PEER["Tailcat + authenticated peer API"]
+        THEIRUI["Their UI, personal chats, settings and database"]
+        THEIRMODEL["Their optional model hosting"]
+        THEIRUI --> PEER
+        PEER --> THEIRMODEL
+    end
+    APP -->|"Private inference/control API; no Docker socket"| RUN
+    APP -->|"Allowlisted inference routes"| EXT
+    TC <-->|"Encrypted direct connection when possible"| PEER
+    RELAY["DERP: rendezvous and encrypted relay fallback"]
+    TC -.-> RELAY
+    RELAY -.-> PEER
+    NOTE["Shared: presence, model ads, community, membership, receipts.
+Local: personal conversations, secrets and settings.
+Creator: admission and signed membership changes; not inference routing."]
