@@ -2,12 +2,10 @@ package localapi
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -16,8 +14,13 @@ import (
 	"github.com/cbaack/woolwire/internal/contributions"
 	"github.com/cbaack/woolwire/internal/hosting"
 	"github.com/cbaack/woolwire/internal/peerapi"
+	"github.com/cbaack/woolwire/internal/sse"
 	"github.com/cbaack/woolwire/internal/store"
 )
+
+// maxNoSaveTurns bounds the in-memory transcript of a privacy-mode chat so a
+// long session cannot grow without limit. Older turns fall off the front.
+const maxNoSaveTurns = 100
 
 func (s *Server) handleListChats(w http.ResponseWriter, r *http.Request) {
 	convs, err := s.store.ListConversations()
@@ -103,9 +106,36 @@ func (s *Server) handleDeleteChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to delete conversation", http.StatusInternalServerError)
 		return
 	}
+	s.forgetNoSaveTurns(id)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+// noSaveHistory returns the in-memory transcript for a privacy-mode chat.
+// Keeping it here is what lets no-save conversations stay multi-turn: sending
+// only the current turn made privacy mode also mean "the model forgets
+// everything you just said".
+func (s *Server) noSaveHistory(convID string) []hosting.ChatMessage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]hosting.ChatMessage(nil), s.noSaveTurns[convID]...)
+}
+
+func (s *Server) appendNoSaveTurn(convID string, msgs ...hosting.ChatMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	turns := append(s.noSaveTurns[convID], msgs...)
+	if len(turns) > maxNoSaveTurns {
+		turns = append([]hosting.ChatMessage(nil), turns[len(turns)-maxNoSaveTurns:]...)
+	}
+	s.noSaveTurns[convID] = turns
+}
+
+func (s *Server) forgetNoSaveTurns(convID string) {
+	s.mu.Lock()
+	delete(s.noSaveTurns, convID)
+	s.mu.Unlock()
 }
 
 func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
@@ -149,53 +179,44 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "device identity missing", http.StatusInternalServerError)
 		return
 	}
-	myMemberID := "m-" + device.DevicePublic[:16]
+	myMemberID, err := peerapi.MemberIDForDevicePublic(device.DevicePublic)
+	if err != nil {
+		http.Error(w, "device identity is malformed", http.StatusInternalServerError)
+		return
+	}
 
-	// Save user message locally (if not no_save mode)
 	now := time.Now().Unix()
 	userMsgIDBytes := make([]byte, 8)
 	_, _ = rand.Read(userMsgIDBytes)
 	userMsgID := "msg-" + hex.EncodeToString(userMsgIDBytes)
 
-	userMsg := store.MessageRecord{
-		ID:             userMsgID,
-		ConversationID: convID,
-		Role:           "user",
-		Content:        body.Content,
-		HostMemberID:   body.HostMemberID,
-		ModelID:        body.ModelID,
-		CreatedAt:      now,
-	}
+	userTurn := hosting.ChatMessage{Role: "user", Content: body.Content}
 
-	if !conv.NoSave {
-		_ = s.store.SaveMessage(userMsg)
-	}
-
-	// Build context from past messages
 	var chatMsgs []hosting.ChatMessage
-	if !conv.NoSave {
+	if conv.NoSave {
+		chatMsgs = append(s.noSaveHistory(convID), userTurn)
+	} else {
+		_ = s.store.SaveMessage(store.MessageRecord{
+			ID:             userMsgID,
+			ConversationID: convID,
+			Role:           "user",
+			Content:        body.Content,
+			HostMemberID:   body.HostMemberID,
+			ModelID:        body.ModelID,
+			CreatedAt:      now,
+		})
 		pastMsgs, _ := s.store.ListMessages(convID)
 		for _, m := range pastMsgs {
-			chatMsgs = append(chatMsgs, hosting.ChatMessage{
-				Role:    m.Role,
-				Content: m.Content,
-			})
+			chatMsgs = append(chatMsgs, hosting.ChatMessage{Role: m.Role, Content: m.Content})
 		}
-	} else {
-		chatMsgs = append(chatMsgs, hosting.ChatMessage{
-			Role:    "user",
-			Content: body.Content,
-		})
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	stream, err := sse.New(w)
+	if err != nil {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	defer stream.Stop()
 
 	reqIDBytes := make([]byte, 8)
 	_, _ = rand.Read(reqIDBytes)
@@ -204,164 +225,93 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	var assistantContent strings.Builder
 	var streamInterrupted bool
 
+	emit := func(delta string) error {
+		assistantContent.WriteString(delta)
+		return stream.SendJSON("", map[string]string{
+			"delta":      delta,
+			"request_id": requestID,
+		})
+	}
+
 	if body.HostMemberID == myMemberID {
-		// Host is local self
 		localModel, mErr := s.store.GetHostedModel(body.ModelID)
 		if mErr != nil || !localModel.Enabled || !localModel.Published {
 			http.Error(w, "model not available locally", http.StatusServiceUnavailable)
 			return
 		}
 
-		err = s.adapter.StreamChat(
-			r.Context(),
-			localModel.EndpointURL,
-			localModel.APIKey,
-			localModel.ID,
-			chatMsgs,
-			func(delta string) error {
-				assistantContent.WriteString(delta)
-				chunkJSON, _ := json.Marshal(map[string]string{
-					"delta":      delta,
-					"request_id": requestID,
-				})
-				_, writeErr := fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
-				if writeErr != nil {
-					return writeErr
-				}
-				flusher.Flush()
-				return nil
-			},
-		)
+		// Local requests go through the same fair queue as remote ones so the
+		// owner's own usage is visible to the limits and to the queue estimate
+		// peers see in the catalog.
+		err = s.infer.Execute(r.Context(), myMemberID, requestID, localModel, chatMsgs, emit)
 		if err != nil {
 			streamInterrupted = true
-			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-			_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(errJSON))
-			flusher.Flush()
+			_ = stream.SendJSON("error", map[string]string{"error": err.Error()})
 		} else {
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			_ = stream.SendRaw("data: [DONE]\n\n")
 		}
 	} else {
-		// Host is remote peer
-		peerAddrs, _ := s.store.ListPeerAddresses()
-		var targetAddr string
-		for _, pa := range peerAddrs {
-			if pa.MemberID == body.HostMemberID {
-				targetAddr = pa.TailcatAddr
-				break
-			}
-		}
-
+		targetAddr := s.peerAddress(body.HostMemberID)
 		if targetAddr == "" {
 			http.Error(w, "host address unknown", http.StatusServiceUnavailable)
 			return
 		}
 
-		conn, dialErr := s.trans.Dial(r.Context(), targetAddr, s.peerPort)
+		// Learn about removals before handing a peer a conversation: a host
+		// removed since the last poll must not receive this prompt.
+		s.SyncMembership(r.Context())
+
+		conn, dialErr := s.dialPeer(r.Context(), body.HostMemberID, targetAddr)
 		if dialErr != nil {
-			http.Error(w, fmt.Sprintf("failed to connect to host: %v", dialErr), http.StatusServiceUnavailable)
+			http.Error(w, "failed to connect to host: "+dialErr.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		defer conn.Close()
 
 		inferReq := peerapi.InferenceRequest{
 			RequestID: requestID,
-			MemberID:  myMemberID,
 			ModelID:   body.ModelID,
 			Messages:  chatMsgs,
 		}
-		reqBytes, _ := json.Marshal(inferReq)
-
-		httpReq, reqErr := http.NewRequestWithContext(r.Context(), "POST", "http://woolwire-peer/peer/v1/inference", bytes.NewReader(reqBytes))
+		resp, reqErr := peerRoundTrip(r.Context(), conn, "POST", "/peer/v1/inference", inferReq)
 		if reqErr != nil {
-			http.Error(w, reqErr.Error(), http.StatusInternalServerError)
-			return
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-
-		if writeErr := httpReq.Write(conn); writeErr != nil {
-			http.Error(w, fmt.Sprintf("failed to send request to host: %v", writeErr), http.StatusBadGateway)
-			return
-		}
-
-		resp, respErr := http.ReadResponse(bufio.NewReader(conn), httpReq)
-		if respErr != nil {
-			http.Error(w, fmt.Sprintf("failed to read response from host: %v", respErr), http.StatusBadGateway)
+			http.Error(w, reqErr.Error(), http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			b, _ := io.ReadAll(resp.Body)
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			http.Error(w, string(b), resp.StatusCode)
 			return
 		}
 
-		// Stream SSE from remote peer to client
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "data: ") {
-				payload := strings.TrimPrefix(line, "data: ")
-				if payload == "[DONE]" {
-					_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-					flusher.Flush()
-					break
-				}
-				var chunk struct {
-					Delta string `json:"delta"`
-				}
-				if json.Unmarshal([]byte(payload), &chunk) == nil {
-					assistantContent.WriteString(chunk.Delta)
-					chunkWithReqID, _ := json.Marshal(map[string]string{
-						"delta":      chunk.Delta,
-						"request_id": requestID,
-					})
-					_, _ = fmt.Fprintf(w, "data: %s\n\n", string(chunkWithReqID))
-					flusher.Flush()
-				}
-			} else if strings.HasPrefix(line, "event: receipt") {
-				if scanner.Scan() {
-					receiptLine := scanner.Text()
-					if strings.HasPrefix(receiptLine, "data: ") {
-						receiptData := strings.TrimPrefix(receiptLine, "data: ")
-						var rec contributions.Receipt
-						if json.Unmarshal([]byte(receiptData), &rec) == nil {
-							s.handleInboundReceipt(r.Context(), rec, body.HostMemberID, targetAddr)
-						}
-					}
-				}
-			} else if strings.HasPrefix(line, "event: error") {
-				streamInterrupted = true
-				_, _ = fmt.Fprintf(w, "%s\n", line)
-				if scanner.Scan() {
-					_, _ = fmt.Fprintf(w, "%s\n\n", scanner.Text())
-				}
-				flusher.Flush()
-				break
-			}
-		}
-
-		if scanErr := scanner.Err(); scanErr != nil && scanErr != io.EOF {
-			streamInterrupted = true
-			errJSON, _ := json.Marshal(map[string]string{"error": "host disconnected unexpectedly"})
-			_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(errJSON))
-			flusher.Flush()
-		}
+		streamInterrupted = s.relayPeerStream(r.Context(), resp.Body, emit, stream, body.HostMemberID, targetAddr)
 	}
 
-	// Local-only persistence: Save assistant message if not no_save
-	if !conv.NoSave && assistantContent.Len() > 0 {
+	if conv.NoSave {
+		// The transcript stays in memory only. Nothing about a no-save chat is
+		// written to the messages table, on this node or any other.
+		s.appendNoSaveTurn(convID, userTurn)
+		if assistantContent.Len() > 0 {
+			s.appendNoSaveTurn(convID, hosting.ChatMessage{
+				Role:    "assistant",
+				Content: assistantContent.String(),
+			})
+		}
+		return
+	}
+
+	if assistantContent.Len() > 0 {
 		content := assistantContent.String()
 		if streamInterrupted {
 			content += " [interrupted]"
 		}
 		asstMsgIDBytes := make([]byte, 8)
 		_, _ = rand.Read(asstMsgIDBytes)
-		asstMsgID := "msg-" + hex.EncodeToString(asstMsgIDBytes)
 
 		_ = s.store.SaveMessage(store.MessageRecord{
-			ID:             asstMsgID,
+			ID:             "msg-" + hex.EncodeToString(asstMsgIDBytes),
 			ConversationID: convID,
 			Role:           "assistant",
 			Content:        content,
@@ -370,6 +320,65 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:      time.Now().Unix(),
 		})
 	}
+}
+
+// relayPeerStream forwards a host's SSE response to the local client and
+// reports whether the stream ended abnormally.
+func (s *Server) relayPeerStream(
+	ctx context.Context,
+	body io.Reader,
+	emit func(string) error,
+	stream *sse.Stream,
+	hostMemberID string,
+	hostAddr string,
+) bool {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, ": "):
+			// keepalive comment from the host; nothing to forward
+
+		case strings.HasPrefix(line, "data: "):
+			payload := strings.TrimPrefix(line, "data: ")
+			if payload == "[DONE]" {
+				_ = stream.SendRaw("data: [DONE]\n\n")
+				return false
+			}
+			var chunk struct {
+				Delta string `json:"delta"`
+			}
+			if json.Unmarshal([]byte(payload), &chunk) == nil {
+				_ = emit(chunk.Delta)
+			}
+
+		case strings.HasPrefix(line, "event: receipt"):
+			if scanner.Scan() {
+				receiptLine := scanner.Text()
+				if strings.HasPrefix(receiptLine, "data: ") {
+					var rec contributions.Receipt
+					if json.Unmarshal([]byte(strings.TrimPrefix(receiptLine, "data: ")), &rec) == nil {
+						s.handleInboundReceipt(ctx, rec, hostMemberID, hostAddr)
+					}
+				}
+			}
+
+		case strings.HasPrefix(line, "event: error"):
+			if scanner.Scan() {
+				errLine := scanner.Text()
+				_ = stream.SendRaw("event: error\n" + errLine + "\n\n")
+			}
+			return true
+		}
+	}
+
+	if err := scanner.Err(); err != nil && err != io.EOF {
+		_ = stream.SendJSON("error", map[string]string{"error": "host disconnected unexpectedly"})
+		return true
+	}
+	return false
 }
 
 func (s *Server) handleCancelMessage(w http.ResponseWriter, r *http.Request) {
@@ -385,27 +394,16 @@ func (s *Server) handleCancelMessage(w http.ResponseWriter, r *http.Request) {
 	device, _ := s.store.GetDeviceIdentity()
 	myMemberID := ""
 	if device != nil {
-		myMemberID = "m-" + device.DevicePublic[:16]
+		myMemberID, _ = peerapi.MemberIDForDevicePublic(device.DevicePublic)
 	}
 
-	if body.HostMemberID != "" && body.HostMemberID != myMemberID {
-		peerAddrs, _ := s.store.ListPeerAddresses()
-		for _, pa := range peerAddrs {
-			if pa.MemberID == body.HostMemberID {
-				dialCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-				defer cancel()
-				if conn, err := s.trans.Dial(dialCtx, pa.TailcatAddr, s.peerPort); err == nil {
-					defer conn.Close()
-					reqBytes, _ := json.Marshal(map[string]string{"request_id": body.RequestID})
-					httpReq, reqErr := http.NewRequestWithContext(dialCtx, "POST", "http://woolwire-peer/peer/v1/inference/cancel", bytes.NewReader(reqBytes))
-					if reqErr == nil {
-						httpReq.Header.Set("Content-Type", "application/json")
-						_ = httpReq.Write(conn)
-					}
-				}
-				break
-			}
-		}
+	if body.HostMemberID == "" || body.HostMemberID == myMemberID {
+		s.infer.Queue().Cancel(body.RequestID, myMemberID)
+	} else if addr := s.peerAddress(body.HostMemberID); addr != "" {
+		dialCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		_ = s.peerJSON(dialCtx, body.HostMemberID, addr, "POST", "/peer/v1/inference/cancel",
+			map[string]string{"request_id": body.RequestID}, nil)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

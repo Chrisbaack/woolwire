@@ -1,20 +1,24 @@
 package community
 
 import (
-	"html"
 	"regexp"
 	"strings"
 )
 
-var (
-	htmlTagRegex    = regexp.MustCompile(`(?i)<[^>]*>`)
-	markdownImgRegex = regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
-)
+var markdownImgRegex = regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
 
-// SanitizeContent escapes raw HTML and neutralizes remote tracking images.
+// SanitizeContent neutralizes remote tracking images and nothing else.
+//
+// Escaping is deliberately not done here: the web client renders message text
+// through React, which escapes on output. Escaping a second time on the way in
+// turned "&" into "&amp;" on screen and permanently corrupted the stored text.
+// Stripping anything that looks like a tag was worse still — it deleted "<3"
+// and mangled "a < b > c" in ordinary prose.
+//
+// If Markdown rendering is added later, sanitize the rendered tree with a real
+// HTML sanitizer rather than reintroducing regexes over the source text.
 func SanitizeContent(content string) string {
-	// 1. Remove remote tracking markdown images: ![alt](http://...) -> [Image: alt]
-	cleaned := markdownImgRegex.ReplaceAllStringFunc(content, func(match string) string {
+	return markdownImgRegex.ReplaceAllStringFunc(content, func(match string) string {
 		submatches := markdownImgRegex.FindStringSubmatch(match)
 		if len(submatches) >= 2 {
 			alt := strings.TrimSpace(submatches[1])
@@ -25,12 +29,4 @@ func SanitizeContent(content string) string {
 		}
 		return "[Image Blocked]"
 	})
-
-	// 2. Strip any raw HTML tags
-	cleaned = htmlTagRegex.ReplaceAllString(cleaned, "")
-
-	// 3. Escape HTML special characters
-	cleaned = html.EscapeString(cleaned)
-
-	return cleaned
 }

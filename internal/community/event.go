@@ -18,6 +18,10 @@ const (
 	EventEdit      EventType = "edit"
 	EventDelete    EventType = "delete"
 	EventTombstone EventType = "tombstone"
+	// EventChannel announces a channel so the channel list replicates through
+	// the same signed log as messages instead of existing only on the node
+	// that created it.
+	EventChannel EventType = "channel"
 )
 
 type Event struct {
@@ -32,12 +36,21 @@ type Event struct {
 	Timestamp        int64     `json:"timestamp"`
 	Signature        string    `json:"signature"`
 	ReplicatedStatus string    `json:"replicated_status,omitempty"`
+	// SigVersion selects the signing payload format; see identity.SigningPayload.
+	SigVersion uint8 `json:"sig_version,omitempty"`
 }
 
 func (e *Event) Payload() []byte {
-	return []byte(fmt.Sprintf("%s:%s:%s:%d:%s:%s:%s:%d",
+	if e.SigVersion == 0 {
+		// Legacy colon-joined payload. Message content contains colons freely,
+		// so this form is ambiguous and is kept only to verify existing events.
+		return []byte(fmt.Sprintf("%s:%s:%s:%d:%s:%s:%s:%d",
+			e.RoomID, e.ChannelID, e.AuthorMemberID, e.AuthorSeq,
+			e.EventType, e.TargetEventID, e.Content, e.Timestamp))
+	}
+	return identity.SigningPayload(e.SigVersion, "woolwire/community-event",
 		e.RoomID, e.ChannelID, e.AuthorMemberID, e.AuthorSeq,
-		e.EventType, e.TargetEventID, e.Content, e.Timestamp))
+		string(e.EventType), e.TargetEventID, e.Content, e.Timestamp)
 }
 
 func (e *Event) Sign(privateKey ed25519.PrivateKey) error {
@@ -47,6 +60,7 @@ func (e *Event) Sign(privateKey ed25519.PrivateKey) error {
 	if e.Timestamp == 0 {
 		e.Timestamp = time.Now().Unix()
 	}
+	e.SigVersion = identity.SigVersionCanonical
 
 	sig := ed25519.Sign(privateKey, e.Payload())
 	e.Signature = identity.EncodeToken(sig)

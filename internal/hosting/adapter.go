@@ -8,11 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,65 +20,53 @@ type ChatMessage struct {
 	Content string `json:"content"`
 }
 
+// ChatRequest carries everything the adapter needs for one streamed
+// completion. It is a struct rather than a parameter list because the model
+// name, token ceiling, and network policy all travel together and forgetting
+// one of them is exactly the class of bug this replaces.
+type ChatRequest struct {
+	EndpointURL         string
+	APIKey              string
+	Model               string
+	MaxTokens           int
+	Messages            []ChatMessage
+	AllowPrivateNetwork bool
+}
+
+// ExternalAdapter talks to owner-configured OpenAI-compatible endpoints. It
+// keeps one HTTP client per destination policy so the SSRF guard that applies
+// to a given endpoint is the one baked into the transport that dials it.
 type ExternalAdapter struct {
-	httpClient *http.Client
+	mu      sync.Mutex
+	clients map[DestinationPolicy]*http.Client
 }
 
 func NewExternalAdapter() *ExternalAdapter {
-	return &ExternalAdapter{
-		httpClient: &http.Client{
-			Timeout: 0, // streaming handled via context
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return errors.New("redirects are prohibited")
-			},
-			Transport: &http.Transport{
-				DialContext: (&net.Dialer{
-					Timeout: 10 * time.Second,
-				}).DialContext,
-				ResponseHeaderTimeout: 30 * time.Second,
-			},
-		},
-	}
+	return &ExternalAdapter{clients: make(map[DestinationPolicy]*http.Client)}
 }
 
-// ValidateDestination verifies endpoint destinations per architectural security rules.
-// Denies metadata addresses, 0.0.0.0, and unencrypted off-machine plain HTTP.
-func ValidateDestination(endpointURL string) error {
-	u, err := url.Parse(endpointURL)
-	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
+func (a *ExternalAdapter) clientFor(policy DestinationPolicy) *http.Client {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.clients == nil {
+		a.clients = make(map[DestinationPolicy]*http.Client)
 	}
-
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("unsupported scheme %q; must be http or https", u.Scheme)
+	if c, ok := a.clients[policy]; ok {
+		return c
 	}
-
-	host := u.Hostname()
-	if host == "" || host == "0.0.0.0" {
-		return errors.New("invalid or empty host")
-	}
-
-	// Reject cloud metadata addresses (SSRF prevention)
-	if host == "169.254.169.254" || strings.Contains(host, "metadata.google.internal") {
-		return errors.New("cloud metadata services are strictly prohibited")
-	}
-
-	// Plain HTTP is limited to loopback or local container names
-	if u.Scheme == "http" {
-		isLoopback := host == "127.0.0.1" || host == "localhost" || host == "::1"
-		isLocalName := !strings.Contains(host, ".") || host == "host.docker.internal" || host == "host.containers.internal"
-		if !isLoopback && !isLocalName {
-			return fmt.Errorf("plain HTTP is restricted to loopback/local targets; off-machine endpoints require HTTPS")
-		}
-	}
-
-	return nil
+	c := guardedClient(policy, 30*time.Second)
+	a.clients[policy] = c
+	return c
 }
 
-func (a *ExternalAdapter) QueryModels(ctx context.Context, endpointURL string, apiKey string) ([]string, error) {
-	if err := ValidateDestination(endpointURL); err != nil {
+func (a *ExternalAdapter) QueryModels(ctx context.Context, endpointURL string, apiKey string, policy DestinationPolicy) ([]string, error) {
+	if err := ValidateDestinationWithPolicy(endpointURL, policy); err != nil {
 		return nil, fmt.Errorf("destination validation failed: %w", err)
 	}
+	if err := requirePlainHTTPIsLocal(endpointURL, policy); err != nil {
+		return nil, err
+	}
+	client := a.clientFor(policy)
 
 	baseURL := strings.TrimRight(endpointURL, "/")
 	// Candidates to check: /models (OpenAI standard) and /api/tags (Ollama native)
@@ -100,7 +87,7 @@ func (a *ExternalAdapter) QueryModels(ctx context.Context, endpointURL string, a
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 		}
 
-		resp, err := a.httpClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
 			continue
@@ -174,9 +161,9 @@ func (a *ExternalAdapter) QueryModels(ctx context.Context, endpointURL string, a
 	return nil, errors.New("no models found at endpoint (tried /v1/models and /api/tags)")
 }
 
-func (a *ExternalAdapter) TestEndpoint(ctx context.Context, endpointURL string, apiKey string) (int64, []string, error) {
+func (a *ExternalAdapter) TestEndpoint(ctx context.Context, endpointURL string, apiKey string, policy DestinationPolicy) (int64, []string, error) {
 	start := time.Now()
-	models, err := a.QueryModels(ctx, endpointURL, apiKey)
+	models, err := a.QueryModels(ctx, endpointURL, apiKey, policy)
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		return latency, nil, err
@@ -195,41 +182,45 @@ type chatCompletionChunk struct {
 
 func (a *ExternalAdapter) StreamChat(
 	ctx context.Context,
-	endpointURL string,
-	apiKey string,
-	model string,
-	messages []ChatMessage,
+	req ChatRequest,
 	onChunk func(delta string) error,
 ) error {
-	if err := ValidateDestination(endpointURL); err != nil {
+	policy := DestinationPolicy{AllowPrivateNetwork: req.AllowPrivateNetwork}
+	if err := ValidateDestinationWithPolicy(req.EndpointURL, policy); err != nil {
 		return fmt.Errorf("destination validation failed: %w", err)
 	}
+	if err := requirePlainHTTPIsLocal(req.EndpointURL, policy); err != nil {
+		return err
+	}
 
-	urlStr := strings.TrimRight(endpointURL, "/")
+	urlStr := strings.TrimRight(req.EndpointURL, "/")
 	if !strings.HasSuffix(urlStr, "/chat/completions") {
 		urlStr = urlStr + "/v1/chat/completions"
 	}
 
 	reqBody := map[string]any{
-		"model":    model,
-		"messages": messages,
+		"model":    req.Model,
+		"messages": req.Messages,
 		"stream":   true,
+	}
+	if req.MaxTokens > 0 {
+		reqBody["max_tokens"] = req.MaxTokens
 	}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
 		return fmt.Errorf("encode request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", urlStr, bytes.NewReader(bodyBytes))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", urlStr, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	if req.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+req.APIKey)
 	}
 
-	resp, err := a.httpClient.Do(req)
+	resp, err := a.clientFor(policy).Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("execute request: %w", err)
 	}

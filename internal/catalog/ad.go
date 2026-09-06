@@ -25,13 +25,24 @@ type ModelAd struct {
 	IsManaged     bool   `json:"is_managed"`
 	Timestamp     int64  `json:"timestamp"`
 	Signature     string `json:"signature"`
+	// SigVersion selects the signing payload format; see identity.SigningPayload.
+	SigVersion uint8 `json:"sig_version,omitempty"`
 }
 
 func (m ModelAd) Payload() []byte {
-	return []byte(fmt.Sprintf("%s:%s:%s:%d:%s:%s:%d:%s:%d:%t:%d",
+	if m.SigVersion == 0 {
+		// Legacy colon-joined payload. Model names contain colons routinely
+		// (llama3:latest), so this form is ambiguous and is kept only to
+		// verify existing advertisements.
+		return []byte(fmt.Sprintf("%s:%s:%s:%d:%s:%s:%d:%s:%d:%t:%d",
+			m.RoomID, m.HostMemberID, m.ModelID, m.Revision, m.Name,
+			m.Quantization, m.ContextLimit, m.Availability, m.QueueEstimate,
+			m.IsManaged, m.Timestamp))
+	}
+	return identity.SigningPayload(m.SigVersion, "woolwire/model-ad",
 		m.RoomID, m.HostMemberID, m.ModelID, m.Revision, m.Name,
 		m.Quantization, m.ContextLimit, m.Availability, m.QueueEstimate,
-		m.IsManaged, m.Timestamp))
+		m.IsManaged, m.Timestamp)
 }
 
 func (m *ModelAd) Sign(privateKey ed25519.PrivateKey) error {
@@ -39,6 +50,7 @@ func (m *ModelAd) Sign(privateKey ed25519.PrivateKey) error {
 		return errors.New("invalid private key")
 	}
 	m.Timestamp = time.Now().Unix()
+	m.SigVersion = identity.SigVersionCanonical
 	sig := ed25519.Sign(privateKey, m.Payload())
 	m.Signature = identity.EncodeToken(sig)
 	return nil

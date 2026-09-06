@@ -2,6 +2,7 @@ package hosting
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -33,12 +34,32 @@ type ArtifactManifest struct {
 	InstalledAt  int64  `json:"installed_at"`
 }
 
+// DownloadState is the observable progress of one background download.
+type DownloadState struct {
+	ID              string `json:"id"`
+	Filename        string `json:"filename"`
+	SourceURL       string `json:"source_url"`
+	Status          string `json:"status"` // downloading, complete, failed, cancelled
+	BytesDownloaded int64  `json:"bytes_downloaded"`
+	TotalBytes      int64  `json:"total_bytes,omitempty"`
+	Error           string `json:"error,omitempty"`
+	StartedAt       int64  `json:"started_at"`
+	FinishedAt      int64  `json:"finished_at,omitempty"`
+}
+
+type downloadJob struct {
+	state  DownloadState
+	cancel context.CancelFunc
+}
+
 type ArtifactManager struct {
-	modelsDir    string
-	stagingDir   string
-	maxBudget    int64 // max total bytes allowed for models
-	mu           sync.RWMutex
-	httpClient   *http.Client
+	modelsDir  string
+	stagingDir string
+	maxBudget  int64 // max total bytes allowed for models
+
+	mu        sync.RWMutex
+	reserved  int64 // bytes promised to in-flight downloads
+	downloads map[string]*downloadJob
 }
 
 func NewArtifactManager(modelsDir string, maxBudget int64) (*ArtifactManager, error) {
@@ -54,41 +75,24 @@ func NewArtifactManager(modelsDir string, maxBudget int64) (*ArtifactManager, er
 		return nil, fmt.Errorf("create staging dir: %w", err)
 	}
 
-	client := &http.Client{
-		Timeout: 0, // bounded by context
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return errors.New("redirects prohibited during model download")
-		},
-	}
-
 	return &ArtifactManager{
 		modelsDir:  modelsDir,
 		stagingDir: stagingDir,
 		maxBudget:  maxBudget,
-		httpClient: client,
+		downloads:  make(map[string]*downloadJob),
 	}, nil
 }
 
 func (m *ArtifactManager) GetUsedDiskSpace() (int64, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
-	var total int64
-	entries, err := os.ReadDir(m.modelsDir)
-	if err != nil {
-		return 0, err
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if info, err := e.Info(); err == nil {
-			total += info.Size()
-		}
-	}
-	return total, nil
+	return m.getUsedSpaceLocked()
 }
 
+// DownloadArtifact fetches one model weight file. The storage budget is
+// reserved under the lock and then released; the multi-gigabyte transfer runs
+// with the lock free, so ListArtifacts and the metrics endpoint keep answering
+// while a download is in flight.
 func (m *ArtifactManager) DownloadArtifact(
 	ctx context.Context,
 	sourceURL string,
@@ -97,15 +101,14 @@ func (m *ArtifactManager) DownloadArtifact(
 	maxSizeBytes int64,
 	onProgress func(bytesDownloaded int64),
 ) (*ArtifactManifest, error) {
-	// 1. Destination validation to prevent SSRF
-	if err := ValidateDestination(sourceURL); err != nil {
+	policy := DestinationPolicy{}
+	if err := ValidateDestinationWithPolicy(sourceURL, policy); err != nil {
 		return nil, fmt.Errorf("source URL validation failed: %w", err)
 	}
 	if !strings.HasPrefix(sourceURL, "https://") {
 		return nil, errors.New("model downloads must use HTTPS")
 	}
 
-	// 2. Filename validation
 	cleanName := filepath.Base(filename)
 	if cleanName != filename || strings.Contains(filename, "..") || strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
 		return nil, ErrPathTraversal
@@ -114,16 +117,15 @@ func (m *ArtifactManager) DownloadArtifact(
 		return nil, errors.New("only .gguf model weights are accepted")
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// 3. Storage budget check
-	used, _ := m.getUsedSpaceLocked()
-	if maxSizeBytes > 0 && used+maxSizeBytes > m.maxBudget {
-		return nil, ErrDiskBudgetExceeded
+	reservation := maxSizeBytes
+	if reservation <= 0 {
+		reservation = 0
 	}
+	if err := m.reserve(reservation); err != nil {
+		return nil, err
+	}
+	defer m.release(reservation)
 
-	// 4. Create staging file
 	stagingPath := filepath.Join(m.stagingDir, fmt.Sprintf("dl-%d-%s", time.Now().UnixNano(), cleanName))
 	outFile, err := os.OpenFile(stagingPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -131,7 +133,7 @@ func (m *ArtifactManager) DownloadArtifact(
 	}
 	defer func() {
 		_ = outFile.Close()
-		_ = os.Remove(stagingPath) // clean up staging file if not renamed
+		_ = os.Remove(stagingPath) // no-op once the file has been renamed
 	}()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", sourceURL, nil)
@@ -139,7 +141,7 @@ func (m *ArtifactManager) DownloadArtifact(
 		return nil, err
 	}
 
-	resp, err := m.httpClient.Do(req)
+	resp, err := guardedClient(policy, 60*time.Second).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http download failed: %w", err)
 	}
@@ -149,7 +151,11 @@ func (m *ArtifactManager) DownloadArtifact(
 		return nil, fmt.Errorf("download server returned %d", resp.StatusCode)
 	}
 
-	// 5. Stream download, hash, and enforce budget limit
+	budgetHeadroom, err := m.remainingBudget()
+	if err != nil {
+		return nil, err
+	}
+
 	hasher := sha256.New()
 	var totalDownloaded int64
 	buf := make([]byte, 64*1024)
@@ -167,7 +173,7 @@ func (m *ArtifactManager) DownloadArtifact(
 			if maxSizeBytes > 0 && totalDownloaded > maxSizeBytes {
 				return nil, ErrDiskBudgetExceeded
 			}
-			if used+totalDownloaded > m.maxBudget {
+			if totalDownloaded > budgetHeadroom {
 				return nil, ErrDiskBudgetExceeded
 			}
 
@@ -194,14 +200,13 @@ func (m *ArtifactManager) DownloadArtifact(
 		return nil, fmt.Errorf("%w: expected %s, got %s", ErrHashMismatch, expectedSHA256, actualHash)
 	}
 
-	_ = outFile.Close()
-
-	// 6. Atomic move into finalized model directory
-	finalPath := filepath.Join(m.modelsDir, cleanName)
-	if err := os.Rename(stagingPath, finalPath); err != nil {
-		return nil, fmt.Errorf("finalize model move: %w", err)
+	if err := outFile.Close(); err != nil {
+		return nil, fmt.Errorf("flush staging file: %w", err)
 	}
 
+	m.mu.Lock()
+	finalPath := filepath.Join(m.modelsDir, cleanName)
+	renameErr := os.Rename(stagingPath, finalPath)
 	manifest := &ArtifactManifest{
 		ID:           "art-" + cleanName,
 		Name:         cleanName,
@@ -212,9 +217,140 @@ func (m *ArtifactManager) DownloadArtifact(
 		ContextLimit: 4096,
 		InstalledAt:  time.Now().Unix(),
 	}
+	if renameErr == nil {
+		_ = m.saveManifestLocked(manifest)
+	}
+	m.mu.Unlock()
 
-	_ = m.saveManifestLocked(manifest)
+	if renameErr != nil {
+		return nil, fmt.Errorf("finalize model move: %w", renameErr)
+	}
 	return manifest, nil
+}
+
+// reserve books budget for an in-flight download so a second one starting at
+// the same moment sees the space as already spoken for.
+func (m *ArtifactManager) reserve(bytes int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	used, err := m.getUsedSpaceLocked()
+	if err != nil {
+		return err
+	}
+	if bytes > 0 && used+m.reserved+bytes > m.maxBudget {
+		return ErrDiskBudgetExceeded
+	}
+	m.reserved += bytes
+	return nil
+}
+
+func (m *ArtifactManager) release(bytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.reserved -= bytes
+	if m.reserved < 0 {
+		m.reserved = 0
+	}
+}
+
+func (m *ArtifactManager) remainingBudget() (int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	used, err := m.getUsedSpaceLocked()
+	if err != nil {
+		return 0, err
+	}
+	remaining := m.maxBudget - used
+	if remaining < 0 {
+		return 0, nil
+	}
+	return remaining, nil
+}
+
+// StartDownload runs a download in the background and returns immediately with
+// a job id the UI polls. A synchronous multi-gigabyte transfer inside an HTTP
+// handler is not something a browser or a reverse proxy will wait through.
+func (m *ArtifactManager) StartDownload(sourceURL, filename, expectedSHA256 string, maxSizeBytes int64) (string, error) {
+	idBytes := make([]byte, 8)
+	if _, err := rand.Read(idBytes); err != nil {
+		return "", err
+	}
+	id := "dl-" + hex.EncodeToString(idBytes)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &downloadJob{
+		state: DownloadState{
+			ID:         id,
+			Filename:   filename,
+			SourceURL:  sourceURL,
+			Status:     "downloading",
+			TotalBytes: maxSizeBytes,
+			StartedAt:  time.Now().Unix(),
+		},
+		cancel: cancel,
+	}
+
+	m.mu.Lock()
+	m.downloads[id] = job
+	m.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		_, err := m.DownloadArtifact(ctx, sourceURL, filename, expectedSHA256, maxSizeBytes, func(n int64) {
+			m.mu.Lock()
+			job.state.BytesDownloaded = n
+			m.mu.Unlock()
+		})
+
+		m.mu.Lock()
+		job.state.FinishedAt = time.Now().Unix()
+		switch {
+		case err == nil:
+			job.state.Status = "complete"
+		case errors.Is(err, context.Canceled):
+			job.state.Status = "cancelled"
+		default:
+			job.state.Status = "failed"
+			job.state.Error = err.Error()
+		}
+		m.mu.Unlock()
+	}()
+
+	return id, nil
+}
+
+// DownloadStatus reports one job, or all of them when id is empty.
+func (m *ArtifactManager) DownloadStatus(id string) ([]DownloadState, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if id != "" {
+		job, ok := m.downloads[id]
+		if !ok {
+			return nil, errors.New("download job not found")
+		}
+		return []DownloadState{job.state}, nil
+	}
+
+	states := make([]DownloadState, 0, len(m.downloads))
+	for _, job := range m.downloads {
+		states = append(states, job.state)
+	}
+	return states, nil
+}
+
+// CancelDownload stops an in-flight job.
+func (m *ArtifactManager) CancelDownload(id string) error {
+	m.mu.RLock()
+	job, ok := m.downloads[id]
+	m.mu.RUnlock()
+	if !ok {
+		return errors.New("download job not found")
+	}
+	job.cancel()
+	return nil
 }
 
 func (m *ArtifactManager) ImportLocalArtifact(sourcePath, filename string) (*ArtifactManifest, error) {
@@ -316,18 +452,26 @@ func (m *ArtifactManager) ListArtifacts() ([]ArtifactManifest, error) {
 	return manifests, nil
 }
 
+// getUsedSpaceLocked counts finished weights and partially written staging
+// files alike. Excluding staging let two concurrent downloads each believe the
+// whole remaining budget was theirs.
 func (m *ArtifactManager) getUsedSpaceLocked() (int64, error) {
 	var total int64
-	entries, err := os.ReadDir(m.modelsDir)
-	if err != nil {
-		return 0, err
-	}
-	for _, e := range entries {
-		if e.IsDir() {
+	for _, dir := range []string{m.modelsDir, m.stagingDir} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if dir == m.modelsDir {
+				return 0, err
+			}
 			continue
 		}
-		if info, err := e.Info(); err == nil {
-			total += info.Size()
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if info, err := e.Info(); err == nil {
+				total += info.Size()
+			}
 		}
 	}
 	return total, nil

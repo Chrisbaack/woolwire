@@ -139,4 +139,57 @@ var migrations = []string{
 
 	CREATE INDEX IF NOT EXISTS idx_contrib_room_time ON contribution_receipts(room_id, timestamp);
 	CREATE INDEX IF NOT EXISTS idx_contrib_pair_time ON contribution_receipts(host_member_id, requester_member_id, timestamp);`,
+
+	// Migration 005: stable transport identity, authority-signed bootstrap
+	// certificate, distinct backend model names, and per-author event
+	// divergence that is quarantined rather than silently dropped.
+	`ALTER TABLE device_identity ADD COLUMN tailcat_psk TEXT NOT NULL DEFAULT '';
+	ALTER TABLE device_identity ADD COLUMN tailcat_addr TEXT NOT NULL DEFAULT '';
+
+	ALTER TABLE room_state ADD COLUMN room_cert_der BLOB;
+
+	ALTER TABLE hosted_models ADD COLUMN backend_model TEXT NOT NULL DEFAULT '';
+	ALTER TABLE hosted_models ADD COLUMN allow_private_network INTEGER NOT NULL DEFAULT 0;
+
+	CREATE INDEX IF NOT EXISTS idx_members_device_public ON members(device_public);
+
+	-- sig_version records which signing payload format each stored signature
+	-- was made over, so canonicalizing payloads does not invalidate records
+	-- written before the change.
+	ALTER TABLE members ADD COLUMN sig_version INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE contribution_receipts ADD COLUMN sig_version INTEGER NOT NULL DEFAULT 0;
+
+	-- community_events is rebuilt to (a) admit the replicated 'channel' event
+	-- type and (b) drop UNIQUE(room_id, author_member_id, author_seq), which
+	-- silently kept whichever conflicting event arrived first and let peers
+	-- diverge. Conflicts are now stored and quarantined by the materializer.
+	CREATE TABLE community_events_v2 (
+		id TEXT PRIMARY KEY,
+		room_id TEXT NOT NULL,
+		channel_id TEXT NOT NULL,
+		author_member_id TEXT NOT NULL,
+		author_seq INTEGER NOT NULL,
+		event_type TEXT NOT NULL CHECK (event_type IN ('message', 'edit', 'delete', 'tombstone', 'channel')),
+		target_event_id TEXT,
+		content TEXT NOT NULL,
+		timestamp INTEGER NOT NULL,
+		signature TEXT NOT NULL,
+		replicated_status TEXT NOT NULL DEFAULT 'local' CHECK (replicated_status IN ('local', 'pending', 'replicated')),
+		created_at INTEGER NOT NULL,
+		sig_version INTEGER NOT NULL DEFAULT 0
+	);
+
+	INSERT INTO community_events_v2 (
+		id, room_id, channel_id, author_member_id, author_seq, event_type,
+		target_event_id, content, timestamp, signature, replicated_status, created_at
+	)
+		SELECT id, room_id, channel_id, author_member_id, author_seq, event_type,
+		       target_event_id, content, timestamp, signature, replicated_status, created_at
+		FROM community_events;
+
+	DROP TABLE community_events;
+	ALTER TABLE community_events_v2 RENAME TO community_events;
+
+	CREATE INDEX IF NOT EXISTS idx_community_events_channel ON community_events(channel_id, timestamp);
+	CREATE INDEX IF NOT EXISTS idx_community_events_author ON community_events(room_id, author_member_id, author_seq);`,
 }

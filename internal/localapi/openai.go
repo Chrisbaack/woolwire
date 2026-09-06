@@ -1,19 +1,19 @@
 package localapi
 
 import (
-	"bufio"
-	"bytes"
-	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/cbaack/woolwire/internal/hosting"
 	"github.com/cbaack/woolwire/internal/peerapi"
+	"github.com/cbaack/woolwire/internal/sse"
 )
 
 type openAIModelItem struct {
@@ -23,14 +23,59 @@ type openAIModelItem struct {
 	OwnedBy string `json:"owned_by"`
 }
 
-func (s *Server) checkOpenAIAuth(r *http.Request) bool {
-	token, _ := s.store.GetSetting("local_api_token")
-	if token == "" {
-		return true // unauthenticated if no token configured
+// localAPIToken returns the bearer token for the OpenAI-compatible routes,
+// generating it on first use. It is never optional: an unset token used to
+// mean "no authentication", which left /v1/chat/completions reachable by a
+// simple cross-origin POST from any page the owner happened to visit, driving
+// inference on other members' hardware.
+func (s *Server) localAPIToken() (string, error) {
+	token, err := s.store.GetSetting("local_api_token")
+	if err == nil && token != "" {
+		return token, nil
 	}
-	auth := r.Header.Get("Authorization")
+
+	generated, err := generateSecret()
+	if err != nil {
+		return "", err
+	}
+	if err := s.store.SetSetting("local_api_token", generated); err != nil {
+		return "", err
+	}
+	return generated, nil
+}
+
+func (s *Server) checkOpenAIAuth(r *http.Request) bool {
+	token, err := s.localAPIToken()
+	if err != nil || token == "" {
+		return false
+	}
 	expected := "Bearer " + token
-	return auth == expected
+	provided := r.Header.Get("Authorization")
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
+func (s *Server) handleGetLocalAPIToken(w http.ResponseWriter, r *http.Request) {
+	token, err := s.localAPIToken()
+	if err != nil {
+		http.Error(w, "failed to read local API token", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"token": token})
+}
+
+func (s *Server) handleRegenerateLocalAPIToken(w http.ResponseWriter, r *http.Request) {
+	token, err := generateSecret()
+	if err != nil {
+		http.Error(w, "failed to generate token", http.StatusInternalServerError)
+		return
+	}
+	if err := s.store.SetSetting("local_api_token", token); err != nil {
+		http.Error(w, "failed to save token", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"token": token})
 }
 
 func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
@@ -68,23 +113,23 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 		Messages []hosting.ChatMessage `json:"messages"`
 		Stream   bool                  `json:"stream"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+	if len(req.Messages) == 0 {
+		http.Error(w, "messages are required", http.StatusBadRequest)
+		return
+	}
 
-	// Match model from catalog
-	available := s.catalog.ListAvailable()
-	var matchedHostID string
-	var matchedModelID string
-	for _, m := range available {
+	var matchedHostID, matchedModelID string
+	for _, m := range s.catalog.ListAvailable() {
 		if m.ModelID == req.Model || m.Name == req.Model {
 			matchedHostID = m.HostMemberID
 			matchedModelID = m.ModelID
 			break
 		}
 	}
-
 	if matchedHostID == "" {
 		http.Error(w, "model not found or offline", http.StatusNotFound)
 		return
@@ -95,188 +140,141 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "device identity missing", http.StatusInternalServerError)
 		return
 	}
-	myMemberID := "m-" + device.DevicePublic[:16]
+	myMemberID, err := peerapi.MemberIDForDevicePublic(device.DevicePublic)
+	if err != nil {
+		http.Error(w, "device identity is malformed", http.StatusInternalServerError)
+		return
+	}
 
 	reqIDBytes := make([]byte, 8)
 	_, _ = rand.Read(reqIDBytes)
 	requestID := "chatcmpl-" + hex.EncodeToString(reqIDBytes)
 
+	var collected strings.Builder
+	collect := func(delta string) error {
+		collected.WriteString(delta)
+		return nil
+	}
+
+	var stream *sse.Stream
+	emit := collect
 	if req.Stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		flusher, ok := w.(http.Flusher)
-		if !ok {
+		stream, err = sse.New(w)
+		if err != nil {
 			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 			return
 		}
+		defer stream.Stop()
+		emit = func(delta string) error {
+			collected.WriteString(delta)
+			return stream.SendJSON("", openAIChunk(requestID, req.Model, delta))
+		}
+	}
 
-		sendChunk := func(delta string) error {
-			chunk := map[string]any{
-				"id":      requestID,
-				"object":  "chat.completion.chunk",
-				"created": time.Now().Unix(),
-				"model":   req.Model,
-				"choices": []map[string]any{
-					{
-						"index": 0,
-						"delta": map[string]string{
-							"content": delta,
-						},
-						"finish_reason": nil,
-					},
+	runErr := s.runOpenAIRequest(r, myMemberID, matchedHostID, matchedModelID, requestID, req.Messages, emit)
+
+	if req.Stream {
+		if runErr != nil {
+			_ = stream.SendJSON("error", map[string]string{"error": runErr.Error()})
+		}
+		_ = stream.SendRaw("data: [DONE]\n\n")
+		return
+	}
+
+	if runErr != nil {
+		http.Error(w, runErr.Error(), openAIStatusFor(runErr))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"id":      requestID,
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   req.Model,
+		"choices": []map[string]any{
+			{
+				"index": 0,
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": collected.String(),
 				},
-			}
-			chunkJSON, _ := json.Marshal(chunk)
-			_, err := fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
-			if err != nil {
-				return err
-			}
-			flusher.Flush()
-			return nil
-		}
-
-		if matchedHostID == myMemberID {
-			localModel, mErr := s.store.GetHostedModel(matchedModelID)
-			if mErr != nil || !localModel.Enabled || !localModel.Published {
-				http.Error(w, "model unavailable locally", http.StatusServiceUnavailable)
-				return
-			}
-			_ = s.adapter.StreamChat(r.Context(), localModel.EndpointURL, localModel.APIKey, localModel.ID, req.Messages, sendChunk)
-		} else {
-			peerAddrs, _ := s.store.ListPeerAddresses()
-			var targetAddr string
-			for _, pa := range peerAddrs {
-				if pa.MemberID == matchedHostID {
-					targetAddr = pa.TailcatAddr
-					break
-				}
-			}
-			if targetAddr == "" {
-				http.Error(w, "host address unknown", http.StatusServiceUnavailable)
-				return
-			}
-
-			conn, dialErr := s.trans.Dial(r.Context(), targetAddr, s.peerPort)
-			if dialErr != nil {
-				http.Error(w, "host dial error", http.StatusServiceUnavailable)
-				return
-			}
-			defer conn.Close()
-
-			inferReq := peerapi.InferenceRequest{
-				RequestID: requestID,
-				MemberID:  myMemberID,
-				ModelID:   matchedModelID,
-				Messages:  req.Messages,
-			}
-			reqBytes, _ := json.Marshal(inferReq)
-			httpReq, _ := http.NewRequestWithContext(r.Context(), "POST", "http://woolwire-peer/peer/v1/inference", bytes.NewReader(reqBytes))
-			httpReq.Header.Set("Content-Type", "application/json")
-			_ = httpReq.Write(conn)
-
-			resp, readErr := http.ReadResponse(bufio.NewReader(conn), httpReq)
-			if readErr != nil {
-				http.Error(w, "host read error", http.StatusBadGateway)
-				return
-			}
-			defer resp.Body.Close()
-
-			scanner := bufio.NewScanner(resp.Body)
-			for scanner.Scan() {
-				line := scanner.Text()
-				if strings.HasPrefix(line, "data: ") {
-					payload := strings.TrimPrefix(line, "data: ")
-					if payload == "[DONE]" {
-						break
-					}
-					var c struct {
-						Delta string `json:"delta"`
-					}
-					if json.Unmarshal([]byte(payload), &c) == nil {
-						_ = sendChunk(c.Delta)
-					}
-				}
-			}
-		}
-
-		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
-	} else {
-		// Non-streaming: accumulate and return complete object
-		var fullContent strings.Builder
-		collectChunk := func(delta string) error {
-			fullContent.WriteString(delta)
-			return nil
-		}
-
-		if matchedHostID == myMemberID {
-			localModel, _ := s.store.GetHostedModel(matchedModelID)
-			_ = s.adapter.StreamChat(r.Context(), localModel.EndpointURL, localModel.APIKey, localModel.ID, req.Messages, collectChunk)
-		} else {
-			peerAddrs, _ := s.store.ListPeerAddresses()
-			var targetAddr string
-			for _, pa := range peerAddrs {
-				if pa.MemberID == matchedHostID {
-					targetAddr = pa.TailcatAddr
-					break
-				}
-			}
-			if targetAddr != "" {
-				dialCtx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-				defer cancel()
-				if conn, err := s.trans.Dial(dialCtx, targetAddr, s.peerPort); err == nil {
-					defer conn.Close()
-					inferReq := peerapi.InferenceRequest{
-						RequestID: requestID,
-						MemberID:  myMemberID,
-						ModelID:   matchedModelID,
-						Messages:  req.Messages,
-					}
-					reqBytes, _ := json.Marshal(inferReq)
-					httpReq, _ := http.NewRequestWithContext(dialCtx, "POST", "http://woolwire-peer/peer/v1/inference", bytes.NewReader(reqBytes))
-					httpReq.Header.Set("Content-Type", "application/json")
-					_ = httpReq.Write(conn)
-
-					if resp, err := http.ReadResponse(bufio.NewReader(conn), httpReq); err == nil {
-						defer resp.Body.Close()
-						scanner := bufio.NewScanner(resp.Body)
-						for scanner.Scan() {
-							line := scanner.Text()
-							if strings.HasPrefix(line, "data: ") {
-								payload := strings.TrimPrefix(line, "data: ")
-								if payload == "[DONE]" {
-									break
-								}
-								var c struct {
-									Delta string `json:"delta"`
-								}
-								if json.Unmarshal([]byte(payload), &c) == nil {
-									fullContent.WriteString(c.Delta)
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":      requestID,
-			"object":  "chat.completion",
-			"created": time.Now().Unix(),
-			"model":   req.Model,
-			"choices": []map[string]any{
-				{
-					"index": 0,
-					"message": map[string]string{
-						"role":    "assistant",
-						"content": fullContent.String(),
-					},
-					"finish_reason": "stop",
-				},
+				"finish_reason": "stop",
 			},
-		})
+		},
+	})
+}
+
+func openAIStatusFor(err error) int {
+	if errors.Is(err, errPeerUnreachable) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+
+var errPeerUnreachable = errors.New("host is unreachable")
+
+// runOpenAIRequest dispatches to the local queue for a self-hosted model, or
+// to the owning peer over authenticated TLS.
+func (s *Server) runOpenAIRequest(
+	r *http.Request,
+	myMemberID, hostMemberID, modelID, requestID string,
+	messages []hosting.ChatMessage,
+	emit func(string) error,
+) error {
+	if hostMemberID == myMemberID {
+		localModel, err := s.store.GetHostedModel(modelID)
+		if err != nil || !localModel.Enabled || !localModel.Published {
+			return errors.New("model unavailable locally")
+		}
+		// The owner's own OpenAI-compatible traffic occupies the same slots as
+		// remote members', so local usage is visible to the fairness limits.
+		return s.infer.Execute(r.Context(), myMemberID, requestID, localModel, messages, emit)
+	}
+
+	targetAddr := s.peerAddress(hostMemberID)
+	if targetAddr == "" {
+		return errPeerUnreachable
+	}
+
+	conn, err := s.dialPeer(r.Context(), hostMemberID, targetAddr)
+	if err != nil {
+		return errPeerUnreachable
+	}
+	defer conn.Close()
+
+	resp, err := peerRoundTrip(r.Context(), conn, "POST", "/peer/v1/inference", peerapi.InferenceRequest{
+		RequestID: requestID,
+		ModelID:   modelID,
+		Messages:  messages,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return errors.New(strings.TrimSpace(string(b)))
+	}
+
+	return readPeerDeltas(resp.Body, emit)
+}
+
+func openAIChunk(requestID, model, delta string) map[string]any {
+	return map[string]any{
+		"id":      requestID,
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{
+			{
+				"index": 0,
+				"delta": map[string]string{
+					"content": delta,
+				},
+				"finish_reason": nil,
+			},
+		},
 	}
 }

@@ -101,16 +101,26 @@ func (c *RunnerClient) RestartEngine(ctx context.Context) error {
 	return c.doJSON(ctx, "POST", "/runner/v1/engine/restart", nil, nil)
 }
 
+// StreamChat drives a managed model through the runner companion. The
+// requester is named in the body so the runner can restart the engine between
+// different members, which is what keeps one member's KV cache out of the
+// next member's session.
 func (c *RunnerClient) StreamChat(
 	ctx context.Context,
-	modelID string,
+	requesterMemberID string,
+	modelName string,
+	maxTokens int,
 	messages []ChatMessage,
 	onChunk func(delta string) error,
 ) error {
 	payload := map[string]any{
-		"model":    modelID,
-		"messages": messages,
-		"stream":   true,
+		"model":               modelName,
+		"messages":            messages,
+		"stream":              true,
+		"requester_member_id": requesterMemberID,
+	}
+	if maxTokens > 0 {
+		payload["max_tokens"] = maxTokens
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

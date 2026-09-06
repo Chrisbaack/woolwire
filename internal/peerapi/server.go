@@ -3,6 +3,7 @@ package peerapi
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,95 +13,194 @@ import (
 	"time"
 
 	"github.com/cbaack/woolwire/internal/catalog"
-	"github.com/cbaack/woolwire/internal/community"
-	"github.com/cbaack/woolwire/internal/contributions"
 	"github.com/cbaack/woolwire/internal/hosting"
-	"github.com/cbaack/woolwire/internal/identity"
 	"github.com/cbaack/woolwire/internal/inference"
+	"github.com/cbaack/woolwire/internal/peerauth"
 	"github.com/cbaack/woolwire/internal/room"
 	"github.com/cbaack/woolwire/internal/store"
 )
 
-type Server struct {
-	store     *store.Store
-	authority ed25519.PrivateKey // non-nil if creator
-	deviceKey ed25519.PrivateKey // local host key for signing ads
-	queue     *inference.FairQueue
-	adapter   *hosting.ExternalAdapter
+// BootstrapPortOffset places /bootstrap/v1/join on its own Tailcat port. The
+// two endpoints have different trust rules — bootstrap accepts a stranger's
+// device certificate, the peer API does not — so they cannot share a listener
+// without weakening the peer API to whatever bootstrap must allow.
+const BootstrapPortOffset = 1
 
-	mux    *http.ServeMux
-	server *http.Server
-	mu     sync.RWMutex
+type contextKey string
+
+const tlsConnKey contextKey = "woolwire.tlsconn"
+
+type Config struct {
+	Store *store.Store
+	// Authority is non-nil only on the creator. Admission is refused outright
+	// without it, so a member's bootstrap endpoint cannot admit anyone.
+	Authority ed25519.PrivateKey
+	// DeviceCert is this node's device certificate, presented on the peer API.
+	DeviceCert tls.Certificate
+	// RoomCert is the creator's authority-signed bootstrap certificate.
+	RoomCert *tls.Certificate
+	// Inference is shared with the local API so the host's own usage counts
+	// against the same limits remote members are held to.
+	Inference *inference.Service
 }
 
-func NewServer(s *store.Store, authority ed25519.PrivateKey) *Server {
-	limits := inference.DefaultLimits()
-	if s != nil {
-		if l, err := s.GetHostLimits(); err == nil {
-			limits = inference.Limits{
-				MaxActive:          l.MaxActive,
-				MaxQueuedPerMember: l.MaxQueuedPerMember,
-				MaxQueuedTotal:     l.MaxQueuedTotal,
-				QueueTimeout:       time.Duration(l.QueueTimeoutSeconds) * time.Second,
-				ExecTimeout:        time.Duration(l.ExecutionTimeoutSeconds) * time.Second,
-			}
-		}
-	}
+type Server struct {
+	store     *store.Store
+	authority ed25519.PrivateKey
+	deviceKey ed25519.PrivateKey
+	roster    *peerauth.Roster
+	infer     *inference.Service
+	adapter   *hosting.ExternalAdapter
 
+	deviceCert tls.Certificate
+	roomCert   *tls.Certificate
+
+	peerMux      *http.ServeMux
+	bootstrapMux *http.ServeMux
+	peerHTTP     *http.Server
+	bootstrapSrv *http.Server
+	mu           sync.RWMutex
+}
+
+func NewServer(cfg Config) *Server {
 	var devKey ed25519.PrivateKey
-	if s != nil {
-		if dev, err := s.GetDeviceIdentity(); err == nil && len(dev.DevicePrivate) == ed25519.PrivateKeySize {
+	if cfg.Store != nil {
+		if dev, err := cfg.Store.GetDeviceIdentity(); err == nil && len(dev.DevicePrivate) == ed25519.PrivateKeySize {
 			devKey = ed25519.PrivateKey(dev.DevicePrivate)
 		}
 	}
 
+	infer := cfg.Inference
+	if infer == nil {
+		infer = inference.NewService(cfg.Store, hosting.NewExternalAdapter(), nil)
+	}
+
 	srv := &Server{
-		store:     s,
-		authority: authority,
-		deviceKey: devKey,
-		queue:     inference.NewFairQueue(limits),
-		adapter:   hosting.NewExternalAdapter(),
-		mux:       http.NewServeMux(),
+		store:        cfg.Store,
+		authority:    cfg.Authority,
+		deviceKey:    devKey,
+		roster:       peerauth.NewRoster(cfg.Store),
+		infer:        infer,
+		adapter:      hosting.NewExternalAdapter(),
+		deviceCert:   cfg.DeviceCert,
+		roomCert:     cfg.RoomCert,
+		peerMux:      http.NewServeMux(),
+		bootstrapMux: http.NewServeMux(),
 	}
 	srv.routes()
-	srv.server = &http.Server{
-		Handler:     srv.mux,
+
+	connContext := func(ctx context.Context, c net.Conn) context.Context {
+		if tc, ok := c.(*tls.Conn); ok {
+			return context.WithValue(ctx, tlsConnKey, tc)
+		}
+		return ctx
+	}
+
+	srv.peerHTTP = &http.Server{
+		Handler:     srv.peerMux,
 		ReadTimeout: 30 * time.Second,
-		// WriteTimeout is 0 to allow continuous SSE streaming
+		// WriteTimeout stays 0: inference responses stream for as long as the
+		// model takes, and per-write deadlines are set inside the handlers.
 		WriteTimeout: 0,
+		ConnContext:  connContext,
+	}
+	srv.bootstrapSrv = &http.Server{
+		Handler:      srv.bootstrapMux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		ConnContext:  connContext,
 	}
 	return srv
 }
 
 func (s *Server) routes() {
-	s.mux.HandleFunc("POST /bootstrap/v1/join", s.handleJoin)
-	s.mux.HandleFunc("POST /peer/v1/membership/sync", s.handleSync)
-	s.mux.HandleFunc("GET /peer/v1/catalog", s.handleCatalog)
-	s.mux.HandleFunc("POST /peer/v1/inference", s.handleInference)
-	s.mux.HandleFunc("POST /peer/v1/inference/cancel", s.handleCancelInference)
-	s.mux.HandleFunc("POST /peer/v1/community/sync", s.handleCommunitySync)
-	s.mux.HandleFunc("POST /peer/v1/contributions/ack", s.handleContributionsAck)
-	s.mux.HandleFunc("POST /peer/v1/contributions/sync", s.handleContributionsSync)
+	s.bootstrapMux.HandleFunc("POST /bootstrap/v1/join", s.handleJoin)
+
+	s.peerMux.HandleFunc("POST /peer/v1/membership/sync", s.authenticated(s.handleSync))
+	s.peerMux.HandleFunc("GET /peer/v1/catalog", s.authenticated(s.handleCatalog))
+	s.peerMux.HandleFunc("POST /peer/v1/inference", s.authenticated(s.handleInference))
+	s.peerMux.HandleFunc("POST /peer/v1/inference/cancel", s.authenticated(s.handleCancelInference))
+	s.peerMux.HandleFunc("POST /peer/v1/community/sync", s.authenticated(s.handleCommunitySync))
+	s.peerMux.HandleFunc("POST /peer/v1/contributions/ack", s.authenticated(s.handleContributionsAck))
+	s.peerMux.HandleFunc("POST /peer/v1/contributions/sync", s.authenticated(s.handleContributionsSync))
+}
+
+type peerHandler func(w http.ResponseWriter, r *http.Request, caller peerauth.Identity)
+
+// authenticated resolves the caller from the TLS client certificate. The
+// handshake already refused unadmitted peers; re-checking here means a
+// membership removed while a connection is open stops being honored on the
+// very next request instead of when the connection happens to close.
+func (s *Server) authenticated(next peerHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		caller, err := s.CallerIdentity(r)
+		if err != nil {
+			http.Error(w, "unauthorized peer", http.StatusForbidden)
+			return
+		}
+		next(w, r, caller)
+	}
+}
+
+// CallerIdentity reports the authenticated member behind a peer request.
+func (s *Server) CallerIdentity(r *http.Request) (peerauth.Identity, error) {
+	tc, ok := r.Context().Value(tlsConnKey).(*tls.Conn)
+	if !ok || tc == nil {
+		return peerauth.Identity{}, errors.New("peer connection is not mutually authenticated")
+	}
+	return s.roster.IdentityFromConnState(tc.ConnectionState())
+}
+
+func bootstrapDevicePublic(r *http.Request) (string, error) {
+	tc, ok := r.Context().Value(tlsConnKey).(*tls.Conn)
+	if !ok || tc == nil {
+		return "", errors.New("bootstrap connection is not TLS")
+	}
+	return peerauth.BootstrapIdentityFromConnState(tc.ConnectionState())
+}
+
+// MemberIDForDevicePublic derives the room-wide member identifier from a
+// device key. It is the one place the derivation lives.
+func MemberIDForDevicePublic(devicePublic string) (string, error) {
+	if len(devicePublic) < 16 {
+		return "", errors.New("device public key is too short to derive a member id")
+	}
+	return "m-" + devicePublic[:16], nil
 }
 
 type JoinRequest struct {
 	RoomID          string `json:"room_id"`
 	InvitationID    string `json:"invitation_id"`
 	AdmissionSecret string `json:"admission_secret"`
-	DevicePublic    string `json:"device_public"`
 	DisplayName     string `json:"display_name"`
 	TailcatAddr     string `json:"tailcat_addr"`
 }
 
 type JoinResponse struct {
-	Status        room.MemberStatus         `json:"status"`
-	Membership    *room.Membership          `json:"membership,omitempty"`
-	Roster        []room.Membership         `json:"roster,omitempty"`
-	PeerAddresses []store.PeerAddressRecord `json:"peer_addresses,omitempty"`
-	Reason        string                    `json:"reason,omitempty"`
+	Status          room.MemberStatus         `json:"status"`
+	RoomName        string                    `json:"room_name,omitempty"`
+	CreatorMemberID string                    `json:"creator_member_id,omitempty"`
+	Membership      *room.Membership          `json:"membership,omitempty"`
+	Roster          []room.Membership         `json:"roster,omitempty"`
+	PeerAddresses   []store.PeerAddressRecord `json:"peer_addresses,omitempty"`
+	Reason          string                    `json:"reason,omitempty"`
 }
 
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
+	// Only the creator holds the room authority, and an unsigned membership is
+	// worthless to every other node. Admitting from a member node would let a
+	// leaked invitation code bypass the creator entirely.
+	if len(s.authority) != ed25519.PrivateKeySize {
+		http.Error(w, "only the room creator can admit members", http.StatusForbidden)
+		return
+	}
+
+	devicePublic, err := bootstrapDevicePublic(r)
+	if err != nil {
+		http.Error(w, "device certificate required", http.StatusBadRequest)
+		return
+	}
+
 	var req JoinRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -108,29 +208,50 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	roomRec, err := s.store.GetRoomState()
-	if err != nil {
+	if err != nil || roomRec == nil {
 		http.Error(w, "room not found", http.StatusNotFound)
 		return
 	}
-
 	if req.RoomID != roomRec.RoomID {
 		http.Error(w, "wrong room", http.StatusBadRequest)
 		return
 	}
 
-	// Verify invitation
 	if roomRec.InvitationCode == "" {
 		http.Error(w, "invitations disabled", http.StatusForbidden)
 		return
 	}
 	inv, err := room.ParseInvitation(roomRec.InvitationCode)
 	if err != nil || inv.InvitationID != req.InvitationID || !inv.VerifySecret(req.AdmissionSecret) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(JoinResponse{
-			Status: "rejected",
-			Reason: "invalid or rotated invitation code",
-		})
+		writeJoinRejection(w, "invalid or rotated invitation code")
 		return
+	}
+
+	displayName := req.DisplayName
+	if displayName == "" {
+		http.Error(w, "display name is required", http.StatusBadRequest)
+		return
+	}
+
+	memberID, err := MemberIDForDevicePublic(devicePublic)
+	if err != nil {
+		http.Error(w, "invalid device public key", http.StatusBadRequest)
+		return
+	}
+
+	// Re-admission is not automatic. An already-admitted row would otherwise
+	// be overwritten by whoever presents the code next, and a removed member
+	// whose key never changed could walk back in on an unrotated code. The
+	// creator removes the row deliberately before such a device may rejoin.
+	if existing, err := s.store.GetMember(memberID); err == nil && existing != nil {
+		switch room.MemberStatus(existing.Status) {
+		case room.StatusAdmitted:
+			writeJoinRejection(w, "device is already an admitted member")
+			return
+		case room.StatusRemoved:
+			writeJoinRejection(w, "device was removed from this room and cannot rejoin")
+			return
+		}
 	}
 
 	status := room.StatusAdmitted
@@ -138,26 +259,21 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		status = room.StatusPending
 	}
 
-	memberID := "m-" + req.DevicePublic[:16]
 	newRosterVersion := roomRec.RosterVersion + 1
-
 	membership := room.Membership{
 		MemberID:      memberID,
 		RoomID:        roomRec.RoomID,
-		DevicePublic:  req.DevicePublic,
-		DisplayName:   req.DisplayName,
+		DevicePublic:  devicePublic,
+		DisplayName:   displayName,
 		Status:        status,
 		RosterVersion: newRosterVersion,
 	}
-
-	if s.authority != nil {
-		if err := membership.Sign(s.authority); err != nil {
-			http.Error(w, "sign membership failed", http.StatusInternalServerError)
-			return
-		}
+	if err := membership.Sign(s.authority); err != nil {
+		http.Error(w, "sign membership failed", http.StatusInternalServerError)
+		return
 	}
 
-	_ = s.store.SaveMember(store.MemberRecord{
+	if err := s.store.SaveMember(store.MemberRecord{
 		MemberID:      membership.MemberID,
 		RoomID:        membership.RoomID,
 		DevicePublic:  membership.DevicePublic,
@@ -165,7 +281,10 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		Status:        string(membership.Status),
 		RosterVersion: membership.RosterVersion,
 		Signature:     membership.Signature,
-	})
+	}); err != nil {
+		http.Error(w, "save membership failed", http.StatusInternalServerError)
+		return
+	}
 
 	if req.TailcatAddr != "" {
 		_ = s.store.SavePeerAddress(membership.MemberID, req.TailcatAddr)
@@ -174,9 +293,34 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	roomRec.RosterVersion = newRosterVersion
 	_ = s.store.SaveRoomState(*roomRec)
 
-	members, _ := s.store.ListMembers(roomRec.RoomID)
+	creatorMemberID := ""
+	if dev, err := s.store.GetDeviceIdentity(); err == nil && dev != nil {
+		creatorMemberID, _ = MemberIDForDevicePublic(dev.DevicePublic)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(JoinResponse{
+		Status:          status,
+		RoomName:        roomRec.RoomName,
+		CreatorMemberID: creatorMemberID,
+		Membership:      &membership,
+		Roster:          s.rosterSnapshot(roomRec.RoomID, 0),
+		PeerAddresses:   s.peerAddresses(),
+	})
+}
+
+func writeJoinRejection(w http.ResponseWriter, reason string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(JoinResponse{Status: "rejected", Reason: reason})
+}
+
+func (s *Server) rosterSnapshot(roomID string, minVersion int64) []room.Membership {
+	members, _ := s.store.ListMembers(roomID)
 	roster := make([]room.Membership, 0, len(members))
 	for _, m := range members {
+		if m.RosterVersion <= minVersion {
+			continue
+		}
 		roster = append(roster, room.Membership{
 			MemberID:      m.MemberID,
 			RoomID:        m.RoomID,
@@ -187,22 +331,23 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 			Signature:     m.Signature,
 		})
 	}
+	return roster
+}
 
-	peerAddrs, _ := s.store.ListPeerAddresses()
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(JoinResponse{
-		Status:        status,
-		Membership:    &membership,
-		Roster:        roster,
-		PeerAddresses: peerAddrs,
-	})
+func (s *Server) peerAddresses() []store.PeerAddressRecord {
+	addrs, _ := s.store.ListPeerAddresses()
+	if addrs == nil {
+		return []store.PeerAddressRecord{}
+	}
+	return addrs
 }
 
 type SyncRequest struct {
-	KnownVersion int64  `json:"known_version"`
-	MemberID     string `json:"member_id,omitempty"`
-	TailcatAddr  string `json:"tailcat_addr,omitempty"`
+	KnownVersion int64 `json:"known_version"`
+	// TailcatAddr updates the caller's own address only. There is no member_id
+	// field: the address is bound to the authenticated TLS identity, so a
+	// member cannot rebind anyone else's address to a node it controls.
+	TailcatAddr string `json:"tailcat_addr,omitempty"`
 }
 
 type SyncResponse struct {
@@ -211,50 +356,31 @@ type SyncResponse struct {
 	PeerAddresses []store.PeerAddressRecord `json:"peer_addresses,omitempty"`
 }
 
-func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSync(w http.ResponseWriter, r *http.Request, caller peerauth.Identity) {
 	var req SyncRequest
 	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req)
 
-	if req.MemberID != "" && req.TailcatAddr != "" {
-		_ = s.store.SavePeerAddress(req.MemberID, req.TailcatAddr)
+	if req.TailcatAddr != "" {
+		_ = s.store.SavePeerAddress(caller.MemberID, req.TailcatAddr)
 	}
 
 	roomRec, err := s.store.GetRoomState()
-	if err != nil {
+	if err != nil || roomRec == nil {
 		http.Error(w, "no active room", http.StatusNotFound)
 		return
 	}
 
-	allMembers, _ := s.store.ListMembers(roomRec.RoomID)
-	updates := make([]room.Membership, 0)
-	for _, m := range allMembers {
-		if m.RosterVersion > req.KnownVersion {
-			updates = append(updates, room.Membership{
-				MemberID:      m.MemberID,
-				RoomID:        m.RoomID,
-				DevicePublic:  m.DevicePublic,
-				DisplayName:   m.DisplayName,
-				Status:        room.MemberStatus(m.Status),
-				RosterVersion: m.RosterVersion,
-				Signature:     m.Signature,
-			})
-		}
-	}
-
-	peerAddrs, _ := s.store.ListPeerAddresses()
-
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(SyncResponse{
 		RosterVersion: roomRec.RosterVersion,
-		Members:       updates,
-		PeerAddresses: peerAddrs,
+		Members:       s.rosterSnapshot(roomRec.RoomID, req.KnownVersion),
+		PeerAddresses: s.peerAddresses(),
 	})
 }
 
-// Catalog Endpoint
-func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request, caller peerauth.Identity) {
 	roomRec, err := s.store.GetRoomState()
-	if err != nil {
+	if err != nil || roomRec == nil {
 		http.Error(w, "no active room", http.StatusNotFound)
 		return
 	}
@@ -264,7 +390,11 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "device identity missing", http.StatusInternalServerError)
 		return
 	}
-	hostMemberID := "m-" + device.DevicePublic[:16]
+	hostMemberID, err := MemberIDForDevicePublic(device.DevicePublic)
+	if err != nil {
+		http.Error(w, "device identity is malformed", http.StatusInternalServerError)
+		return
+	}
 
 	models, err := s.store.ListHostedModels()
 	if err != nil {
@@ -272,10 +402,10 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	active, queued := s.queue.Stats()
+	active, queued := s.infer.Queue().Stats()
 	queueEst := active + queued
 
-	var ads []catalog.ModelAd
+	ads := make([]catalog.ModelAd, 0, len(models))
 	for _, m := range models {
 		if !m.Enabled || !m.Published {
 			continue
@@ -292,7 +422,6 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 			QueueEstimate: queueEst,
 			IsManaged:     m.ModelType == "managed",
 		}
-
 		if len(s.deviceKey) == ed25519.PrivateKeySize {
 			_ = ad.Sign(s.deviceKey)
 		}
@@ -303,383 +432,42 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(ads)
 }
 
-// Inference Endpoint
-type InferenceRequest struct {
-	RequestID string                `json:"request_id"`
-	MemberID  string                `json:"member_id"`
-	ModelID   string                `json:"model_id"`
-	Messages  []hosting.ChatMessage `json:"messages"`
-}
-
-func (s *Server) handleInference(w http.ResponseWriter, r *http.Request) {
-	var req InferenceRequest
-	// Cap HTTP body to 1 MiB per architecture specification
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		http.Error(w, "request payload too large or invalid", http.StatusBadRequest)
-		return
-	}
-
-	if req.RequestID == "" || req.ModelID == "" || len(req.Messages) == 0 {
-		http.Error(w, "missing required fields", http.StatusBadRequest)
-		return
-	}
-
-	// Verify requester is an admitted member
-	roomRec, err := s.store.GetRoomState()
-	if err != nil {
-		http.Error(w, "room not found", http.StatusNotFound)
-		return
-	}
-
-	members, _ := s.store.ListMembers(roomRec.RoomID)
-	var admitted bool
-	for _, m := range members {
-		if m.MemberID == req.MemberID && m.Status == string(room.StatusAdmitted) {
-			admitted = true
-			break
-		}
-	}
-	if !admitted {
-		http.Error(w, "unauthorized member", http.StatusForbidden)
-		return
-	}
-
-	// Lookup requested model
-	model, err := s.store.GetHostedModel(req.ModelID)
-	if err != nil || !model.Enabled {
-		http.Error(w, "model not found or unavailable", http.StatusNotFound)
-		return
-	}
-
-	// Prepare SSE response
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-
-	// Enqueue into fair queue
-	err = s.queue.Submit(r.Context(), req.MemberID, req.RequestID, func(execCtx context.Context) error {
-		return s.adapter.StreamChat(
-			execCtx,
-			model.EndpointURL,
-			model.APIKey,
-			model.ID,
-			req.Messages,
-			func(delta string) error {
-				chunkJSON, _ := json.Marshal(map[string]string{"delta": delta})
-				_, writeErr := fmt.Fprintf(w, "data: %s\n\n", string(chunkJSON))
-				if writeErr != nil {
-					return writeErr
-				}
-				flusher.Flush()
-				return nil
-			},
-		)
-	})
-
-	if err != nil {
-		if errors.Is(err, inference.ErrMemberQueueFull) {
-			http.Error(w, "member queue limit exceeded", http.StatusTooManyRequests)
-			return
-		}
-		if errors.Is(err, inference.ErrQueueOverflow) {
-			http.Error(w, "host queue is full", http.StatusServiceUnavailable)
-			return
-		}
-		// If error occurred after headers were sent, write error event
-		errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-		_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", string(errJSON))
-		flusher.Flush()
-		return
-	}
-
-	// Host signs contribution receipt if neither has opted out
-	optOut, _ := s.store.GetSetting("contributions_opt_out")
-	device, _ := s.store.GetDeviceIdentity()
-	if optOut != "true" && device != nil && len(s.deviceKey) == ed25519.PrivateKeySize {
-		hostMemberID := "m-" + device.DevicePublic[:16]
-		if req.MemberID != hostMemberID {
-			rec := contributions.Receipt{
-				RequestID:         req.RequestID,
-				RoomID:            roomRec.RoomID,
-				HostMemberID:      hostMemberID,
-				RequesterMemberID: req.MemberID,
-				Timestamp:         time.Now().Unix(),
-				Completed:         true,
-			}
-			if err := rec.SignHost(s.deviceKey); err == nil {
-				recJSON, _ := json.Marshal(rec)
-				_, _ = fmt.Fprintf(w, "event: receipt\ndata: %s\n\n", string(recJSON))
-			}
-		}
-	}
-
-	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
-}
-
-func (s *Server) handleCancelInference(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		RequestID string `json:"request_id"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	if body.RequestID != "" {
-		s.queue.Cancel(body.RequestID)
-	}
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{"cancelled": true})
-}
-
-type CommunitySyncRequest struct {
-	RoomID        string            `json:"room_id"`
-	MemberID      string            `json:"member_id"`
-	KnownEventIDs []string          `json:"known_event_ids"`
-	PushEvents    []community.Event `json:"push_events,omitempty"`
-}
-
-type CommunitySyncResponse struct {
-	PullEvents []community.Event `json:"pull_events"`
-}
-
-func (s *Server) handleCommunitySync(w http.ResponseWriter, r *http.Request) {
-	var req CommunitySyncRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512*1024)).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	roomRec, err := s.store.GetRoomState()
-	if err != nil || roomRec.RoomID != req.RoomID {
-		http.Error(w, "room not found or mismatch", http.StatusBadRequest)
-		return
-	}
-
-	// Verify requester is admitted
-	members, _ := s.store.ListMembers(roomRec.RoomID)
-	var admitted bool
-	for _, m := range members {
-		if m.MemberID == req.MemberID && m.Status == string(room.StatusAdmitted) {
-			admitted = true
-			break
-		}
-	}
-	if !admitted {
-		http.Error(w, "unauthorized: requester is not an admitted member", http.StatusForbidden)
-		return
-	}
-
-	// Ingest pushed events
-	for _, e := range req.PushEvents {
-		if e.EventType == community.EventTombstone {
-			// Tombstone requires room authority signature!
-			authPubBytes, err := identity.DecodeToken(roomRec.AuthorityPublic, ed25519.PublicKeySize)
-			if err != nil || e.Verify(ed25519.PublicKey(authPubBytes)) != nil {
-				continue // reject forged or non-creator tombstone
-			}
-		} else {
-			// Regular event: verify author key
-			author, err := s.store.GetMember(e.AuthorMemberID)
-			if err != nil || author.Status != string(room.StatusAdmitted) {
-				continue
-			}
-			authorPubBytes, err := identity.DecodeToken(author.DevicePublic, ed25519.PublicKeySize)
-			if err != nil || e.Verify(ed25519.PublicKey(authorPubBytes)) != nil {
-				continue // reject invalid signature
-			}
-		}
-
-		_ = s.store.SaveEvent(store.EventRecord{
-			ID:               e.ID,
-			RoomID:           e.RoomID,
-			ChannelID:        e.ChannelID,
-			AuthorMemberID:   e.AuthorMemberID,
-			AuthorSeq:        e.AuthorSeq,
-			EventType:        string(e.EventType),
-			TargetEventID:    e.TargetEventID,
-			Content:          e.Content,
-			Timestamp:        e.Timestamp,
-			Signature:        e.Signature,
-			ReplicatedStatus: "replicated",
-		})
-	}
-
-	// Collect missing events for requester
-	knownMap := make(map[string]bool)
-	for _, id := range req.KnownEventIDs {
-		knownMap[id] = true
-	}
-
-	allEvents, _ := s.store.ListAllEvents(roomRec.RoomID)
-	pullEvents := make([]community.Event, 0)
-	for _, rec := range allEvents {
-		if !knownMap[rec.ID] {
-			pullEvents = append(pullEvents, community.Event{
-				ID:             rec.ID,
-				RoomID:         rec.RoomID,
-				ChannelID:      rec.ChannelID,
-				AuthorMemberID: rec.AuthorMemberID,
-				AuthorSeq:      rec.AuthorSeq,
-				EventType:      community.EventType(rec.EventType),
-				TargetEventID:  rec.TargetEventID,
-				Content:        rec.Content,
-				Timestamp:      rec.Timestamp,
-				Signature:      rec.Signature,
-			})
-			if len(pullEvents) >= 100 {
-				break // bound page size
-			}
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(CommunitySyncResponse{
-		PullEvents: pullEvents,
-	})
-}
-
-func (s *Server) handleContributionsAck(w http.ResponseWriter, r *http.Request) {
-	var rec contributions.Receipt
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&rec); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	roomRec, err := s.store.GetRoomState()
-	if err != nil || roomRec.RoomID != rec.RoomID {
-		http.Error(w, "room mismatch", http.StatusBadRequest)
-		return
-	}
-	if rec.HostMemberID == rec.RequesterMemberID || !rec.Completed {
-		http.Error(w, "invalid receipt", http.StatusBadRequest)
-		return
-	}
-	hostMember, _ := s.store.GetMember(rec.HostMemberID)
-	reqMember, _ := s.store.GetMember(rec.RequesterMemberID)
-	if hostMember == nil || reqMember == nil {
-		http.Error(w, "member not found", http.StatusBadRequest)
-		return
-	}
-	hostPubBytes, _ := identity.DecodeToken(hostMember.DevicePublic, ed25519.PublicKeySize)
-	reqPubBytes, _ := identity.DecodeToken(reqMember.DevicePublic, ed25519.PublicKeySize)
-	if rec.VerifyBoth(ed25519.PublicKey(hostPubBytes), ed25519.PublicKey(reqPubBytes)) != nil {
-		http.Error(w, "invalid signatures", http.StatusBadRequest)
-		return
-	}
-	_ = s.store.SaveReceipt(store.ContributionReceiptRecord{
-		RequestID:          rec.RequestID,
-		RoomID:             rec.RoomID,
-		HostMemberID:       rec.HostMemberID,
-		RequesterMemberID:  rec.RequesterMemberID,
-		Timestamp:          rec.Timestamp,
-		Completed:          rec.Completed,
-		HostSignature:      rec.HostSignature,
-		RequesterSignature: rec.RequesterSignature,
-		ReplicatedStatus:   "replicated",
-	})
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
-}
-
-type ContributionsSyncRequest struct {
-	RoomID          string                  `json:"room_id"`
-	MemberID        string                  `json:"member_id"`
-	KnownRequestIDs []string                `json:"known_request_ids"`
-	PushReceipts    []contributions.Receipt `json:"push_receipts,omitempty"`
-}
-
-type ContributionsSyncResponse struct {
-	PullReceipts []contributions.Receipt `json:"pull_receipts"`
-}
-
-func (s *Server) handleContributionsSync(w http.ResponseWriter, r *http.Request) {
-	var req ContributionsSyncRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512*1024)).Decode(&req); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	roomRec, err := s.store.GetRoomState()
-	if err != nil || roomRec.RoomID != req.RoomID {
-		http.Error(w, "room not found or mismatch", http.StatusBadRequest)
-		return
-	}
-	members, _ := s.store.ListMembers(roomRec.RoomID)
-	var admitted bool
-	for _, m := range members {
-		if m.MemberID == req.MemberID && m.Status == string(room.StatusAdmitted) {
-			admitted = true
-			break
-		}
-	}
-	if !admitted {
-		http.Error(w, "unauthorized member", http.StatusForbidden)
-		return
-	}
-
-	// Ingest pushed receipts
-	for _, rec := range req.PushReceipts {
-		if rec.HostMemberID == rec.RequesterMemberID || !rec.Completed {
-			continue
-		}
-		hostMember, _ := s.store.GetMember(rec.HostMemberID)
-		reqMember, _ := s.store.GetMember(rec.RequesterMemberID)
-		if hostMember == nil || reqMember == nil {
-			continue
-		}
-		hostPubBytes, _ := identity.DecodeToken(hostMember.DevicePublic, ed25519.PublicKeySize)
-		reqPubBytes, _ := identity.DecodeToken(reqMember.DevicePublic, ed25519.PublicKeySize)
-		if rec.VerifyBoth(ed25519.PublicKey(hostPubBytes), ed25519.PublicKey(reqPubBytes)) != nil {
-			continue
-		}
-		_ = s.store.SaveReceipt(store.ContributionReceiptRecord{
-			RequestID:          rec.RequestID,
-			RoomID:             rec.RoomID,
-			HostMemberID:       rec.HostMemberID,
-			RequesterMemberID:  rec.RequesterMemberID,
-			Timestamp:          rec.Timestamp,
-			Completed:          rec.Completed,
-			HostSignature:      rec.HostSignature,
-			RequesterSignature: rec.RequesterSignature,
-			ReplicatedStatus:   "replicated",
-		})
-	}
-
-	// Collect pull receipts
-	knownMap := make(map[string]bool)
-	for _, id := range req.KnownRequestIDs {
-		knownMap[id] = true
-	}
-	allReceipts, _ := s.store.ListReceipts(roomRec.RoomID)
-	pullReceipts := make([]contributions.Receipt, 0)
-	for _, rec := range allReceipts {
-		if !knownMap[rec.RequestID] {
-			pullReceipts = append(pullReceipts, contributions.Receipt{
-				RequestID:          rec.RequestID,
-				RoomID:             rec.RoomID,
-				HostMemberID:       rec.HostMemberID,
-				RequesterMemberID:  rec.RequesterMemberID,
-				Timestamp:          rec.Timestamp,
-				Completed:          rec.Completed,
-				HostSignature:      rec.HostSignature,
-				RequesterSignature: rec.RequesterSignature,
-			})
-			if len(pullReceipts) >= 100 {
-				break
-			}
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(ContributionsSyncResponse{
-		PullReceipts: pullReceipts,
-	})
-}
-
 func (s *Server) Serve(listener net.Listener) error {
-	return s.server.Serve(listener)
+	return s.peerHTTP.Serve(listener)
+}
+
+// ServeBootstrap answers /bootstrap/v1/join. Only the creator ever starts it.
+func (s *Server) ServeBootstrap(listener net.Listener) error {
+	return s.bootstrapSrv.Serve(listener)
+}
+
+// PeerTLSConfig is the server-side configuration for the peer listener.
+func (s *Server) PeerTLSConfig() *tls.Config {
+	return peerauth.PeerServerTLSConfig(s.deviceCert, s.roster)
+}
+
+// BootstrapTLSConfig is the server-side configuration for the bootstrap
+// listener. It returns nil when this node holds no authority-signed room
+// certificate, which is the case for every non-creator.
+func (s *Server) BootstrapTLSConfig() *tls.Config {
+	if s.roomCert == nil {
+		return nil
+	}
+	return peerauth.BootstrapServerTLSConfig(*s.roomCert)
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	bootErr := s.bootstrapSrv.Shutdown(ctx)
+	peerErr := s.peerHTTP.Shutdown(ctx)
+	if peerErr != nil {
+		return peerErr
+	}
+	return bootErr
 }
 
 func (s *Server) Close() error {
-	return s.server.Close()
+	_ = s.bootstrapSrv.Close()
+	return s.peerHTTP.Close()
 }
+
+var errNotAdmitted = fmt.Errorf("caller is not an admitted member")

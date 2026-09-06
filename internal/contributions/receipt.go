@@ -20,11 +20,18 @@ type Receipt struct {
 	HostSignature      string `json:"host_signature"`
 	RequesterSignature string `json:"requester_signature"`
 	ReplicatedStatus   string `json:"replicated_status,omitempty"`
+	// SigVersion selects the signing payload format; see identity.SigningPayload.
+	SigVersion uint8 `json:"sig_version,omitempty"`
 }
 
 func (r *Receipt) Payload() []byte {
-	return []byte(fmt.Sprintf("%s:%s:%s:%s:%d:%t",
-		r.RoomID, r.RequestID, r.HostMemberID, r.RequesterMemberID, r.Timestamp, r.Completed))
+	if r.SigVersion == 0 {
+		// Legacy colon-joined payload, kept only to verify existing receipts.
+		return []byte(fmt.Sprintf("%s:%s:%s:%s:%d:%t",
+			r.RoomID, r.RequestID, r.HostMemberID, r.RequesterMemberID, r.Timestamp, r.Completed))
+	}
+	return identity.SigningPayload(r.SigVersion, "woolwire/contribution-receipt",
+		r.RoomID, r.RequestID, r.HostMemberID, r.RequesterMemberID, r.Timestamp, r.Completed)
 }
 
 func (r *Receipt) SignHost(priv ed25519.PrivateKey) error {
@@ -34,6 +41,7 @@ func (r *Receipt) SignHost(priv ed25519.PrivateKey) error {
 	if r.Timestamp == 0 {
 		r.Timestamp = time.Now().Unix()
 	}
+	r.SigVersion = identity.SigVersionCanonical
 	sig := ed25519.Sign(priv, r.Payload())
 	r.HostSignature = identity.EncodeToken(sig)
 	return nil

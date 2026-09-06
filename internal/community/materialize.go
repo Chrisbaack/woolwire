@@ -1,6 +1,7 @@
 package community
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 )
@@ -20,16 +21,51 @@ type MaterializedMessage struct {
 	ReplicatedStatus string `json:"replicated_status"`
 }
 
+// ChannelAnnouncement is a channel materialized from the signed event log.
+// Channels replicate this way so a channel created on one node is visible and
+// readable on every other, rather than existing only where it was created.
+type ChannelAnnouncement struct {
+	ID             string `json:"id"`
+	RoomID         string `json:"room_id"`
+	Name           string `json:"name"`
+	Description    string `json:"description"`
+	AuthorMemberID string `json:"author_member_id"`
+	CreatedAt      int64  `json:"created_at"`
+}
+
+// ChannelPayload is the JSON body of a channel event's Content field.
+type ChannelPayload struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// Result is everything one pass over the event log produces.
+type Result struct {
+	Messages []MaterializedMessage
+	Channels []ChannelAnnouncement
+	// ConflictedAuthors names authors that published two different events
+	// under the same author_seq. Both events are stored; the deterministic
+	// winner is the lexically smaller event ID so every peer converges on the
+	// same view, and the author is surfaced so the divergence is visible
+	// rather than silently absorbed.
+	ConflictedAuthors []string
+}
+
 func MaterializeEvents(events []Event) []MaterializedMessage {
+	return Materialize(events).Messages
+}
+
+func Materialize(events []Event) Result {
 	if len(events) == 0 {
-		return []MaterializedMessage{}
+		return Result{Messages: []MaterializedMessage{}, Channels: []ChannelAnnouncement{}}
 	}
 
-	// 1. Deduplicate by event ID
+	// 1. Deduplicate by event ID, then resolve author-sequence conflicts.
+	//    Two peers can legitimately receive divergent events in opposite
+	//    orders, so the winner cannot be "whichever arrived first".
 	seenIDs := make(map[string]bool)
-	uniqueEvents := make([]Event, 0, len(events))
-	// Quarantine check: detect conflicting events with same author and same seq
-	seenSeqs := make(map[string]string) // key: author+seq -> eventID
+	bySeq := make(map[string]Event)
+	conflicted := make(map[string]bool)
 
 	for _, e := range events {
 		if seenIDs[e.ID] {
@@ -38,11 +74,22 @@ func MaterializeEvents(events []Event) []MaterializedMessage {
 		seenIDs[e.ID] = true
 
 		seqKey := fmt.Sprintf("%s:%d", e.AuthorMemberID, e.AuthorSeq)
-		if existingID, exists := seenSeqs[seqKey]; exists && existingID != e.ID {
-			// Conflicting sequence from same author! Quarantine: skip conflicting event
+		existing, exists := bySeq[seqKey]
+		if !exists {
+			bySeq[seqKey] = e
 			continue
 		}
-		seenSeqs[seqKey] = e.ID
+		if existing.ID == e.ID {
+			continue
+		}
+		conflicted[e.AuthorMemberID] = true
+		if e.ID < existing.ID {
+			bySeq[seqKey] = e
+		}
+	}
+
+	uniqueEvents := make([]Event, 0, len(bySeq))
+	for _, e := range bySeq {
 		uniqueEvents = append(uniqueEvents, e)
 	}
 
@@ -57,12 +104,32 @@ func MaterializeEvents(events []Event) []MaterializedMessage {
 		return uniqueEvents[i].ID < uniqueEvents[j].ID
 	})
 
-	// 3. Materialize message records
+	// 3. Materialize message and channel records
 	msgMap := make(map[string]*MaterializedMessage)
 	var orderedList []*MaterializedMessage
+	channels := make([]ChannelAnnouncement, 0)
+	seenChannels := make(map[string]bool)
 
 	for _, e := range uniqueEvents {
 		switch e.EventType {
+		case EventChannel:
+			if seenChannels[e.ChannelID] {
+				continue
+			}
+			var payload ChannelPayload
+			if json.Unmarshal([]byte(e.Content), &payload) != nil || payload.Name == "" {
+				continue
+			}
+			seenChannels[e.ChannelID] = true
+			channels = append(channels, ChannelAnnouncement{
+				ID:             e.ChannelID,
+				RoomID:         e.RoomID,
+				Name:           payload.Name,
+				Description:    payload.Description,
+				AuthorMemberID: e.AuthorMemberID,
+				CreatedAt:      e.Timestamp,
+			})
+
 		case EventMessage:
 			status := e.ReplicatedStatus
 			if status == "" {
@@ -83,7 +150,7 @@ func MaterializeEvents(events []Event) []MaterializedMessage {
 
 		case EventEdit:
 			if target, exists := msgMap[e.TargetEventID]; exists {
-				// Only original author can edit their message
+				// Only the original author can edit their message
 				if target.AuthorMemberID == e.AuthorMemberID && !target.Deleted && !target.Tombstoned {
 					target.Content = SanitizeContent(e.Content)
 					target.Edited = true
@@ -92,7 +159,7 @@ func MaterializeEvents(events []Event) []MaterializedMessage {
 
 		case EventDelete:
 			if target, exists := msgMap[e.TargetEventID]; exists {
-				// Only original author can delete their message
+				// Only the original author can delete their message
 				if target.AuthorMemberID == e.AuthorMemberID && !target.Tombstoned {
 					target.Deleted = true
 					target.Content = "[Message deleted by author]"
@@ -108,10 +175,16 @@ func MaterializeEvents(events []Event) []MaterializedMessage {
 		}
 	}
 
-	result := make([]MaterializedMessage, 0, len(orderedList))
+	messages := make([]MaterializedMessage, 0, len(orderedList))
 	for _, m := range orderedList {
-		result = append(result, *m)
+		messages = append(messages, *m)
 	}
 
-	return result
+	authors := make([]string, 0, len(conflicted))
+	for author := range conflicted {
+		authors = append(authors, author)
+	}
+	sort.Strings(authors)
+
+	return Result{Messages: messages, Channels: channels, ConflictedAuthors: authors}
 }

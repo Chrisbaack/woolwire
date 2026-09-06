@@ -41,6 +41,17 @@ func Open(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("apply migrations: %w", err)
 	}
 
+	// The database holds device and authority private keys, so it must never
+	// be group- or world-readable regardless of the process umask. The WAL and
+	// shared-memory sidecars carry the same content.
+	if dbPath != ":memory:" {
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			if _, statErr := os.Stat(dbPath + suffix); statErr == nil {
+				_ = os.Chmod(dbPath+suffix, 0o600)
+			}
+		}
+	}
+
 	return s, nil
 }
 
@@ -134,6 +145,11 @@ type DeviceIdentity struct {
 	DevicePrivate []byte
 	DeviceCertDER []byte
 	DevicePublic  string
+	// TailcatPSK and TailcatAddr must survive restarts together with
+	// TailcatKey: the pre-shared key and the pinned DERP region are both
+	// embedded in the address peers stored and the invitation code carries.
+	TailcatPSK  string
+	TailcatAddr string
 }
 
 func (s *Store) GetDeviceIdentity() (*DeviceIdentity, error) {
@@ -142,9 +158,11 @@ func (s *Store) GetDeviceIdentity() (*DeviceIdentity, error) {
 
 	var id DeviceIdentity
 	err := s.db.QueryRow(`
-		SELECT tailcat_key, device_private, device_cert_der, device_public
+		SELECT tailcat_key, device_private, device_cert_der, device_public,
+		       tailcat_psk, tailcat_addr
 		FROM device_identity WHERE id = 1
-	`).Scan(&id.TailcatKey, &id.DevicePrivate, &id.DeviceCertDER, &id.DevicePublic)
+	`).Scan(&id.TailcatKey, &id.DevicePrivate, &id.DeviceCertDER, &id.DevicePublic,
+		&id.TailcatPSK, &id.TailcatAddr)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -159,14 +177,19 @@ func (s *Store) SaveDeviceIdentity(id DeviceIdentity) error {
 	defer s.mu.Unlock()
 
 	_, err := s.db.Exec(`
-		INSERT INTO device_identity (id, tailcat_key, device_private, device_cert_der, device_public)
-		VALUES (1, ?, ?, ?, ?)
+		INSERT INTO device_identity (
+			id, tailcat_key, device_private, device_cert_der, device_public,
+			tailcat_psk, tailcat_addr
+		) VALUES (1, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			tailcat_key = excluded.tailcat_key,
 			device_private = excluded.device_private,
 			device_cert_der = excluded.device_cert_der,
-			device_public = excluded.device_public
-	`, id.TailcatKey, id.DevicePrivate, id.DeviceCertDER, id.DevicePublic)
+			device_public = excluded.device_public,
+			tailcat_psk = excluded.tailcat_psk,
+			tailcat_addr = excluded.tailcat_addr
+	`, id.TailcatKey, id.DevicePrivate, id.DeviceCertDER, id.DevicePublic,
+		id.TailcatPSK, id.TailcatAddr)
 	return err
 }
 
@@ -183,6 +206,10 @@ type RoomRecord struct {
 	AdmissionSecretHash string
 	ApprovalMode        bool
 	RosterVersion       int64
+	// RoomCertDER is the creator's authority-signed bootstrap certificate.
+	// Joiners pin it from the invitation's authority key before they have a
+	// roster to authenticate anyone with.
+	RoomCertDER []byte
 }
 
 func (s *Store) GetRoomState() (*RoomRecord, error) {
@@ -194,12 +221,12 @@ func (s *Store) GetRoomState() (*RoomRecord, error) {
 	err := s.db.QueryRow(`
 		SELECT room_id, role, room_name, authority_public, authority_private,
 		       bootstrap_addr, invitation_code, invitation_id, admission_secret_hash,
-		       approval_mode, roster_version
-		FROM room_state LIMIT 1
+		       approval_mode, roster_version, room_cert_der
+		FROM room_state ORDER BY rowid ASC LIMIT 1
 	`).Scan(
 		&r.RoomID, &r.Role, &r.RoomName, &r.AuthorityPublic, &r.AuthorityPrivate,
 		&r.BootstrapAddr, &r.InvitationCode, &r.InvitationID, &r.AdmissionSecretHash,
-		&approvalInt, &r.RosterVersion,
+		&approvalInt, &r.RosterVersion, &r.RoomCertDER,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -224,8 +251,8 @@ func (s *Store) SaveRoomState(r RoomRecord) error {
 		INSERT INTO room_state (
 			room_id, role, room_name, authority_public, authority_private,
 			bootstrap_addr, invitation_code, invitation_id, admission_secret_hash,
-			approval_mode, roster_version
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			approval_mode, roster_version, room_cert_der
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(room_id) DO UPDATE SET
 			role = excluded.role,
 			room_name = excluded.room_name,
@@ -236,10 +263,11 @@ func (s *Store) SaveRoomState(r RoomRecord) error {
 			invitation_id = excluded.invitation_id,
 			admission_secret_hash = excluded.admission_secret_hash,
 			approval_mode = excluded.approval_mode,
-			roster_version = excluded.roster_version
+			roster_version = excluded.roster_version,
+			room_cert_der = excluded.room_cert_der
 	`, r.RoomID, r.Role, r.RoomName, r.AuthorityPublic, r.AuthorityPrivate,
 		r.BootstrapAddr, r.InvitationCode, r.InvitationID, r.AdmissionSecretHash,
-		approvalInt, r.RosterVersion)
+		approvalInt, r.RosterVersion, r.RoomCertDER)
 	return err
 }
 
@@ -274,6 +302,7 @@ type MemberRecord struct {
 	Status        string `json:"status"`
 	RosterVersion int64  `json:"roster_version"`
 	Signature     string `json:"signature,omitempty"`
+	SigVersion    uint8  `json:"sig_version"`
 	CreatedAt     int64  `json:"created_at"`
 	UpdatedAt     int64  `json:"updated_at"`
 }
@@ -291,16 +320,17 @@ func (s *Store) SaveMember(m MemberRecord) error {
 	_, err := s.db.Exec(`
 		INSERT INTO members (
 			member_id, room_id, device_public, display_name, status,
-			roster_version, signature, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			roster_version, signature, created_at, updated_at, sig_version
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(member_id) DO UPDATE SET
 			display_name = excluded.display_name,
 			status = excluded.status,
 			roster_version = excluded.roster_version,
 			signature = excluded.signature,
+			sig_version = excluded.sig_version,
 			updated_at = excluded.updated_at
 	`, m.MemberID, m.RoomID, m.DevicePublic, m.DisplayName, m.Status,
-		m.RosterVersion, m.Signature, m.CreatedAt, m.UpdatedAt)
+		m.RosterVersion, m.Signature, m.CreatedAt, m.UpdatedAt, m.SigVersion)
 	return err
 }
 
@@ -311,11 +341,11 @@ func (s *Store) GetMember(memberID string) (*MemberRecord, error) {
 	var m MemberRecord
 	err := s.db.QueryRow(`
 		SELECT member_id, room_id, device_public, display_name, status,
-		       roster_version, signature, created_at, updated_at
+		       roster_version, signature, created_at, updated_at, sig_version
 		FROM members WHERE member_id = ?
 	`, memberID).Scan(
 		&m.MemberID, &m.RoomID, &m.DevicePublic, &m.DisplayName, &m.Status,
-		&m.RosterVersion, &m.Signature, &m.CreatedAt, &m.UpdatedAt,
+		&m.RosterVersion, &m.Signature, &m.CreatedAt, &m.UpdatedAt, &m.SigVersion,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -332,7 +362,7 @@ func (s *Store) ListMembers(roomID string) ([]MemberRecord, error) {
 
 	rows, err := s.db.Query(`
 		SELECT member_id, room_id, device_public, display_name, status,
-		       roster_version, signature, created_at, updated_at
+		       roster_version, signature, created_at, updated_at, sig_version
 		FROM members WHERE room_id = ? ORDER BY display_name ASC
 	`, roomID)
 	if err != nil {
@@ -345,7 +375,7 @@ func (s *Store) ListMembers(roomID string) ([]MemberRecord, error) {
 		var m MemberRecord
 		if err := rows.Scan(
 			&m.MemberID, &m.RoomID, &m.DevicePublic, &m.DisplayName, &m.Status,
-			&m.RosterVersion, &m.Signature, &m.CreatedAt, &m.UpdatedAt,
+			&m.RosterVersion, &m.Signature, &m.CreatedAt, &m.UpdatedAt, &m.SigVersion,
 		); err != nil {
 			return nil, err
 		}
@@ -552,6 +582,14 @@ type HostedModelRecord struct {
 	Enabled      bool   `json:"enabled"`
 	Published    bool   `json:"published"`
 	Revision     int    `json:"revision"`
+	// BackendModel is the identifier the backend server expects in the
+	// OpenAI "model" field. It is separate from ID (opaque, room-wide) and
+	// Name (owner-facing label) so a display name can be changed without
+	// breaking dispatch.
+	BackendModel string `json:"backend_model"`
+	// AllowPrivateNetwork opts this one endpoint out of the private-range
+	// SSRF block. It is per-model and off by default.
+	AllowPrivateNetwork bool `json:"allow_private_network"`
 }
 
 func (s *Store) SaveHostedModel(m HostedModelRecord) error {
@@ -567,11 +605,17 @@ func (s *Store) SaveHostedModel(m HostedModelRecord) error {
 		publishedInt = 1
 	}
 
+	allowPrivateInt := 0
+	if m.AllowPrivateNetwork {
+		allowPrivateInt = 1
+	}
+
 	_, err := s.db.Exec(`
 		INSERT INTO hosted_models (
 			id, name, model_type, endpoint_url, api_key, context_limit,
-			max_tokens, enabled, published, revision
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			max_tokens, enabled, published, revision, backend_model,
+			allow_private_network
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			model_type = excluded.model_type,
@@ -581,9 +625,12 @@ func (s *Store) SaveHostedModel(m HostedModelRecord) error {
 			max_tokens = excluded.max_tokens,
 			enabled = excluded.enabled,
 			published = excluded.published,
-			revision = excluded.revision
+			revision = excluded.revision,
+			backend_model = excluded.backend_model,
+			allow_private_network = excluded.allow_private_network
 	`, m.ID, m.Name, m.ModelType, m.EndpointURL, m.APIKey, m.ContextLimit,
-		m.MaxTokens, enabledInt, publishedInt, m.Revision)
+		m.MaxTokens, enabledInt, publishedInt, m.Revision, m.BackendModel,
+		allowPrivateInt)
 	return err
 }
 
@@ -592,14 +639,16 @@ func (s *Store) GetHostedModel(id string) (*HostedModelRecord, error) {
 	defer s.mu.RUnlock()
 
 	var m HostedModelRecord
-	var enabledInt, publishedInt int
+	var enabledInt, publishedInt, allowPrivateInt int
 	err := s.db.QueryRow(`
 		SELECT id, name, model_type, endpoint_url, api_key, context_limit,
-		       max_tokens, enabled, published, revision
+		       max_tokens, enabled, published, revision, backend_model,
+		       allow_private_network
 		FROM hosted_models WHERE id = ?
 	`, id).Scan(
 		&m.ID, &m.Name, &m.ModelType, &m.EndpointURL, &m.APIKey, &m.ContextLimit,
-		&m.MaxTokens, &enabledInt, &publishedInt, &m.Revision,
+		&m.MaxTokens, &enabledInt, &publishedInt, &m.Revision, &m.BackendModel,
+		&allowPrivateInt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -609,6 +658,7 @@ func (s *Store) GetHostedModel(id string) (*HostedModelRecord, error) {
 	}
 	m.Enabled = enabledInt != 0
 	m.Published = publishedInt != 0
+	m.AllowPrivateNetwork = allowPrivateInt != 0
 	return &m, nil
 }
 
@@ -618,7 +668,8 @@ func (s *Store) ListHostedModels() ([]HostedModelRecord, error) {
 
 	rows, err := s.db.Query(`
 		SELECT id, name, model_type, endpoint_url, api_key, context_limit,
-		       max_tokens, enabled, published, revision
+		       max_tokens, enabled, published, revision, backend_model,
+		       allow_private_network
 		FROM hosted_models ORDER BY name ASC
 	`)
 	if err != nil {
@@ -629,15 +680,17 @@ func (s *Store) ListHostedModels() ([]HostedModelRecord, error) {
 	var models []HostedModelRecord
 	for rows.Next() {
 		var m HostedModelRecord
-		var enabledInt, publishedInt int
+		var enabledInt, publishedInt, allowPrivateInt int
 		if err := rows.Scan(
 			&m.ID, &m.Name, &m.ModelType, &m.EndpointURL, &m.APIKey, &m.ContextLimit,
-			&m.MaxTokens, &enabledInt, &publishedInt, &m.Revision,
+			&m.MaxTokens, &enabledInt, &publishedInt, &m.Revision, &m.BackendModel,
+			&allowPrivateInt,
 		); err != nil {
 			return nil, err
 		}
 		m.Enabled = enabledInt != 0
 		m.Published = publishedInt != 0
+		m.AllowPrivateNetwork = allowPrivateInt != 0
 		models = append(models, m)
 	}
 	return models, rows.Err()
@@ -762,6 +815,7 @@ type EventRecord struct {
 	Timestamp        int64  `json:"timestamp"`
 	Signature        string `json:"signature"`
 	ReplicatedStatus string `json:"replicated_status"` // local, pending, replicated
+	SigVersion       uint8  `json:"sig_version"`
 	CreatedAt        int64  `json:"created_at"`
 }
 
@@ -781,13 +835,13 @@ func (s *Store) SaveEvent(e EventRecord) error {
 		INSERT INTO community_events (
 			id, room_id, channel_id, author_member_id, author_seq,
 			event_type, target_event_id, content, timestamp, signature,
-			replicated_status, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(room_id, author_member_id, author_seq) DO UPDATE SET
+			replicated_status, created_at, sig_version
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
 			replicated_status = excluded.replicated_status
 	`, e.ID, e.RoomID, e.ChannelID, e.AuthorMemberID, e.AuthorSeq,
 		e.EventType, e.TargetEventID, e.Content, e.Timestamp, e.Signature,
-		e.ReplicatedStatus, e.CreatedAt)
+		e.ReplicatedStatus, e.CreatedAt, e.SigVersion)
 	return err
 }
 
@@ -816,7 +870,7 @@ func (s *Store) ListEvents(channelID string) ([]EventRecord, error) {
 	rows, err := s.db.Query(`
 		SELECT id, room_id, channel_id, author_member_id, author_seq,
 		       event_type, COALESCE(target_event_id, ''), content, timestamp, signature,
-		       replicated_status, created_at
+		       replicated_status, created_at, sig_version
 		FROM community_events
 		WHERE channel_id = ?
 		ORDER BY timestamp ASC, author_seq ASC
@@ -832,7 +886,7 @@ func (s *Store) ListEvents(channelID string) ([]EventRecord, error) {
 		if err := rows.Scan(
 			&e.ID, &e.RoomID, &e.ChannelID, &e.AuthorMemberID, &e.AuthorSeq,
 			&e.EventType, &e.TargetEventID, &e.Content, &e.Timestamp, &e.Signature,
-			&e.ReplicatedStatus, &e.CreatedAt,
+			&e.ReplicatedStatus, &e.CreatedAt, &e.SigVersion,
 		); err != nil {
 			return nil, err
 		}
@@ -849,13 +903,13 @@ func (s *Store) GetEvent(id string) (*EventRecord, error) {
 	err := s.db.QueryRow(`
 		SELECT id, room_id, channel_id, author_member_id, author_seq,
 		       event_type, COALESCE(target_event_id, ''), content, timestamp, signature,
-		       replicated_status, created_at
+		       replicated_status, created_at, sig_version
 		FROM community_events
 		WHERE id = ?
 	`, id).Scan(
 		&e.ID, &e.RoomID, &e.ChannelID, &e.AuthorMemberID, &e.AuthorSeq,
 		&e.EventType, &e.TargetEventID, &e.Content, &e.Timestamp, &e.Signature,
-		&e.ReplicatedStatus, &e.CreatedAt,
+		&e.ReplicatedStatus, &e.CreatedAt, &e.SigVersion,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -873,7 +927,7 @@ func (s *Store) ListAllEvents(roomID string) ([]EventRecord, error) {
 	rows, err := s.db.Query(`
 		SELECT id, room_id, channel_id, author_member_id, author_seq,
 		       event_type, COALESCE(target_event_id, ''), content, timestamp, signature,
-		       replicated_status, created_at
+		       replicated_status, created_at, sig_version
 		FROM community_events
 		WHERE room_id = ?
 		ORDER BY timestamp ASC, author_seq ASC
@@ -889,7 +943,7 @@ func (s *Store) ListAllEvents(roomID string) ([]EventRecord, error) {
 		if err := rows.Scan(
 			&e.ID, &e.RoomID, &e.ChannelID, &e.AuthorMemberID, &e.AuthorSeq,
 			&e.EventType, &e.TargetEventID, &e.Content, &e.Timestamp, &e.Signature,
-			&e.ReplicatedStatus, &e.CreatedAt,
+			&e.ReplicatedStatus, &e.CreatedAt, &e.SigVersion,
 		); err != nil {
 			return nil, err
 		}
@@ -958,6 +1012,7 @@ type ContributionReceiptRecord struct {
 	HostSignature      string
 	RequesterSignature string
 	ReplicatedStatus   string
+	SigVersion         uint8
 	CreatedAt          int64
 }
 
@@ -982,14 +1037,16 @@ func (s *Store) SaveReceipt(r ContributionReceiptRecord) error {
 		INSERT INTO contribution_receipts (
 			request_id, room_id, host_member_id, requester_member_id,
 			timestamp, completed, host_signature, requester_signature,
-			replicated_status, created_at
+			replicated_status, created_at, sig_version
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(request_id) DO UPDATE SET
-			replicated_status = excluded.replicated_status
+			replicated_status = excluded.replicated_status,
+			requester_signature = excluded.requester_signature,
+			sig_version = excluded.sig_version
 	`, r.RequestID, r.RoomID, r.HostMemberID, r.RequesterMemberID,
 		r.Timestamp, completedInt, r.HostSignature, r.RequesterSignature,
-		r.ReplicatedStatus, r.CreatedAt)
+		r.ReplicatedStatus, r.CreatedAt, r.SigVersion)
 	return err
 }
 
@@ -1002,12 +1059,12 @@ func (s *Store) GetReceipt(requestID string) (*ContributionReceiptRecord, error)
 	err := s.db.QueryRow(`
 		SELECT request_id, room_id, host_member_id, requester_member_id,
 		       timestamp, completed, host_signature, requester_signature,
-		       replicated_status, created_at
+		       replicated_status, created_at, sig_version
 		FROM contribution_receipts WHERE request_id = ?
 	`, requestID).Scan(
 		&r.RequestID, &r.RoomID, &r.HostMemberID, &r.RequesterMemberID,
 		&r.Timestamp, &completedInt, &r.HostSignature, &r.RequesterSignature,
-		&r.ReplicatedStatus, &r.CreatedAt)
+		&r.ReplicatedStatus, &r.CreatedAt, &r.SigVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1025,7 +1082,7 @@ func (s *Store) ListReceipts(roomID string) ([]ContributionReceiptRecord, error)
 	rows, err := s.db.Query(`
 		SELECT request_id, room_id, host_member_id, requester_member_id,
 		       timestamp, completed, host_signature, requester_signature,
-		       replicated_status, created_at
+		       replicated_status, created_at, sig_version
 		FROM contribution_receipts WHERE room_id = ?
 		ORDER BY timestamp ASC
 	`, roomID)
@@ -1041,7 +1098,7 @@ func (s *Store) ListReceipts(roomID string) ([]ContributionReceiptRecord, error)
 		if err := rows.Scan(
 			&r.RequestID, &r.RoomID, &r.HostMemberID, &r.RequesterMemberID,
 			&r.Timestamp, &completedInt, &r.HostSignature, &r.RequesterSignature,
-			&r.ReplicatedStatus, &r.CreatedAt); err != nil {
+			&r.ReplicatedStatus, &r.CreatedAt, &r.SigVersion); err != nil {
 			return nil, err
 		}
 		r.Completed = completedInt != 0

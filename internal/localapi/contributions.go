@@ -1,8 +1,6 @@
 package localapi
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -43,6 +41,7 @@ func (s *Server) handleGetLeaderboard(w http.ResponseWriter, r *http.Request) {
 			Completed:          rec.Completed,
 			HostSignature:      rec.HostSignature,
 			RequesterSignature: rec.RequesterSignature,
+			SigVersion:         rec.SigVersion,
 			ReplicatedStatus:   rec.ReplicatedStatus,
 		})
 	}
@@ -57,9 +56,10 @@ func (s *Server) handleGetLeaderboard(w http.ResponseWriter, r *http.Request) {
 	localOptOut, _ := s.store.GetSetting("contributions_opt_out")
 	if localOptOut == "true" {
 		device, _ := s.store.GetDeviceIdentity()
-		if device != nil && len(device.DevicePublic) >= 16 {
-			myMemberID := "m-" + device.DevicePublic[:16]
-			optOutMap[myMemberID] = true
+		if device != nil {
+			if myMemberID, err := peerapi.MemberIDForDevicePublic(device.DevicePublic); err == nil {
+				optOutMap[myMemberID] = true
+			}
 		}
 	}
 
@@ -141,25 +141,21 @@ func (s *Server) handleInboundReceipt(ctx context.Context, rec contributions.Rec
 		Completed:          rec.Completed,
 		HostSignature:      rec.HostSignature,
 		RequesterSignature: rec.RequesterSignature,
+		SigVersion:         rec.SigVersion,
 		ReplicatedStatus:   "local",
 	})
 
-	// Acknowledge back to host asynchronously
+	// Acknowledge back to the host asynchronously over the authenticated peer
+	// connection, so the host learns the requester counter-signed.
 	go func() {
-		b, _ := json.Marshal(rec)
-		dialCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		conn, dialErr := s.trans.Dial(dialCtx, hostTailcatAddr, s.peerPort)
-		if dialErr != nil {
-			return
-		}
-		defer conn.Close()
-		req, _ := http.NewRequestWithContext(dialCtx, "POST", "http://woolwire-peer/peer/v1/contributions/ack", bytes.NewReader(b))
-		req.Header.Set("Content-Type", "application/json")
-		_ = req.Write(conn)
+		_ = s.peerJSON(dialCtx, hostMemberID, hostTailcatAddr, "POST", "/peer/v1/contributions/ack", rec, nil)
 	}()
 }
 
+// SyncContributions exchanges receipts with peers using per-pair cursors, so
+// the request body no longer grows with the number of receipts held.
 func (s *Server) SyncContributions(ctx context.Context) {
 	roomRec, err := s.store.GetRoomState()
 	if err != nil || roomRec == nil {
@@ -169,93 +165,99 @@ func (s *Server) SyncContributions(ctx context.Context) {
 	if err != nil || device == nil {
 		return
 	}
-	myMemberID := "m-" + device.DevicePublic[:16]
-
-	allReceipts, _ := s.store.ListReceipts(roomRec.RoomID)
-	knownIDs := make([]string, 0, len(allReceipts))
-	var pushReceipts []contributions.Receipt
-	for _, rec := range allReceipts {
-		knownIDs = append(knownIDs, rec.RequestID)
-		if rec.ReplicatedStatus == "local" {
-			pushReceipts = append(pushReceipts, contributions.Receipt{
-				RequestID:          rec.RequestID,
-				RoomID:             rec.RoomID,
-				HostMemberID:       rec.HostMemberID,
-				RequesterMemberID:  rec.RequesterMemberID,
-				Timestamp:          rec.Timestamp,
-				Completed:          rec.Completed,
-				HostSignature:      rec.HostSignature,
-				RequesterSignature: rec.RequesterSignature,
-			})
-		}
+	myMemberID, err := peerapi.MemberIDForDevicePublic(device.DevicePublic)
+	if err != nil {
+		return
 	}
 
-	peerAddrs, _ := s.store.ListPeerAddresses()
-	for _, pa := range peerAddrs {
+	allReceipts, _ := s.store.ListReceipts(roomRec.RoomID)
+	var pushReceipts []contributions.Receipt
+	for _, rec := range allReceipts {
+		if rec.ReplicatedStatus != "local" {
+			continue
+		}
+		pushReceipts = append(pushReceipts, contributions.Receipt{
+			RequestID:          rec.RequestID,
+			RoomID:             rec.RoomID,
+			HostMemberID:       rec.HostMemberID,
+			RequesterMemberID:  rec.RequesterMemberID,
+			Timestamp:          rec.Timestamp,
+			Completed:          rec.Completed,
+			HostSignature:      rec.HostSignature,
+			RequesterSignature: rec.RequesterSignature,
+			SigVersion:         rec.SigVersion,
+		})
+	}
+
+	for _, pa := range s.knownPeers() {
 		if pa.MemberID == myMemberID {
 			continue
 		}
-		dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		conn, dialErr := s.trans.Dial(dialCtx, pa.TailcatAddr, s.peerPort)
-		if dialErr != nil {
-			cancel()
-			continue
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
-		reqPayload := peerapi.ContributionsSyncRequest{
-			RoomID:          roomRec.RoomID,
-			MemberID:        myMemberID,
-			KnownRequestIDs: knownIDs,
-			PushReceipts:    pushReceipts,
-		}
-		b, _ := json.Marshal(reqPayload)
-		httpReq, _ := http.NewRequestWithContext(dialCtx, "POST", "http://woolwire-peer/peer/v1/contributions/sync", bytes.NewReader(b))
-		httpReq.Header.Set("Content-Type", "application/json")
-		_ = httpReq.Write(conn)
-
-		resp, readErr := http.ReadResponse(bufio.NewReader(conn), httpReq)
-		if readErr == nil {
-			if resp.StatusCode == http.StatusOK {
-				var syncResp peerapi.ContributionsSyncResponse
-				if json.NewDecoder(resp.Body).Decode(&syncResp) == nil {
-					for _, pr := range syncResp.PullReceipts {
-						if pr.HostMemberID == pr.RequesterMemberID || !pr.Completed {
-							continue
-						}
-						hostMember, _ := s.store.GetMember(pr.HostMemberID)
-						reqMember, _ := s.store.GetMember(pr.RequesterMemberID)
-						if hostMember == nil || reqMember == nil {
-							continue
-						}
-						hostPubBytes, _ := identity.DecodeToken(hostMember.DevicePublic, ed25519.PublicKeySize)
-						reqPubBytes, _ := identity.DecodeToken(reqMember.DevicePublic, ed25519.PublicKeySize)
-						if pr.VerifyBoth(ed25519.PublicKey(hostPubBytes), ed25519.PublicKey(reqPubBytes)) != nil {
-							continue
-						}
-						_ = s.store.SaveReceipt(store.ContributionReceiptRecord{
-							RequestID:          pr.RequestID,
-							RoomID:             pr.RoomID,
-							HostMemberID:       pr.HostMemberID,
-							RequesterMemberID:  pr.RequesterMemberID,
-							Timestamp:          pr.Timestamp,
-							Completed:          pr.Completed,
-							HostSignature:      pr.HostSignature,
-							RequesterSignature: pr.RequesterSignature,
-							ReplicatedStatus:   "replicated",
-						})
-					}
-				}
-			}
-			resp.Body.Close()
-		}
-		conn.Close()
-		cancel()
+		s.syncReceiptsWithPeer(ctx, roomRec.RoomID, pa, pushReceipts)
 	}
 
 	for _, pr := range pushReceipts {
-		rec, _ := s.store.GetReceipt(pr.RequestID)
-		if rec != nil {
+		if rec, err := s.store.GetReceipt(pr.RequestID); err == nil && rec != nil {
 			rec.ReplicatedStatus = "replicated"
 			_ = s.store.SaveReceipt(*rec)
+		}
+	}
+}
+
+func (s *Server) syncReceiptsWithPeer(
+	ctx context.Context,
+	roomID string,
+	peer store.PeerAddressRecord,
+	pushReceipts []contributions.Receipt,
+) {
+	const maxPages = 200
+
+	for page := 0; page < maxPages; page++ {
+		dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+
+		cursors, _ := s.store.ReceiptCursors(roomID)
+		req := peerapi.ContributionsSyncRequest{
+			RoomID:  roomID,
+			Cursors: cursors,
+		}
+		if page == 0 {
+			req.PushReceipts = pushReceipts
+		}
+
+		var resp peerapi.ContributionsSyncResponse
+		err := s.peerJSON(dialCtx, peer.MemberID, peer.TailcatAddr, "POST", "/peer/v1/contributions/sync", req, &resp)
+		cancel()
+		if err != nil {
+			return
+		}
+
+		applied := 0
+		for _, pr := range resp.PullReceipts {
+			if !peerapi.VerifyReceipt(s.store, pr) {
+				continue
+			}
+			_ = s.store.SaveReceipt(store.ContributionReceiptRecord{
+				RequestID:          pr.RequestID,
+				RoomID:             pr.RoomID,
+				HostMemberID:       pr.HostMemberID,
+				RequesterMemberID:  pr.RequesterMemberID,
+				Timestamp:          pr.Timestamp,
+				Completed:          pr.Completed,
+				HostSignature:      pr.HostSignature,
+				RequesterSignature: pr.RequesterSignature,
+				SigVersion:         pr.SigVersion,
+				ReplicatedStatus:   "replicated",
+			})
+			applied++
+		}
+
+		if len(resp.PullReceipts) == 0 || applied == 0 {
+			return
 		}
 	}
 }

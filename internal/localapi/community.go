@@ -1,8 +1,6 @@
 package localapi
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -15,10 +13,13 @@ import (
 	"github.com/cbaack/woolwire/internal/community"
 	"github.com/cbaack/woolwire/internal/identity"
 	"github.com/cbaack/woolwire/internal/peerapi"
-	"github.com/cbaack/woolwire/internal/room"
 	"github.com/cbaack/woolwire/internal/store"
 )
 
+// handleListChannels materializes the channel list from the signed event log
+// and merges it with locally created rows. Listing only local rows meant a
+// channel created on one node was invisible on every other, so events for it
+// arrived and were never displayed.
 func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
 	roomRec, err := s.store.GetRoomState()
 	if err != nil || roomRec == nil {
@@ -27,13 +28,16 @@ func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.materializeChannels(roomRec.RoomID)
+
 	channels, err := s.store.ListChannels(roomRec.RoomID)
 	if err != nil {
 		http.Error(w, "failed to query channels", http.StatusInternalServerError)
 		return
 	}
 
-	// Auto-create default #general channel if none exists
+	// Every room has #general. It needs no channel event: the ID is fixed, so
+	// all nodes agree on it without replication.
 	if len(channels) == 0 {
 		general := store.ChannelRecord{
 			ID:          "chan-general",
@@ -50,6 +54,45 @@ func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(channels)
 }
 
+// materializeChannels folds replicated channel events into local rows.
+func (s *Server) materializeChannels(roomID string) {
+	records, err := s.store.ListAllEvents(roomID)
+	if err != nil {
+		return
+	}
+
+	events := make([]community.Event, 0, len(records))
+	for _, rec := range records {
+		if rec.EventType != string(community.EventChannel) {
+			continue
+		}
+		events = append(events, community.Event{
+			ID:             rec.ID,
+			RoomID:         rec.RoomID,
+			ChannelID:      rec.ChannelID,
+			AuthorMemberID: rec.AuthorMemberID,
+			AuthorSeq:      rec.AuthorSeq,
+			EventType:      community.EventType(rec.EventType),
+			Content:        rec.Content,
+			Timestamp:      rec.Timestamp,
+			Signature:      rec.Signature,
+			SigVersion:     rec.SigVersion,
+		})
+	}
+
+	for _, ch := range community.Materialize(events).Channels {
+		_ = s.store.SaveChannel(store.ChannelRecord{
+			ID:          ch.ID,
+			RoomID:      ch.RoomID,
+			Name:        ch.Name,
+			Description: ch.Description,
+			CreatedAt:   ch.CreatedAt,
+		})
+	}
+}
+
+// handleCreateChannel publishes a signed channel event so the channel exists
+// on every node, then materializes it locally.
 func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	roomRec, err := s.store.GetRoomState()
 	if err != nil || roomRec == nil {
@@ -66,28 +109,85 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cleanName := strings.ToLower(strings.TrimSpace(body.Name))
-	cleanName = strings.TrimPrefix(cleanName, "#")
+	device, err := s.store.GetDeviceIdentity()
+	if err != nil || device == nil {
+		http.Error(w, "device identity missing", http.StatusInternalServerError)
+		return
+	}
+	myMemberID, err := peerapi.MemberIDForDevicePublic(device.DevicePublic)
+	if err != nil {
+		http.Error(w, "device identity is malformed", http.StatusInternalServerError)
+		return
+	}
+
+	cleanName := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(body.Name)), "#")
 
 	randBytes := make([]byte, 6)
 	_, _ = rand.Read(randBytes)
-	id := "chan-" + hex.EncodeToString(randBytes)
+	channelID := "chan-" + hex.EncodeToString(randBytes)
+
+	payload, err := json.Marshal(community.ChannelPayload{
+		Name:        cleanName,
+		Description: strings.TrimSpace(body.Description),
+	})
+	if err != nil {
+		http.Error(w, "encode channel payload failed", http.StatusInternalServerError)
+		return
+	}
+
+	seq, _ := s.store.GetLatestAuthorSeq(roomRec.RoomID, myMemberID)
+	event := community.Event{
+		RoomID:         roomRec.RoomID,
+		ChannelID:      channelID,
+		AuthorMemberID: myMemberID,
+		AuthorSeq:      seq + 1,
+		EventType:      community.EventChannel,
+		Content:        string(payload),
+		Timestamp:      time.Now().Unix(),
+	}
+	if err := event.Sign(ed25519.PrivateKey(device.DevicePrivate)); err != nil {
+		http.Error(w, "sign channel event failed", http.StatusInternalServerError)
+		return
+	}
+	if err := s.store.SaveEvent(eventRecord(event, "local")); err != nil {
+		http.Error(w, "failed to save channel event", http.StatusInternalServerError)
+		return
+	}
 
 	ch := store.ChannelRecord{
-		ID:          id,
+		ID:          channelID,
 		RoomID:      roomRec.RoomID,
 		Name:        cleanName,
 		Description: strings.TrimSpace(body.Description),
-		CreatedAt:   time.Now().Unix(),
+		CreatedAt:   event.Timestamp,
 	}
-
 	if err := s.store.SaveChannel(ch); err != nil {
 		http.Error(w, "failed to save channel", http.StatusInternalServerError)
 		return
 	}
 
+	go s.SyncCommunityEvents(context.Background())
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(ch)
+}
+
+// eventRecord converts a signed event into its stored form.
+func eventRecord(e community.Event, status string) store.EventRecord {
+	return store.EventRecord{
+		ID:               e.ID,
+		RoomID:           e.RoomID,
+		ChannelID:        e.ChannelID,
+		AuthorMemberID:   e.AuthorMemberID,
+		AuthorSeq:        e.AuthorSeq,
+		EventType:        string(e.EventType),
+		TargetEventID:    e.TargetEventID,
+		Content:          e.Content,
+		Timestamp:        e.Timestamp,
+		Signature:        e.Signature,
+		SigVersion:       e.SigVersion,
+		ReplicatedStatus: status,
+	}
 }
 
 type EnrichedMaterializedMessage struct {
@@ -121,6 +221,7 @@ func (s *Server) handleGetChannelMessages(w http.ResponseWriter, r *http.Request
 			Content:        rec.Content,
 			Timestamp:        rec.Timestamp,
 			Signature:        rec.Signature,
+			SigVersion:       rec.SigVersion,
 			ReplicatedStatus: rec.ReplicatedStatus,
 		})
 	}
@@ -175,7 +276,11 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "device identity missing", http.StatusInternalServerError)
 		return
 	}
-	myMemberID := "m-" + device.DevicePublic[:16]
+	myMemberID, idErr := peerapi.MemberIDForDevicePublic(device.DevicePublic)
+	if idErr != nil {
+		http.Error(w, "device identity is malformed", http.StatusInternalServerError)
+		return
+	}
 	myPrivKey := ed25519.PrivateKey(device.DevicePrivate)
 
 	var body struct {
@@ -243,7 +348,11 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	device, _ := s.store.GetDeviceIdentity()
-	myMemberID := "m-" + device.DevicePublic[:16]
+	myMemberID, idErr := peerapi.MemberIDForDevicePublic(device.DevicePublic)
+	if idErr != nil {
+		http.Error(w, "device identity is malformed", http.StatusInternalServerError)
+		return
+	}
 	myPrivKey := ed25519.PrivateKey(device.DevicePrivate)
 
 	targetRec, err := s.store.GetEvent(targetID)
@@ -321,7 +430,11 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	device, _ := s.store.GetDeviceIdentity()
-	myMemberID := "m-" + device.DevicePublic[:16]
+	myMemberID, idErr := peerapi.MemberIDForDevicePublic(device.DevicePublic)
+	if idErr != nil {
+		http.Error(w, "device identity is malformed", http.StatusInternalServerError)
+		return
+	}
 	myPrivKey := ed25519.PrivateKey(device.DevicePrivate)
 
 	targetRec, err := s.store.GetEvent(targetID)
@@ -408,7 +521,11 @@ func (s *Server) handleModerateMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	device, _ := s.store.GetDeviceIdentity()
-	myMemberID := "m-" + device.DevicePublic[:16]
+	myMemberID, idErr := peerapi.MemberIDForDevicePublic(device.DevicePublic)
+	if idErr != nil {
+		http.Error(w, "device identity is malformed", http.StatusInternalServerError)
+		return
+	}
 	authorityPriv := ed25519.PrivateKey(roomRec.AuthorityPrivate)
 
 	seq, _ := s.store.GetLatestAuthorSeq(roomRec.RoomID, myMemberID)
@@ -472,6 +589,10 @@ func (s *Server) handleUpdateReadState(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
+// SyncCommunityEvents exchanges events with every known peer using per-author
+// cursors. The previous shape sent every known event ID in each request, which
+// grew without bound and made sync fail permanently once a room passed roughly
+// fifteen thousand events.
 func (s *Server) SyncCommunityEvents(ctx context.Context) {
 	roomRec, err := s.store.GetRoomState()
 	if err != nil || roomRec == nil {
@@ -479,108 +600,112 @@ func (s *Server) SyncCommunityEvents(ctx context.Context) {
 	}
 
 	device, err := s.store.GetDeviceIdentity()
+	if err != nil || device == nil {
+		return
+	}
+	myMemberID, err := peerapi.MemberIDForDevicePublic(device.DevicePublic)
 	if err != nil {
 		return
 	}
-	myMemberID := "m-" + device.DevicePublic[:16]
 
-	allEvents, _ := s.store.ListAllEvents(roomRec.RoomID)
-	knownIDs := make([]string, 0, len(allEvents))
-	var pushEvents []community.Event
-	for _, rec := range allEvents {
-		knownIDs = append(knownIDs, rec.ID)
-		if rec.ReplicatedStatus == "local" {
-			pushEvents = append(pushEvents, community.Event{
-				ID:             rec.ID,
-				RoomID:         rec.RoomID,
-				ChannelID:      rec.ChannelID,
-				AuthorMemberID: rec.AuthorMemberID,
-				AuthorSeq:      rec.AuthorSeq,
-				EventType:      community.EventType(rec.EventType),
-				TargetEventID:  rec.TargetEventID,
-				Content:        rec.Content,
-				Timestamp:      rec.Timestamp,
-				Signature:      rec.Signature,
-			})
-		}
+	authorityBytes, err := identity.DecodeToken(roomRec.AuthorityPublic, ed25519.PublicKeySize)
+	if err != nil {
+		return
 	}
+	authority := ed25519.PublicKey(authorityBytes)
 
-	peerAddrs, _ := s.store.ListPeerAddresses()
-	for _, pa := range peerAddrs {
+	pushEvents := s.pendingLocalEvents(roomRec.RoomID)
+
+	for _, pa := range s.knownPeers() {
 		if pa.MemberID == myMemberID {
 			continue
 		}
-
-		dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		conn, dialErr := s.trans.Dial(dialCtx, pa.TailcatAddr, s.peerPort)
-		if dialErr != nil {
-			cancel()
-			continue
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
-
-		reqPayload := peerapi.CommunitySyncRequest{
-			RoomID:        roomRec.RoomID,
-			MemberID:      myMemberID,
-			KnownEventIDs: knownIDs,
-			PushEvents:    pushEvents,
-		}
-		b, _ := json.Marshal(reqPayload)
-
-		httpReq, _ := http.NewRequestWithContext(dialCtx, "POST", "http://woolwire-peer/peer/v1/community/sync", bytes.NewReader(b))
-		httpReq.Header.Set("Content-Type", "application/json")
-		_ = httpReq.Write(conn)
-
-		resp, readErr := http.ReadResponse(bufio.NewReader(conn), httpReq)
-		if readErr == nil {
-			if resp.StatusCode == http.StatusOK {
-				var syncResp peerapi.CommunitySyncResponse
-				if json.NewDecoder(resp.Body).Decode(&syncResp) == nil {
-					for _, pe := range syncResp.PullEvents {
-						if pe.EventType == community.EventTombstone {
-							authPubBytes, err := identity.DecodeToken(roomRec.AuthorityPublic, ed25519.PublicKeySize)
-							if err != nil || pe.Verify(ed25519.PublicKey(authPubBytes)) != nil {
-								continue
-							}
-						} else {
-							author, err := s.store.GetMember(pe.AuthorMemberID)
-							if err != nil || author.Status != string(room.StatusAdmitted) {
-								continue
-							}
-							authorPubBytes, err := identity.DecodeToken(author.DevicePublic, ed25519.PublicKeySize)
-							if err != nil || pe.Verify(ed25519.PublicKey(authorPubBytes)) != nil {
-								continue
-							}
-						}
-
-						// Save pulled event
-						_ = s.store.SaveEvent(store.EventRecord{
-							ID:               pe.ID,
-							RoomID:           pe.RoomID,
-							ChannelID:        pe.ChannelID,
-							AuthorMemberID:   pe.AuthorMemberID,
-							AuthorSeq:        pe.AuthorSeq,
-							EventType:        string(pe.EventType),
-							TargetEventID:    pe.TargetEventID,
-							Content:          pe.Content,
-							Timestamp:        pe.Timestamp,
-							Signature:        pe.Signature,
-							ReplicatedStatus: "replicated",
-						})
-					}
-				}
-			}
-			resp.Body.Close()
-		}
-		conn.Close()
-		cancel()
+		s.syncEventsWithPeer(ctx, roomRec.RoomID, authority, pa, pushEvents)
 	}
 
-	// Mark pushed events as replicated
+	// Only mark pushed events replicated once a peer has been offered them.
 	for _, pe := range pushEvents {
-		rec, _ := s.store.GetEvent(pe.ID)
-		if rec != nil {
+		if rec, err := s.store.GetEvent(pe.ID); err == nil && rec != nil {
 			rec.ReplicatedStatus = "replicated"
 			_ = s.store.SaveEvent(*rec)
+		}
+	}
+}
+
+func (s *Server) pendingLocalEvents(roomID string) []community.Event {
+	all, _ := s.store.ListAllEvents(roomID)
+	var pending []community.Event
+	for _, rec := range all {
+		if rec.ReplicatedStatus != "local" {
+			continue
+		}
+		pending = append(pending, community.Event{
+			ID:             rec.ID,
+			RoomID:         rec.RoomID,
+			ChannelID:      rec.ChannelID,
+			AuthorMemberID: rec.AuthorMemberID,
+			AuthorSeq:      rec.AuthorSeq,
+			EventType:      community.EventType(rec.EventType),
+			TargetEventID:  rec.TargetEventID,
+			Content:        rec.Content,
+			Timestamp:      rec.Timestamp,
+			Signature:      rec.Signature,
+			SigVersion:     rec.SigVersion,
+		})
+	}
+	return pending
+}
+
+// syncEventsWithPeer pages until the peer reports nothing further. Each round
+// trip carries only the cursors, so the request body stays bounded no matter
+// how large the room's history grows.
+func (s *Server) syncEventsWithPeer(
+	ctx context.Context,
+	roomID string,
+	authority ed25519.PublicKey,
+	peer store.PeerAddressRecord,
+	pushEvents []community.Event,
+) {
+	const maxPages = 200
+
+	for page := 0; page < maxPages; page++ {
+		dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+
+		cursors, _ := s.store.AuthorCursors(roomID)
+		req := peerapi.CommunitySyncRequest{
+			RoomID:  roomID,
+			Cursors: cursors,
+		}
+		if page == 0 {
+			req.PushEvents = pushEvents
+		}
+
+		var resp peerapi.CommunitySyncResponse
+		err := s.peerJSON(dialCtx, peer.MemberID, peer.TailcatAddr, "POST", "/peer/v1/community/sync", req, &resp)
+		cancel()
+		if err != nil {
+			return
+		}
+
+		applied := 0
+		for _, pe := range resp.PullEvents {
+			if !peerapi.AcceptInboundEvent(s.store, pe, authority) {
+				continue
+			}
+			if err := s.store.SaveEvent(eventRecord(pe, "replicated")); err == nil {
+				applied++
+			}
+		}
+
+		// An empty page, or a page that advanced nothing, means either caught
+		// up or stuck; either way there is no progress left to make here.
+		if len(resp.PullEvents) == 0 || applied == 0 {
+			return
 		}
 	}
 }

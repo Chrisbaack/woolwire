@@ -1,7 +1,6 @@
 package localapi
 
 import (
-	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -15,6 +14,7 @@ import (
 	"github.com/cbaack/woolwire/internal/catalog"
 	"github.com/cbaack/woolwire/internal/hosting"
 	"github.com/cbaack/woolwire/internal/identity"
+	"github.com/cbaack/woolwire/internal/peerapi"
 	"github.com/cbaack/woolwire/internal/room"
 	"github.com/cbaack/woolwire/internal/store"
 )
@@ -35,15 +35,17 @@ func (s *Server) handleListHostedModels(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleSaveHostedModel(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID           string `json:"id"`
-		Name         string `json:"name"`
-		ModelType    string `json:"model_type"`
-		EndpointURL  string `json:"endpoint_url"`
-		APIKey       string `json:"api_key"`
-		ContextLimit int    `json:"context_limit"`
-		MaxTokens    int    `json:"max_tokens"`
-		Enabled      *bool  `json:"enabled"`
-		Published    bool   `json:"published"`
+		ID                  string `json:"id"`
+		Name                string `json:"name"`
+		ModelType           string `json:"model_type"`
+		EndpointURL         string `json:"endpoint_url"`
+		APIKey              string `json:"api_key"`
+		BackendModel        string `json:"backend_model"`
+		ContextLimit        int    `json:"context_limit"`
+		MaxTokens           int    `json:"max_tokens"`
+		Enabled             *bool  `json:"enabled"`
+		Published           bool   `json:"published"`
+		AllowPrivateNetwork bool   `json:"allow_private_network"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -59,8 +61,11 @@ func (s *Server) handleSaveHostedModel(w http.ResponseWriter, r *http.Request) {
 		body.ModelType = "external"
 	}
 
-	// Validate endpoint destination to protect against SSRF and insecure off-machine HTTP
-	if err := hosting.ValidateDestination(body.EndpointURL); err != nil {
+	// Validate endpoint destination to protect against SSRF and insecure
+	// off-machine HTTP. The authoritative check runs again at dial time
+	// against the addresses the name actually resolves to.
+	policy := hosting.DestinationPolicy{AllowPrivateNetwork: body.AllowPrivateNetwork}
+	if err := hosting.ValidateDestinationWithPolicy(body.EndpointURL, policy); err != nil {
 		http.Error(w, fmt.Sprintf("invalid endpoint destination: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -91,17 +96,26 @@ func (s *Server) handleSaveHostedModel(w http.ResponseWriter, r *http.Request) {
 		enabled = *body.Enabled
 	}
 
+	// BackendModel defaults to the display name, which is what a discovery
+	// call returns and what a multi-model backend expects to be sent.
+	backendModel := strings.TrimSpace(body.BackendModel)
+	if backendModel == "" {
+		backendModel = strings.TrimSpace(body.Name)
+	}
+
 	rec := store.HostedModelRecord{
-		ID:           id,
-		Name:         strings.TrimSpace(body.Name),
-		ModelType:    body.ModelType,
-		EndpointURL:  strings.TrimSpace(body.EndpointURL),
-		APIKey:       body.APIKey,
-		ContextLimit: contextLimit,
-		MaxTokens:    maxTokens,
-		Enabled:      enabled,
-		Published:    body.Published,
-		Revision:     revision,
+		ID:                  id,
+		Name:                strings.TrimSpace(body.Name),
+		ModelType:           body.ModelType,
+		EndpointURL:         strings.TrimSpace(body.EndpointURL),
+		APIKey:              body.APIKey,
+		BackendModel:        backendModel,
+		ContextLimit:        contextLimit,
+		MaxTokens:           maxTokens,
+		Enabled:             enabled,
+		Published:           body.Published,
+		Revision:            revision,
+		AllowPrivateNetwork: body.AllowPrivateNetwork,
 	}
 
 	if err := s.store.SaveHostedModel(rec); err != nil {
@@ -131,9 +145,10 @@ func (s *Server) handleDeleteHostedModel(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleTestHostedModel(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID          string `json:"id"`
-		EndpointURL string `json:"endpoint_url"`
-		APIKey      string `json:"api_key"`
+		ID                  string `json:"id"`
+		EndpointURL         string `json:"endpoint_url"`
+		APIKey              string `json:"api_key"`
+		AllowPrivateNetwork bool   `json:"allow_private_network"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -142,6 +157,7 @@ func (s *Server) handleTestHostedModel(w http.ResponseWriter, r *http.Request) {
 
 	endpointURL := strings.TrimSpace(body.EndpointURL)
 	apiKey := strings.TrimSpace(body.APIKey)
+	policy := hosting.DestinationPolicy{AllowPrivateNetwork: body.AllowPrivateNetwork}
 
 	// If ID provided, load from store
 	if body.ID != "" && endpointURL == "" {
@@ -152,6 +168,7 @@ func (s *Server) handleTestHostedModel(w http.ResponseWriter, r *http.Request) {
 		}
 		endpointURL = rec.EndpointURL
 		apiKey = rec.APIKey
+		policy.AllowPrivateNetwork = rec.AllowPrivateNetwork
 	}
 
 	if endpointURL == "" {
@@ -162,7 +179,7 @@ func (s *Server) handleTestHostedModel(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	latency, models, err := s.adapter.TestEndpoint(ctx, endpointURL, apiKey)
+	latency, models, err := s.adapter.TestEndpoint(ctx, endpointURL, apiKey, policy)
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -182,8 +199,9 @@ func (s *Server) handleTestHostedModel(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDiscoverHostedModels(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		EndpointURL string `json:"endpoint_url"`
-		APIKey      string `json:"api_key"`
+		EndpointURL         string `json:"endpoint_url"`
+		APIKey              string `json:"api_key"`
+		AllowPrivateNetwork bool   `json:"allow_private_network"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -199,7 +217,8 @@ func (s *Server) handleDiscoverHostedModels(w http.ResponseWriter, r *http.Reque
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	models, err := s.adapter.QueryModels(ctx, endpointURL, strings.TrimSpace(body.APIKey))
+	models, err := s.adapter.QueryModels(ctx, endpointURL, strings.TrimSpace(body.APIKey),
+		hosting.DestinationPolicy{AllowPrivateNetwork: body.AllowPrivateNetwork})
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -253,6 +272,9 @@ func (s *Server) handleSaveHostLimits(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to save host limits", http.StatusInternalServerError)
 		return
 	}
+	// The shared queue picks up the new limits immediately; otherwise an
+	// edited limit would only take effect on the next restart.
+	s.infer.ReloadLimits()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(body)
@@ -276,7 +298,7 @@ func (s *Server) handleGetCatalog(w http.ResponseWriter, r *http.Request) {
 	var myPubKey ed25519.PublicKey
 	var myPrivKey ed25519.PrivateKey
 	if device != nil {
-		myMemberID = "m-" + device.DevicePublic[:16]
+		myMemberID, _ = peerapi.MemberIDForDevicePublic(device.DevicePublic)
 		if pubBytes, err := identity.DecodeToken(device.DevicePublic, ed25519.PublicKeySize); err == nil {
 			myPubKey = ed25519.PublicKey(pubBytes)
 		}
@@ -308,56 +330,36 @@ func (s *Server) handleGetCatalog(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2. Query all known peer addresses for their catalogs
-	peerAddrs, _ := s.store.ListPeerAddresses()
-	for _, pa := range peerAddrs {
+	// 2. Query all known peer addresses for their catalogs over authenticated
+	//    connections, and accept an advertisement only from the member whose
+	//    identity the handshake proved.
+	for _, pa := range s.knownPeers() {
 		if pa.MemberID == myMemberID {
 			continue
 		}
 
-		dialCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		conn, dialErr := s.trans.Dial(dialCtx, pa.TailcatAddr, s.peerPort)
-		if dialErr != nil {
-			cancel()
-			continue
-		}
-
-		httpReq, reqErr := http.NewRequestWithContext(dialCtx, "GET", "http://woolwire-peer/peer/v1/catalog", nil)
-		if reqErr != nil {
-			_ = conn.Close()
-			cancel()
-			continue
-		}
-
-		if writeErr := httpReq.Write(conn); writeErr != nil {
-			_ = conn.Close()
-			cancel()
-			continue
-		}
-
-		resp, readErr := http.ReadResponse(bufio.NewReader(conn), httpReq)
-		if readErr != nil {
-			_ = conn.Close()
-			cancel()
-			continue
-		}
-
-		if resp.StatusCode == http.StatusOK {
-			var ads []catalog.ModelAd
-			if decErr := json.NewDecoder(resp.Body).Decode(&ads); decErr == nil {
-				for _, ad := range ads {
-					// Verify member is admitted
-					if m, mErr := s.store.GetMember(ad.HostMemberID); mErr == nil && m.Status == string(room.StatusAdmitted) {
-						if pubBytes, dErr := identity.DecodeToken(m.DevicePublic, ed25519.PublicKeySize); dErr == nil {
-							_ = s.catalog.Upsert(ad, ed25519.PublicKey(pubBytes))
-						}
-					}
-				}
-			}
-		}
-		_ = resp.Body.Close()
-		_ = conn.Close()
+		dialCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		var ads []catalog.ModelAd
+		err := s.peerJSON(dialCtx, pa.MemberID, pa.TailcatAddr, "GET", "/peer/v1/catalog", nil, &ads)
 		cancel()
+		if err != nil {
+			continue
+		}
+
+		for _, ad := range ads {
+			if ad.HostMemberID != pa.MemberID {
+				continue // a peer may only advertise its own models
+			}
+			m, mErr := s.store.GetMember(ad.HostMemberID)
+			if mErr != nil || m == nil || m.Status != string(room.StatusAdmitted) {
+				continue
+			}
+			pubBytes, dErr := identity.DecodeToken(m.DevicePublic, ed25519.PublicKeySize)
+			if dErr != nil {
+				continue
+			}
+			_ = s.catalog.Upsert(ad, ed25519.PublicKey(pubBytes))
+		}
 	}
 
 	// 3. Return all currently available ads (filtering out stale / offline)
