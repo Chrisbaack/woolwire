@@ -94,7 +94,14 @@ func (p DestinationPolicy) CheckIP(ip net.IP) error {
 	return nil
 }
 
-func (p DestinationPolicy) checkPort(port int) error {
+// checkPort restricts which ports may be reached off-machine. Loopback is
+// exempt: local inference servers bind wherever they like, and the port
+// allowlist exists to limit what a mistyped or hostile URL can reach on the
+// network, not on the owner's own machine.
+func (p DestinationPolicy) checkPort(ip net.IP, port int) error {
+	if ip != nil && ip.IsLoopback() {
+		return nil
+	}
 	if p.AllowPrivateNetwork {
 		return nil // the owner override covers non-standard ports too
 	}
@@ -141,9 +148,6 @@ func ValidateDestinationWithPolicy(endpointURL string, policy DestinationPolicy)
 		}
 		port = parsed
 	}
-	if err := policy.checkPort(port); err != nil {
-		return err
-	}
 
 	lowered := strings.ToLower(strings.TrimSuffix(host, "."))
 	for _, name := range metadataHostnames {
@@ -158,12 +162,21 @@ func ValidateDestinationWithPolicy(endpointURL string, policy DestinationPolicy)
 		if err := policy.CheckIP(ip); err != nil {
 			return err
 		}
+		if err := policy.checkPort(ip, port); err != nil {
+			return err
+		}
 		if u.Scheme == "http" && !ip.IsLoopback() && !policy.AllowPrivateNetwork {
 			return errors.New("plain HTTP is restricted to loopback; off-machine endpoints require HTTPS")
 		}
+	} else if lowered != "localhost" {
+		// The port allowlist still applies to names, which resolve off-machine
+		// unless they are literally localhost.
+		if err := policy.checkPort(nil, port); err != nil {
+			return err
+		}
 	}
 
-	return nil
+	return requirePlainHTTPIsLocal(endpointURL, policy)
 }
 
 // GuardedDialer resolves the destination itself and refuses any address the
@@ -181,9 +194,6 @@ func GuardedDialer(policy DestinationPolicy) func(ctx context.Context, network, 
 		port, err := strconv.Atoi(portStr)
 		if err != nil {
 			return nil, fmt.Errorf("%w: unparsable port %q", ErrBlockedDestination, portStr)
-		}
-		if err := policy.checkPort(port); err != nil {
-			return nil, err
 		}
 
 		var candidates []net.IP
@@ -206,6 +216,9 @@ func GuardedDialer(policy DestinationPolicy) func(ctx context.Context, network, 
 		// private address is a rebinding attempt, not a fallback.
 		for _, ip := range candidates {
 			if err := policy.CheckIP(ip); err != nil {
+				return nil, err
+			}
+			if err := policy.checkPort(ip, port); err != nil {
 				return nil, err
 			}
 		}

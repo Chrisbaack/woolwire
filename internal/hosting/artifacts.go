@@ -60,6 +60,20 @@ type ArtifactManager struct {
 	mu        sync.RWMutex
 	reserved  int64 // bytes promised to in-flight downloads
 	downloads map[string]*downloadJob
+
+	// httpClient overrides the SSRF-guarded client. It exists so tests can
+	// trust a self-signed local server; production leaves it nil.
+	httpClient *http.Client
+}
+
+func (m *ArtifactManager) clientFor(policy DestinationPolicy) *http.Client {
+	m.mu.RLock()
+	override := m.httpClient
+	m.mu.RUnlock()
+	if override != nil {
+		return override
+	}
+	return guardedClient(policy, 60*time.Second)
 }
 
 func NewArtifactManager(modelsDir string, maxBudget int64) (*ArtifactManager, error) {
@@ -141,7 +155,7 @@ func (m *ArtifactManager) DownloadArtifact(
 		return nil, err
 	}
 
-	resp, err := guardedClient(policy, 60*time.Second).Do(req)
+	resp, err := m.clientFor(policy).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http download failed: %w", err)
 	}

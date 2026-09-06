@@ -4,8 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cbaack/woolwire/internal/runner"
 )
 
 func TestM3RunnerControllerAndArtifactsGate(t *testing.T) {
@@ -141,83 +138,9 @@ func TestM3RunnerControllerAndArtifactsGate(t *testing.T) {
 		}
 	})
 
-	// ---------------------------------------------------------------------------------
-	// Part 2: Isolated Runner Controller & Protocol
-	// ---------------------------------------------------------------------------------
-	t.Run("Runner Controller: argument validation, isolation and engine lifecycle", func(t *testing.T) {
-		token := "secret-runner-auth-token"
-		ctrl, err := runner.NewController(runner.Config{
-			ModelDir:    modelsDir,
-			RunnerToken: token,
-			EnginePath:  "echo", // use echo as dummy engine command
-			EnginePort:  9099,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer l.Close()
-
-		go func() { _ = ctrl.Serve(l) }()
-
-		baseURL := fmt.Sprintf("http://%s", l.Addr().String())
-		client := NewRunnerClient(baseURL, token)
-
-		// 1. Health check
-		h, err := client.Health(context.Background())
-		if err != nil {
-			t.Fatalf("runner health failed: %v", err)
-		}
-		if h.Status != string(runner.StatusIdle) {
-			t.Fatalf("expected idle status, got: %s", h.Status)
-		}
-
-		// 2. Authentication check: wrong token fails
-		badClient := NewRunnerClient(baseURL, "wrong-token")
-		_, err = badClient.Health(context.Background())
-		if err == nil {
-			t.Fatal("expected unauthorized error with wrong token, got nil")
-		}
-
-		// 3. Path traversal in load model rejected
-		err = client.LoadModel(context.Background(), "m1", "../etc/passwd", 4096, 4, 0)
-		if err == nil {
-			t.Fatal("expected path traversal rejection, got nil")
-		}
-
-		// 4. Non-existent file rejected
-		err = client.LoadModel(context.Background(), "m1", "ghost.gguf", 4096, 4, 0)
-		if err == nil {
-			t.Fatal("expected missing file rejection, got nil")
-		}
-
-		// 5. Successful load of approved model
-		err = client.LoadModel(context.Background(), "tiny-model", dummyGGUFName, 4096, 2, 0)
-		if err != nil {
-			t.Fatalf("load approved model failed: %v", err)
-		}
-
-		// 6. Restart engine (used between requesting members to release prompt state)
-		err = client.RestartEngine(context.Background())
-		if err != nil {
-			t.Fatalf("restart engine failed: %v", err)
-		}
-
-		// 7. Unload model
-		err = client.UnloadModel(context.Background())
-		if err != nil {
-			t.Fatalf("unload model failed: %v", err)
-		}
-
-		h, err = client.Health(context.Background())
-		if err != nil || h.Status != string(runner.StatusIdle) {
-			t.Fatalf("expected idle after unload, got: %s", h.Status)
-		}
-	})
+	// The runner controller's own gate (argument validation, engine lifecycle,
+	// per-member isolation) is covered against a fake engine in
+	// internal/runner/controller_test.go.
 
 	// ---------------------------------------------------------------------------------
 	// Part 3: Hardware Detection

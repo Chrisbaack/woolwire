@@ -30,6 +30,75 @@ const (
 	eventRetentionWindow = 30 * 24 * time.Hour
 )
 
+// EventFromRecord and EventRecord convert between the wire and stored forms of
+// a community event. They exist so no caller hand-copies the field list: an
+// earlier hand-written conversion dropped SigVersion, which made every
+// replicated event fail signature verification on the receiving node.
+func EventFromRecord(rec store.EventRecord) community.Event {
+	return community.Event{
+		ID:               rec.ID,
+		RoomID:           rec.RoomID,
+		ChannelID:        rec.ChannelID,
+		AuthorMemberID:   rec.AuthorMemberID,
+		AuthorSeq:        rec.AuthorSeq,
+		EventType:        community.EventType(rec.EventType),
+		TargetEventID:    rec.TargetEventID,
+		Content:          rec.Content,
+		Timestamp:        rec.Timestamp,
+		Signature:        rec.Signature,
+		SigVersion:       rec.SigVersion,
+		ReplicatedStatus: rec.ReplicatedStatus,
+	}
+}
+
+func EventRecord(e community.Event, status string) store.EventRecord {
+	return store.EventRecord{
+		ID:               e.ID,
+		RoomID:           e.RoomID,
+		ChannelID:        e.ChannelID,
+		AuthorMemberID:   e.AuthorMemberID,
+		AuthorSeq:        e.AuthorSeq,
+		EventType:        string(e.EventType),
+		TargetEventID:    e.TargetEventID,
+		Content:          e.Content,
+		Timestamp:        e.Timestamp,
+		Signature:        e.Signature,
+		SigVersion:       e.SigVersion,
+		ReplicatedStatus: status,
+	}
+}
+
+// ReceiptFromRecord and ReceiptRecord do the same for contribution receipts.
+func ReceiptFromRecord(rec store.ContributionReceiptRecord) contributions.Receipt {
+	return contributions.Receipt{
+		RequestID:          rec.RequestID,
+		RoomID:             rec.RoomID,
+		HostMemberID:       rec.HostMemberID,
+		RequesterMemberID:  rec.RequesterMemberID,
+		Timestamp:          rec.Timestamp,
+		Completed:          rec.Completed,
+		HostSignature:      rec.HostSignature,
+		RequesterSignature: rec.RequesterSignature,
+		SigVersion:         rec.SigVersion,
+		ReplicatedStatus:   rec.ReplicatedStatus,
+	}
+}
+
+func ReceiptRecord(rec contributions.Receipt, status string) store.ContributionReceiptRecord {
+	return store.ContributionReceiptRecord{
+		RequestID:          rec.RequestID,
+		RoomID:             rec.RoomID,
+		HostMemberID:       rec.HostMemberID,
+		RequesterMemberID:  rec.RequesterMemberID,
+		Timestamp:          rec.Timestamp,
+		Completed:          rec.Completed,
+		HostSignature:      rec.HostSignature,
+		RequesterSignature: rec.RequesterSignature,
+		SigVersion:         rec.SigVersion,
+		ReplicatedStatus:   status,
+	}
+}
+
 // CommunitySyncRequest replaces the full known-ID list with one cursor per
 // author. The old shape grew without bound and made sync fail permanently
 // once the room passed roughly fifteen thousand events.
@@ -68,37 +137,14 @@ func (s *Server) handleCommunitySync(w http.ResponseWriter, r *http.Request, cal
 		if !s.acceptInboundEvent(e, ed25519.PublicKey(authorityPub)) {
 			continue
 		}
-		_ = s.store.SaveEvent(store.EventRecord{
-			ID:               e.ID,
-			RoomID:           e.RoomID,
-			ChannelID:        e.ChannelID,
-			AuthorMemberID:   e.AuthorMemberID,
-			AuthorSeq:        e.AuthorSeq,
-			EventType:        string(e.EventType),
-			TargetEventID:    e.TargetEventID,
-			Content:          e.Content,
-			Timestamp:        e.Timestamp,
-			Signature:        e.Signature,
-			ReplicatedStatus: "replicated",
-		})
+		_ = s.store.SaveEvent(EventRecord(e, "replicated"))
 	}
 
 	records, _ := s.store.ListEventsAfterCursor(roomRec.RoomID, req.Cursors, syncPageSize)
 	pullEvents := make([]community.Event, 0, len(records))
 	nextCursors := make(map[string]int64, len(records))
 	for _, rec := range records {
-		pullEvents = append(pullEvents, community.Event{
-			ID:             rec.ID,
-			RoomID:         rec.RoomID,
-			ChannelID:      rec.ChannelID,
-			AuthorMemberID: rec.AuthorMemberID,
-			AuthorSeq:      rec.AuthorSeq,
-			EventType:      community.EventType(rec.EventType),
-			TargetEventID:  rec.TargetEventID,
-			Content:        rec.Content,
-			Timestamp:      rec.Timestamp,
-			Signature:      rec.Signature,
-		})
+		pullEvents = append(pullEvents, EventFromRecord(rec))
 		if rec.AuthorSeq > nextCursors[rec.AuthorMemberID] {
 			nextCursors[rec.AuthorMemberID] = rec.AuthorSeq
 		}
@@ -196,7 +242,7 @@ func (s *Server) handleContributionsAck(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	_ = s.store.SaveReceipt(receiptRecord(rec, "replicated"))
+	_ = s.store.SaveReceipt(ReceiptRecord(rec, "replicated"))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
@@ -217,23 +263,14 @@ func (s *Server) handleContributionsSync(w http.ResponseWriter, r *http.Request,
 		if !VerifyReceipt(s.store, rec) {
 			continue
 		}
-		_ = s.store.SaveReceipt(receiptRecord(rec, "replicated"))
+		_ = s.store.SaveReceipt(ReceiptRecord(rec, "replicated"))
 	}
 
 	records, _ := s.store.ListReceiptsAfterCursor(roomRec.RoomID, req.Cursors, syncPageSize)
 	pullReceipts := make([]contributions.Receipt, 0, len(records))
 	nextCursors := make(map[string]int64, len(records))
 	for _, rec := range records {
-		pullReceipts = append(pullReceipts, contributions.Receipt{
-			RequestID:          rec.RequestID,
-			RoomID:             rec.RoomID,
-			HostMemberID:       rec.HostMemberID,
-			RequesterMemberID:  rec.RequesterMemberID,
-			Timestamp:          rec.Timestamp,
-			Completed:          rec.Completed,
-			HostSignature:      rec.HostSignature,
-			RequesterSignature: rec.RequesterSignature,
-		})
+		pullReceipts = append(pullReceipts, ReceiptFromRecord(rec))
 		key := rec.HostMemberID + "/" + rec.RequesterMemberID
 		if rec.Timestamp > nextCursors[key] {
 			nextCursors[key] = rec.Timestamp
@@ -272,16 +309,3 @@ func VerifyReceipt(s *store.Store, rec contributions.Receipt) bool {
 	return rec.VerifyBoth(ed25519.PublicKey(hostPub), ed25519.PublicKey(reqPub)) == nil
 }
 
-func receiptRecord(rec contributions.Receipt, status string) store.ContributionReceiptRecord {
-	return store.ContributionReceiptRecord{
-		RequestID:          rec.RequestID,
-		RoomID:             rec.RoomID,
-		HostMemberID:       rec.HostMemberID,
-		RequesterMemberID:  rec.RequesterMemberID,
-		Timestamp:          rec.Timestamp,
-		Completed:          rec.Completed,
-		HostSignature:      rec.HostSignature,
-		RequesterSignature: rec.RequesterSignature,
-		ReplicatedStatus:   status,
-	}
-}

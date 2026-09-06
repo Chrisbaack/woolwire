@@ -36,13 +36,13 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// peerManager owns the peer server and its listeners. The peer server is
-// created and replaced from HTTP handler goroutines (hosting or joining a
-// room), so every access to it is behind this mutex.
+// peerManager owns the peer server. It is created and replaced from HTTP
+// handler goroutines (hosting or joining a room), so every access is behind
+// this mutex; the previous code closed over the pointer and mutated it
+// unsynchronized.
 type peerManager struct {
-	mu        sync.Mutex
-	server    *peerapi.Server
-	listeners []net.Listener
+	mu     sync.Mutex
+	server *peerapi.Server
 
 	store    *store.Store
 	trans    transport.Transport
@@ -53,10 +53,7 @@ type peerManager struct {
 func (p *peerManager) start(authority ed25519.PrivateKey) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.startLocked(authority)
-}
 
-func (p *peerManager) startLocked(authority ed25519.PrivateKey) error {
 	p.stopLocked()
 
 	dev, err := p.store.GetDeviceIdentity()
@@ -90,26 +87,9 @@ func (p *peerManager) startLocked(authority ed25519.PrivateKey) error {
 	}
 
 	srv := peerapi.NewServer(cfg)
-
-	peerListener, err := p.trans.Listen(p.peerPort)
-	if err != nil {
+	if err := srv.Start(p.trans, p.peerPort); err != nil {
 		return err
 	}
-	p.listeners = append(p.listeners, peerListener)
-	go func() { _ = srv.Serve(tls.NewListener(peerListener, srv.PeerTLSConfig())) }()
-
-	// Bootstrap sits on its own port because it must accept a device
-	// certificate the roster has never seen, which the peer listener must not.
-	if bootstrapCfg := srv.BootstrapTLSConfig(); bootstrapCfg != nil {
-		bootstrapListener, err := p.trans.Listen(p.peerPort + peerapi.BootstrapPortOffset)
-		if err != nil {
-			p.stopLocked()
-			return err
-		}
-		p.listeners = append(p.listeners, bootstrapListener)
-		go func() { _ = srv.ServeBootstrap(tls.NewListener(bootstrapListener, bootstrapCfg)) }()
-	}
-
 	p.server = srv
 	return nil
 }
@@ -122,29 +102,22 @@ func (p *peerManager) stop() error {
 }
 
 func (p *peerManager) stopLocked() {
-	if p.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_ = p.server.Shutdown(ctx)
-		cancel()
-		p.server = nil
+	if p.server == nil {
+		return
 	}
-	for _, l := range p.listeners {
-		_ = l.Close()
-	}
-	p.listeners = nil
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_ = p.server.Stop(ctx)
+	cancel()
+	p.server = nil
 }
 
 func (p *peerManager) shutdown(ctx context.Context) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.server != nil {
-		_ = p.server.Shutdown(ctx)
+		_ = p.server.Stop(ctx)
 		p.server = nil
 	}
-	for _, l := range p.listeners {
-		_ = l.Close()
-	}
-	p.listeners = nil
 }
 
 func main() {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cbaack/woolwire/internal/contributions"
+	"github.com/cbaack/woolwire/internal/peerapi"
 	"github.com/cbaack/woolwire/internal/store"
 	"github.com/cbaack/woolwire/internal/transport"
 )
@@ -106,17 +107,7 @@ func TestM5ContributionsReceiptFlowAndConvergence(t *testing.T) {
 	}
 
 	// Save receipt on Charlie's node (local)
-	_ = node3.store.SaveReceipt(store.ContributionReceiptRecord{
-		RequestID:          receipt.RequestID,
-		RoomID:             receipt.RoomID,
-		HostMemberID:       receipt.HostMemberID,
-		RequesterMemberID:  receipt.RequesterMemberID,
-		Timestamp:          receipt.Timestamp,
-		Completed:          receipt.Completed,
-		HostSignature:      receipt.HostSignature,
-		RequesterSignature: receipt.RequesterSignature,
-		ReplicatedStatus:   "local",
-	})
+	_ = node3.store.SaveReceipt(peerapi.ReceiptRecord(receipt, "local"))
 
 	// 2. Charlie syncs contributions with Bob and Alice
 	node3.localSrv.SyncContributions(context.Background())
@@ -147,17 +138,7 @@ func TestM5ContributionsReceiptFlowAndConvergence(t *testing.T) {
 	}
 
 	// 4. Replay test: ingesting same receipt again does not increase score
-	_ = node3.store.SaveReceipt(store.ContributionReceiptRecord{
-		RequestID:          receipt.RequestID,
-		RoomID:             receipt.RoomID,
-		HostMemberID:       receipt.HostMemberID,
-		RequesterMemberID:  receipt.RequesterMemberID,
-		Timestamp:          receipt.Timestamp,
-		Completed:          receipt.Completed,
-		HostSignature:      receipt.HostSignature,
-		RequesterSignature: receipt.RequesterSignature,
-		ReplicatedStatus:   "local",
-	})
+	_ = node3.store.SaveReceipt(peerapi.ReceiptRecord(receipt, "local"))
 
 	w = node3.doJSON("GET", "/api/v1/contributions/leaderboard", nil)
 	var lbDedupe struct {

@@ -453,22 +453,46 @@ func TestM4PrivacyBoundariesAndReadStateIsolation(t *testing.T) {
 	}
 }
 
-func TestM4SanitizationAndXSSNeutralization(t *testing.T) {
-	maliciousInput := `<script>alert('xss')</script><img src="x" onerror="evil()"/><b>Safe text</b>![tracker](https://evil.com/logger.png)`
-	sanitized := community.SanitizeContent(maliciousInput)
+// TestM4SanitizationLeavesTextIntact covers task 26. Sanitization is for
+// structure only: remote tracking images are neutralized, and everything else
+// reaches the client verbatim so React escapes it exactly once on render.
+// Escaping here as well turned "&" into "&amp;" in stored text, and the
+// tag-stripping regex deleted ordinary prose like "<3" and "a < b > c".
+func TestM4SanitizationLeavesTextIntact(t *testing.T) {
+	t.Run("remote images are neutralized", func(t *testing.T) {
+		got := community.SanitizeContent(`![tracker](https://evil.com/logger.png)`)
+		if stringContains(got, "https://evil.com/logger.png") {
+			t.Fatalf("tracking image URL survived: %s", got)
+		}
+		if got != "[Image: tracker]" {
+			t.Fatalf("expected the placeholder, got: %s", got)
+		}
+	})
 
-	// Verify raw HTML tags stripped
-	if stringContains(sanitized, "<script>") || stringContains(sanitized, "<img") || stringContains(sanitized, "<b>") {
-		t.Fatalf("sanitization failed to strip raw HTML: %s", sanitized)
-	}
+	t.Run("ordinary text passes through unchanged", func(t *testing.T) {
+		for _, input := range []string{
+			"a < b & c",
+			"I <3 this",
+			"a < b > c",
+			"x && y || z",
+			`he said "hi" & left`,
+			"5 > 3 && 2 < 4",
+		} {
+			if got := community.SanitizeContent(input); got != input {
+				t.Errorf("SanitizeContent(%q) = %q, want it unchanged", input, got)
+			}
+		}
+	})
 
-	// Verify tracking image neutralized
-	if stringContains(sanitized, "https://evil.com/logger.png") {
-		t.Fatalf("sanitization failed to neutralize tracking image URL: %s", sanitized)
-	}
-	if !stringContains(sanitized, "[Image: tracker]") {
-		t.Fatalf("expected safe image placeholder, got: %s", sanitized)
-	}
+	t.Run("markup is left for the renderer to escape", func(t *testing.T) {
+		// The stored form keeps the author's literal text. React escapes it on
+		// output, so the tags are displayed rather than executed; double
+		// escaping here would corrupt the stored message permanently.
+		input := `<script>alert('xss')</script><b>Safe text</b>`
+		if got := community.SanitizeContent(input); got != input {
+			t.Fatalf("SanitizeContent altered stored text: %q", got)
+		}
+	})
 }
 
 func stringContains(s, sub string) bool {

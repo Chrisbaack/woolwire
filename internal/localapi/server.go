@@ -755,16 +755,7 @@ func (s *Server) handleHostRoom(w http.ResponseWriter, r *http.Request) {
 		RosterVersion: 1,
 	}
 	_ = m.Sign(priv)
-	_ = s.store.SaveMember(store.MemberRecord{
-		MemberID:      m.MemberID,
-		RoomID:        m.RoomID,
-		DevicePublic:  m.DevicePublic,
-		DisplayName:   m.DisplayName,
-		Status:        string(m.Status),
-		RosterVersion: m.RosterVersion,
-		Signature:     m.Signature,
-		SigVersion:    m.SigVersion,
-	})
+	saveMembership(s.store, m)
 
 	if s.startPeerFn != nil {
 		if err := s.startPeerFn(priv); err != nil {
@@ -924,16 +915,7 @@ func (s *Server) handleJoinRoom(w http.ResponseWriter, r *http.Request) {
 }
 
 func saveMembership(s *store.Store, m room.Membership) {
-	_ = s.SaveMember(store.MemberRecord{
-		MemberID:      m.MemberID,
-		RoomID:        m.RoomID,
-		DevicePublic:  m.DevicePublic,
-		DisplayName:   m.DisplayName,
-		Status:        string(m.Status),
-		RosterVersion: m.RosterVersion,
-		Signature:     m.Signature,
-		SigVersion:    m.SigVersion,
-	})
+	_ = s.SaveMember(peerauth.MemberRecord(m))
 }
 
 func (s *Server) handleLeaveRoom(w http.ResponseWriter, r *http.Request) {

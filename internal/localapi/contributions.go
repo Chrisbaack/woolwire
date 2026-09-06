@@ -32,18 +32,7 @@ func (s *Server) handleGetLeaderboard(w http.ResponseWriter, r *http.Request) {
 
 	var receipts []contributions.Receipt
 	for _, rec := range records {
-		receipts = append(receipts, contributions.Receipt{
-			RequestID:          rec.RequestID,
-			RoomID:             rec.RoomID,
-			HostMemberID:       rec.HostMemberID,
-			RequesterMemberID:  rec.RequesterMemberID,
-			Timestamp:          rec.Timestamp,
-			Completed:          rec.Completed,
-			HostSignature:      rec.HostSignature,
-			RequesterSignature: rec.RequesterSignature,
-			SigVersion:         rec.SigVersion,
-			ReplicatedStatus:   rec.ReplicatedStatus,
-		})
+		receipts = append(receipts, peerapi.ReceiptFromRecord(rec))
 	}
 
 	memberNames := make(map[string]string)
@@ -132,18 +121,7 @@ func (s *Server) handleInboundReceipt(ctx context.Context, rec contributions.Rec
 	}
 
 	// Save locally
-	_ = s.store.SaveReceipt(store.ContributionReceiptRecord{
-		RequestID:          rec.RequestID,
-		RoomID:             rec.RoomID,
-		HostMemberID:       rec.HostMemberID,
-		RequesterMemberID:  rec.RequesterMemberID,
-		Timestamp:          rec.Timestamp,
-		Completed:          rec.Completed,
-		HostSignature:      rec.HostSignature,
-		RequesterSignature: rec.RequesterSignature,
-		SigVersion:         rec.SigVersion,
-		ReplicatedStatus:   "local",
-	})
+	_ = s.store.SaveReceipt(peerapi.ReceiptRecord(rec, "local"))
 
 	// Acknowledge back to the host asynchronously over the authenticated peer
 	// connection, so the host learns the requester counter-signed.
@@ -176,17 +154,7 @@ func (s *Server) SyncContributions(ctx context.Context) {
 		if rec.ReplicatedStatus != "local" {
 			continue
 		}
-		pushReceipts = append(pushReceipts, contributions.Receipt{
-			RequestID:          rec.RequestID,
-			RoomID:             rec.RoomID,
-			HostMemberID:       rec.HostMemberID,
-			RequesterMemberID:  rec.RequesterMemberID,
-			Timestamp:          rec.Timestamp,
-			Completed:          rec.Completed,
-			HostSignature:      rec.HostSignature,
-			RequesterSignature: rec.RequesterSignature,
-			SigVersion:         rec.SigVersion,
-		})
+		pushReceipts = append(pushReceipts, peerapi.ReceiptFromRecord(rec))
 	}
 
 	for _, pa := range s.knownPeers() {
@@ -241,18 +209,7 @@ func (s *Server) syncReceiptsWithPeer(
 			if !peerapi.VerifyReceipt(s.store, pr) {
 				continue
 			}
-			_ = s.store.SaveReceipt(store.ContributionReceiptRecord{
-				RequestID:          pr.RequestID,
-				RoomID:             pr.RoomID,
-				HostMemberID:       pr.HostMemberID,
-				RequesterMemberID:  pr.RequesterMemberID,
-				Timestamp:          pr.Timestamp,
-				Completed:          pr.Completed,
-				HostSignature:      pr.HostSignature,
-				RequesterSignature: pr.RequesterSignature,
-				SigVersion:         pr.SigVersion,
-				ReplicatedStatus:   "replicated",
-			})
+			_ = s.store.SaveReceipt(peerapi.ReceiptRecord(pr, "replicated"))
 			applied++
 		}
 

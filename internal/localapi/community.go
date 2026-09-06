@@ -66,18 +66,7 @@ func (s *Server) materializeChannels(roomID string) {
 		if rec.EventType != string(community.EventChannel) {
 			continue
 		}
-		events = append(events, community.Event{
-			ID:             rec.ID,
-			RoomID:         rec.RoomID,
-			ChannelID:      rec.ChannelID,
-			AuthorMemberID: rec.AuthorMemberID,
-			AuthorSeq:      rec.AuthorSeq,
-			EventType:      community.EventType(rec.EventType),
-			Content:        rec.Content,
-			Timestamp:      rec.Timestamp,
-			Signature:      rec.Signature,
-			SigVersion:     rec.SigVersion,
-		})
+		events = append(events, peerapi.EventFromRecord(rec))
 	}
 
 	for _, ch := range community.Materialize(events).Channels {
@@ -149,7 +138,7 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sign channel event failed", http.StatusInternalServerError)
 		return
 	}
-	if err := s.store.SaveEvent(eventRecord(event, "local")); err != nil {
+	if err := s.store.SaveEvent(peerapi.EventRecord(event, "local")); err != nil {
 		http.Error(w, "failed to save channel event", http.StatusInternalServerError)
 		return
 	}
@@ -172,23 +161,6 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(ch)
 }
 
-// eventRecord converts a signed event into its stored form.
-func eventRecord(e community.Event, status string) store.EventRecord {
-	return store.EventRecord{
-		ID:               e.ID,
-		RoomID:           e.RoomID,
-		ChannelID:        e.ChannelID,
-		AuthorMemberID:   e.AuthorMemberID,
-		AuthorSeq:        e.AuthorSeq,
-		EventType:        string(e.EventType),
-		TargetEventID:    e.TargetEventID,
-		Content:          e.Content,
-		Timestamp:        e.Timestamp,
-		Signature:        e.Signature,
-		SigVersion:       e.SigVersion,
-		ReplicatedStatus: status,
-	}
-}
 
 type EnrichedMaterializedMessage struct {
 	community.MaterializedMessage
@@ -210,20 +182,7 @@ func (s *Server) handleGetChannelMessages(w http.ResponseWriter, r *http.Request
 
 	events := make([]community.Event, 0, len(records))
 	for _, rec := range records {
-		events = append(events, community.Event{
-			ID:             rec.ID,
-			RoomID:         rec.RoomID,
-			ChannelID:      rec.ChannelID,
-			AuthorMemberID: rec.AuthorMemberID,
-			AuthorSeq:      rec.AuthorSeq,
-			EventType:      community.EventType(rec.EventType),
-			TargetEventID:  rec.TargetEventID,
-			Content:        rec.Content,
-			Timestamp:        rec.Timestamp,
-			Signature:        rec.Signature,
-			SigVersion:       rec.SigVersion,
-			ReplicatedStatus: rec.ReplicatedStatus,
-		})
+		events = append(events, peerapi.EventFromRecord(rec))
 	}
 
 	materialized := community.MaterializeEvents(events)
@@ -309,20 +268,7 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec := store.EventRecord{
-		ID:               event.ID,
-		RoomID:           event.RoomID,
-		ChannelID:        event.ChannelID,
-		AuthorMemberID:   event.AuthorMemberID,
-		AuthorSeq:        event.AuthorSeq,
-		EventType:        string(event.EventType),
-		Content:          event.Content,
-		Timestamp:        event.Timestamp,
-		Signature:        event.Signature,
-		ReplicatedStatus: "local",
-	}
-
-	if err := s.store.SaveEvent(rec); err != nil {
+	if err := s.store.SaveEvent(peerapi.EventRecord(event, "local")); err != nil {
 		http.Error(w, "failed to save event", http.StatusInternalServerError)
 		return
 	}
@@ -396,19 +342,7 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = s.store.SaveEvent(store.EventRecord{
-		ID:               event.ID,
-		RoomID:           event.RoomID,
-		ChannelID:        event.ChannelID,
-		AuthorMemberID:   event.AuthorMemberID,
-		AuthorSeq:        event.AuthorSeq,
-		EventType:        string(event.EventType),
-		TargetEventID:    event.TargetEventID,
-		Content:          event.Content,
-		Timestamp:        event.Timestamp,
-		Signature:        event.Signature,
-		ReplicatedStatus: "local",
-	})
+	_ = s.store.SaveEvent(peerapi.EventRecord(event, "local"))
 
 	go s.SyncCommunityEvents(context.Background())
 
@@ -474,19 +408,7 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = s.store.SaveEvent(store.EventRecord{
-		ID:               event.ID,
-		RoomID:           event.RoomID,
-		ChannelID:        event.ChannelID,
-		AuthorMemberID:   event.AuthorMemberID,
-		AuthorSeq:        event.AuthorSeq,
-		EventType:        string(event.EventType),
-		TargetEventID:    event.TargetEventID,
-		Content:          event.Content,
-		Timestamp:        event.Timestamp,
-		Signature:        event.Signature,
-		ReplicatedStatus: "local",
-	})
+	_ = s.store.SaveEvent(peerapi.EventRecord(event, "local"))
 
 	go s.SyncCommunityEvents(context.Background())
 
@@ -548,19 +470,7 @@ func (s *Server) handleModerateMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = s.store.SaveEvent(store.EventRecord{
-		ID:               event.ID,
-		RoomID:           event.RoomID,
-		ChannelID:        event.ChannelID,
-		AuthorMemberID:   event.AuthorMemberID,
-		AuthorSeq:        event.AuthorSeq,
-		EventType:        string(event.EventType),
-		TargetEventID:    event.TargetEventID,
-		Content:          event.Content,
-		Timestamp:        event.Timestamp,
-		Signature:        event.Signature,
-		ReplicatedStatus: "local",
-	})
+	_ = s.store.SaveEvent(peerapi.EventRecord(event, "local"))
 
 	go s.SyncCommunityEvents(context.Background())
 
@@ -644,19 +554,7 @@ func (s *Server) pendingLocalEvents(roomID string) []community.Event {
 		if rec.ReplicatedStatus != "local" {
 			continue
 		}
-		pending = append(pending, community.Event{
-			ID:             rec.ID,
-			RoomID:         rec.RoomID,
-			ChannelID:      rec.ChannelID,
-			AuthorMemberID: rec.AuthorMemberID,
-			AuthorSeq:      rec.AuthorSeq,
-			EventType:      community.EventType(rec.EventType),
-			TargetEventID:  rec.TargetEventID,
-			Content:        rec.Content,
-			Timestamp:      rec.Timestamp,
-			Signature:      rec.Signature,
-			SigVersion:     rec.SigVersion,
-		})
+		pending = append(pending, peerapi.EventFromRecord(rec))
 	}
 	return pending
 }
@@ -697,7 +595,7 @@ func (s *Server) syncEventsWithPeer(
 			if !peerapi.AcceptInboundEvent(s.store, pe, authority) {
 				continue
 			}
-			if err := s.store.SaveEvent(eventRecord(pe, "replicated")); err == nil {
+			if err := s.store.SaveEvent(peerapi.EventRecord(pe, "replicated")); err == nil {
 				applied++
 			}
 		}

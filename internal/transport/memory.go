@@ -8,7 +8,11 @@ import (
 	"sync"
 )
 
-// MemoryNetwork routes connections between in-memory transport nodes.
+// MemoryNetwork routes connections between in-memory transport nodes. Each
+// listening port is backed by a real loopback socket rather than net.Pipe:
+// TLS writes its session tickets and alerts after the handshake, and an
+// unbuffered pipe deadlocks the moment both ends write at once. A kernel
+// socket buffers like the real transport does.
 type MemoryNetwork struct {
 	mu    sync.RWMutex
 	nodes map[string]*MemoryTransport
@@ -72,11 +76,21 @@ func (m *MemoryTransport) Listen(port uint16) (net.Listener, error) {
 	if _, exists := m.listeners[port]; exists {
 		return nil, fmt.Errorf("port %d already in use", port)
 	}
-	l := newMemoryListener(m.addr, port, func() {
-		m.mu.Lock()
-		delete(m.listeners, port)
-		m.mu.Unlock()
-	})
+
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+
+	l := &memoryListener{
+		Listener: inner,
+		addr:     memoryAddr{node: m.addr, port: port},
+		onClose: func() {
+			m.mu.Lock()
+			delete(m.listeners, port)
+			m.mu.Unlock()
+		},
+	}
 	m.listeners[port] = l
 	return l, nil
 }
@@ -93,27 +107,19 @@ func (m *MemoryTransport) Dial(ctx context.Context, target string, port uint16) 
 
 func (m *MemoryTransport) acceptInbound(ctx context.Context, port uint16) (net.Conn, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.closed {
+	closed := m.closed
+	l, ok := m.listeners[port]
+	m.mu.RUnlock()
+
+	if closed {
 		return nil, errors.New("target transport closed")
 	}
-	l, ok := m.listeners[port]
 	if !ok {
 		return nil, fmt.Errorf("port %d not listening on %s", port, m.addr)
 	}
-	clientConn, serverConn := net.Pipe()
-	select {
-	case <-ctx.Done():
-		clientConn.Close()
-		serverConn.Close()
-		return nil, ctx.Err()
-	case l.inbound <- serverConn:
-		return clientConn, nil
-	case <-l.done:
-		clientConn.Close()
-		serverConn.Close()
-		return nil, errors.New("listener closed")
-	}
+
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, "tcp", l.Listener.Addr().String())
 }
 
 func (m *MemoryTransport) Close() error {
@@ -137,41 +143,22 @@ func (m *MemoryTransport) Close() error {
 	return nil
 }
 
+// memoryListener presents a loopback listener under the node's virtual
+// address, so callers see transport addresses rather than 127.0.0.1 ports.
 type memoryListener struct {
+	net.Listener
 	addr    memoryAddr
-	inbound chan net.Conn
-	done    chan struct{}
 	once    sync.Once
 	onClose func()
 }
 
-func newMemoryListener(nodeAddr string, port uint16, onClose func()) *memoryListener {
-	return &memoryListener{
-		addr:    memoryAddr{node: nodeAddr, port: port},
-		inbound: make(chan net.Conn, 32),
-		done:    make(chan struct{}),
-		onClose: onClose,
-	}
-}
-
-func (l *memoryListener) Accept() (net.Conn, error) {
-	select {
-	case conn, ok := <-l.inbound:
-		if !ok {
-			return nil, errors.New("listener closed")
-		}
-		return conn, nil
-	case <-l.done:
-		return nil, errors.New("listener closed")
-	}
-}
-
 func (l *memoryListener) Close() error {
+	var err error
 	l.once.Do(func() {
-		close(l.done)
+		err = l.Listener.Close()
 		l.onClose()
 	})
-	return nil
+	return err
 }
 
 func (l *memoryListener) Addr() net.Addr {

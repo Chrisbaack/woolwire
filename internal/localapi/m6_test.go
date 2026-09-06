@@ -1,11 +1,13 @@
 package localapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cbaack/woolwire/internal/store"
@@ -17,8 +19,6 @@ func TestM6MetricsEndpoint(t *testing.T) {
 	const peerPort = 4260
 
 	node := setupTestNode(t, vNet, "m6-metrics-1", peerPort)
-	defer node.trans.Close()
-	defer node.store.Close()
 	node.login(t)
 
 	w := node.doJSON("GET", "/api/v1/metrics", nil)
@@ -26,8 +26,9 @@ func TestM6MetricsEndpoint(t *testing.T) {
 		t.Fatalf("get metrics failed: %d, %s", w.Code, w.Body.String())
 	}
 
+	body := w.Body.String()
 	var m MetricsResponse
-	if err := json.NewDecoder(w.Body).Decode(&m); err != nil {
+	if err := json.NewDecoder(strings.NewReader(body)).Decode(&m); err != nil {
 		t.Fatalf("decode metrics response failed: %v", err)
 	}
 
@@ -35,8 +36,20 @@ func TestM6MetricsEndpoint(t *testing.T) {
 		t.Fatalf("telemetry must be strictly disabled")
 	}
 
-	if m.Connectivity.TailcatAddr != "tailcat-m6-metrics-1" {
+	// The reported address is the transport's public address.
+	if m.Connectivity.TailcatAddr != "m6-metrics-1" {
 		t.Fatalf("unexpected tailcat addr: %s", m.Connectivity.TailcatAddr)
+	}
+
+	// Regression for leaking the persisted node private key through metrics:
+	// the stored key is "tailcat-<addr>" in tests and "privkey:..." in
+	// production, and neither may appear anywhere in the response.
+	dev, _ := node.store.GetDeviceIdentity()
+	if strings.Contains(body, "privkey:") {
+		t.Fatalf("metrics response contains a private key: %s", body)
+	}
+	if strings.Contains(body, dev.TailcatKey) {
+		t.Fatalf("metrics response contains the persisted node key: %s", body)
 	}
 
 	if m.Storage.DatabaseSizeBytes < 0 {
@@ -44,24 +57,23 @@ func TestM6MetricsEndpoint(t *testing.T) {
 	}
 }
 
-func TestM6BackupAndRestoreFlow(t *testing.T) {
+// TestM6BackupIsEncryptedAndUnderStateDir covers task 22.
+func TestM6BackupIsEncryptedAndUnderStateDir(t *testing.T) {
 	vNet := transport.NewMemoryNetwork()
 	const peerPort = 4261
 
 	node := setupTestNode(t, vNet, "m6-backup-1", peerPort)
-	defer node.trans.Close()
-	defer node.store.Close()
 	node.login(t)
+	node.hostRoom(t, "BackupUser", "Pre-Backup Room")
 
-	// Set display name and host room
-	_ = node.doJSON("POST", "/api/v1/profile", map[string]string{"display_name": "BackupUser"})
-	w := node.doJSON("POST", "/api/v1/room/host", map[string]string{"room_name": "Pre-Backup Room"})
-	if w.Code != http.StatusOK {
-		t.Fatalf("host room failed: %d", w.Code)
+	// A backup without a passphrase is refused: the plaintext database holds
+	// the device private key, the session token, and every endpoint API key.
+	if code := node.doJSON("POST", "/api/v1/backup/export", map[string]string{}).Code; code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without a passphrase, got %d", code)
 	}
 
-	// Trigger backup export
-	w = node.doJSON("POST", "/api/v1/backup/export", nil)
+	const passphrase = "correct horse battery staple"
+	w := node.doJSON("POST", "/api/v1/backup/export", map[string]string{"passphrase": passphrase})
 	if w.Code != http.StatusOK {
 		t.Fatalf("backup export failed: %d, %s", w.Code, w.Body.String())
 	}
@@ -70,37 +82,53 @@ func TestM6BackupAndRestoreFlow(t *testing.T) {
 		OK         bool   `json:"ok"`
 		BackupPath string `json:"backup_path"`
 		SizeBytes  int64  `json:"size_bytes"`
+		Encrypted  bool   `json:"encrypted"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&resp)
-
-	if !resp.OK || resp.BackupPath == "" || resp.SizeBytes <= 0 {
+	if !resp.OK || resp.BackupPath == "" || resp.SizeBytes <= 0 || !resp.Encrypted {
 		t.Fatalf("invalid backup response: %+v", resp)
 	}
-	defer os.Remove(resp.BackupPath)
 
-	// Verify backup file exists on disk
-	info, err := os.Stat(resp.BackupPath)
-	if err != nil || info.Size() <= 0 {
+	// The export lives under the state directory, not the working directory,
+	// so a container backup lands inside the mounted volume.
+	if !strings.HasPrefix(resp.BackupPath, filepath.Join(node.localSrv.stateDir, "backups")) {
+		t.Fatalf("backup written outside the state dir: %s", resp.BackupPath)
+	}
+
+	blob, err := os.ReadFile(resp.BackupPath)
+	if err != nil {
 		t.Fatalf("backup file not on disk: %v", err)
 	}
 
-	// Restore from backup file into a fresh store
-	restoreDir := filepath.Join(t.TempDir(), "restored.db")
-	backupBytes, err := os.ReadFile(resp.BackupPath)
-	if err != nil {
-		t.Fatalf("read backup file failed: %v", err)
+	// It must not be a readable SQLite database.
+	if bytes.HasPrefix(blob, []byte("SQLite format 3")) {
+		t.Fatal("backup is a plaintext SQLite database")
 	}
-	if err := os.WriteFile(restoreDir, backupBytes, 0o600); err != nil {
-		t.Fatalf("write restore file failed: %v", err)
+	if bytes.Contains(blob, node.device.PrivateKey) {
+		t.Fatal("backup contains the device private key in the clear")
 	}
 
-	restoredStore, err := store.Open(restoreDir)
+	// The wrong passphrase must not decrypt it.
+	if _, err := DecryptBackup(bytes.NewReader(blob), "wrong passphrase"); err == nil {
+		t.Fatal("backup decrypted with the wrong passphrase")
+	}
+
+	plaintext, err := DecryptBackup(bytes.NewReader(blob), passphrase)
+	if err != nil {
+		t.Fatalf("decrypt backup: %v", err)
+	}
+
+	restorePath := filepath.Join(t.TempDir(), "restored.db")
+	if err := os.WriteFile(restorePath, plaintext, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	restoredStore, err := store.Open(restorePath)
 	if err != nil {
 		t.Fatalf("open restored store failed: %v", err)
 	}
 	defer restoredStore.Close()
 
-	// Verify restored room and identity
 	restoredName, err := restoredStore.GetSetting("display_name")
 	if err != nil || restoredName != "BackupUser" {
 		t.Fatalf("restored name mismatch: got %q, err %v", restoredName, err)
@@ -112,39 +140,97 @@ func TestM6BackupAndRestoreFlow(t *testing.T) {
 	}
 }
 
+func TestDatabaseFileIsOwnerOnly(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "perm.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("database mode is %04o, want 0600", perm)
+	}
+}
+
 func TestM6SecurityBoundariesReview(t *testing.T) {
 	vNet := transport.NewMemoryNetwork()
 	const peerPort = 4262
 
 	node := setupTestNode(t, vNet, "m6-sec-1", peerPort)
-	defer node.trans.Close()
-	defer node.store.Close()
 
-	// 1. Unauthenticated request to /api/v1/state without cookie or setup token -> 401 Unauthorized
-	req, _ := http.NewRequest("GET", "/api/v1/state", nil)
-	w := node.localSrv.mux
-	rec := node.doRequest(req)
-	_ = w
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for unauthenticated state request, got %d", rec.Code)
+	// 1. Unauthenticated request to /api/v1/state -> 401
+	req := httptest.NewRequest("GET", "/api/v1/state", nil)
+	req.Host = "127.0.0.1:7070"
+	if code := node.doRequest(req).Code; code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated state request, got %d", code)
 	}
 
-	// 2. Invalid setup token -> 401 Unauthorized
-	wLogin := node.doJSON("POST", "/api/v1/setup", map[string]string{"token": "wrong-token"})
-	if wLogin.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for wrong setup token, got %d", wLogin.Code)
+	// 2. Invalid setup token -> 401
+	if code := node.doJSON("POST", "/api/v1/setup",
+		map[string]string{"token": "wrong-token"}).Code; code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong setup token, got %d", code)
 	}
 
-	// 3. Login with correct setup token
+	// 3. Login with the correct setup secret
 	node.login(t)
-	wAuth := node.doJSON("GET", "/api/v1/state", nil)
-	if wAuth.Code != http.StatusOK {
-		t.Fatalf("expected 200 after authentication, got %d", wAuth.Code)
+	if code := node.doJSON("GET", "/api/v1/state", nil).Code; code != http.StatusOK {
+		t.Fatalf("expected 200 after authentication, got %d", code)
 	}
 }
 
-func (n *testNode) doRequest(req *http.Request) *httptest.ResponseRecorder {
-	rec := httptest.NewRecorder()
-	n.localSrv.mux.ServeHTTP(rec, req)
-	return rec
+// TestOpenAIRoutesRequireToken covers task 8.
+func TestOpenAIRoutesRequireToken(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	node := setupTestNode(t, vNet, "oai-node", 4263)
+	node.login(t)
+
+	// No bearer token: refused even though local_api_token was never set by
+	// hand. It is generated on first boot precisely so "unset" cannot mean
+	// "open".
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Host = "127.0.0.1:7070"
+	if code := node.doRequest(req).Code; code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without a bearer token, got %d", code)
+	}
+
+	// A wrong token is refused.
+	req = httptest.NewRequest("GET", "/v1/models", nil)
+	req.Host = "127.0.0.1:7070"
+	req.Header.Set("Authorization", "Bearer not-the-token")
+	if code := node.doRequest(req).Code; code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for a wrong bearer token, got %d", code)
+	}
+
+	// The real token works.
+	req = httptest.NewRequest("GET", "/v1/models", nil)
+	req.Host = "127.0.0.1:7070"
+	req.Header.Set("Authorization", node.localAPIBearer(t))
+	if code := node.doRequest(req).Code; code != http.StatusOK {
+		t.Fatalf("expected 200 with the local API token, got %d", code)
+	}
+
+	// A cross-origin simple POST to chat completions is refused before auth.
+	post := httptest.NewRequest("POST", "/v1/chat/completions",
+		bytes.NewReader([]byte(`{"model":"x","messages":[]}`)))
+	post.Host = "127.0.0.1:7070"
+	post.Header.Set("Content-Type", "text/plain")
+	post.Header.Set("Origin", "https://evil.example")
+	if code := node.doRequest(post).Code; code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a cross-origin simple POST, got %d", code)
+	}
+
+	// Regenerating replaces the token.
+	before := node.localAPIBearer(t)
+	w := node.doJSON("POST", "/api/v1/local-api-token/regenerate", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("regenerate failed: %d", w.Code)
+	}
+	if node.localAPIBearer(t) == before {
+		t.Fatal("regenerate did not change the token")
+	}
 }

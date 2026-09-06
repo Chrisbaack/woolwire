@@ -90,14 +90,41 @@ func TestCommunityMaterializationQuarantineAndOrdering(t *testing.T) {
 	}
 	_ = e3.Sign(priv)
 
-	// Materialize with both e1, e2Conflict, e3
-	materialized := MaterializeEvents([]Event{e1, e2Conflict, e3})
+	// Two peers can legitimately receive the divergent pair in opposite
+	// orders. Both must converge on the same view, so the winner is chosen by
+	// a property of the events (the lexically smaller ID) rather than by
+	// whichever arrived first.
+	forward := Materialize([]Event{e1, e2Conflict, e3})
+	reverse := Materialize([]Event{e3, e2Conflict, e1})
 
-	// Conflicting event must be quarantined (only e1 and e3 appear)
-	if len(materialized) != 2 {
-		t.Fatalf("expected 2 materialized messages after quarantine, got %d", len(materialized))
+	if len(forward.Messages) != 2 {
+		t.Fatalf("expected 2 materialized messages after quarantine, got %d", len(forward.Messages))
 	}
-	if materialized[0].Content != "Message 1" || materialized[1].Content != "Message 2" {
-		t.Fatalf("unexpected content: %+v", materialized)
+	if len(reverse.Messages) != len(forward.Messages) {
+		t.Fatalf("peers diverged: %d vs %d messages", len(forward.Messages), len(reverse.Messages))
+	}
+	for i := range forward.Messages {
+		if forward.Messages[i].ID != reverse.Messages[i].ID {
+			t.Fatalf("peers diverged at index %d: %s vs %s",
+				i, forward.Messages[i].ID, reverse.Messages[i].ID)
+		}
+	}
+
+	// The surviving seq-1 event is the one with the lexically smaller ID.
+	expected := e1
+	if e2Conflict.ID < e1.ID {
+		expected = e2Conflict
+	}
+	if forward.Messages[0].ID != expected.ID {
+		t.Fatalf("conflict resolved to %s, want the lexically smaller id %s",
+			forward.Messages[0].ID, expected.ID)
+	}
+	if forward.Messages[1].Content != "Message 2" {
+		t.Fatalf("non-conflicting event was dropped: %+v", forward.Messages)
+	}
+
+	// The divergence is surfaced rather than silently absorbed.
+	if len(forward.ConflictedAuthors) != 1 || forward.ConflictedAuthors[0] != memberID {
+		t.Fatalf("expected the author to be flagged, got %#v", forward.ConflictedAuthors)
 	}
 }

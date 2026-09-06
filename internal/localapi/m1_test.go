@@ -2,187 +2,75 @@ package localapi
 
 import (
 	"bytes"
-	"crypto/ed25519"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
+	"time"
 
-	"github.com/cbaack/woolwire/internal/identity"
 	"github.com/cbaack/woolwire/internal/peerapi"
+	"github.com/cbaack/woolwire/internal/peerauth"
+	"github.com/cbaack/woolwire/internal/room"
 	"github.com/cbaack/woolwire/internal/store"
 	"github.com/cbaack/woolwire/internal/transport"
 )
-
-type testNode struct {
-	store      *store.Store
-	trans      *transport.MemoryTransport
-	localSrv   *Server
-	peerSrv    *peerapi.Server
-	setupToken string
-	cookie     *http.Cookie
-	device     *identity.Device
-}
-
-func setupTestNode(t *testing.T, net *transport.MemoryNetwork, addr string, port uint16) *testNode {
-	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "node.db")
-	s, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dev, err := identity.GenerateDevice()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SaveDeviceIdentity(store.DeviceIdentity{
-		TailcatKey:    "tailcat-" + addr,
-		DevicePrivate: dev.PrivateKey,
-		DeviceCertDER: dev.CertDER,
-		DevicePublic:  dev.EncodedPublicKey(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	trans := net.NewTransport(addr)
-
-	node := &testNode{
-		store:      s,
-		trans:      trans,
-		setupToken: "setup-secret-12345",
-		device:     dev,
-	}
-
-	node.localSrv, err = NewServer(Config{
-		Store:      s,
-		Transport:  trans,
-		SetupToken: node.setupToken,
-		PeerPort:   port,
-		StartPeerFn: func(authority ed25519.PrivateKey) error {
-			node.peerSrv = peerapi.NewServer(s, authority)
-			l, lErr := trans.Listen(port)
-			if lErr != nil {
-				return lErr
-			}
-			go func() { _ = node.peerSrv.Serve(l) }()
-			return nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return node
-}
-
-func (n *testNode) login(t *testing.T) {
-	t.Helper()
-	body, _ := json.Marshal(map[string]string{"token": n.setupToken})
-	req := httptest.NewRequest("POST", "/api/v1/setup", bytes.NewReader(body))
-	w := httptest.NewRecorder()
-	n.localSrv.mux.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("login failed: %d, %s", w.Code, w.Body.String())
-	}
-
-	cookies := w.Result().Cookies()
-	for _, c := range cookies {
-		if c.Name == "woolwire_session" {
-			n.cookie = c
-			return
-		}
-	}
-	t.Fatal("session cookie not set")
-}
-
-func (n *testNode) doJSON(method, path string, payload any) *httptest.ResponseRecorder {
-	var bodyReader *bytes.Reader
-	if payload != nil {
-		b, _ := json.Marshal(payload)
-		bodyReader = bytes.NewReader(b)
-	} else {
-		bodyReader = bytes.NewReader(nil)
-	}
-	req := httptest.NewRequest(method, path, bodyReader)
-	req.Host = "127.0.0.1:7070"
-	if n.cookie != nil {
-		req.AddCookie(n.cookie)
-	}
-	w := httptest.NewRecorder()
-	n.localSrv.securityMiddleware(n.localSrv.mux).ServeHTTP(w, req)
-	return w
-}
 
 func TestM1FullOnboardingAndAcceptanceGate(t *testing.T) {
 	vNet := transport.NewMemoryNetwork()
 	const peerPort = 4242
 
-	// Node 1: Creator (Alice)
 	node1 := setupTestNode(t, vNet, "node-1", peerPort)
-	defer node1.trans.Close()
-	defer node1.store.Close()
 	node1.login(t)
+	roomID, invitation := node1.hostRoom(t, "Alice", "Technical Friends")
 
-	// Set display name on Node 1
-	w := node1.doJSON("POST", "/api/v1/profile", map[string]string{"display_name": "Alice"})
-	if w.Code != http.StatusOK {
-		t.Fatalf("set profile Alice: %d", w.Code)
-	}
-
-	// Host room on Node 1
-	w = node1.doJSON("POST", "/api/v1/room/host", map[string]string{"room_name": "Technical Friends"})
-	if w.Code != http.StatusOK {
-		t.Fatalf("host room: %d, %s", w.Code, w.Body.String())
-	}
-	var hostResp struct {
-		RoomID         string `json:"room_id"`
-		InvitationCode string `json:"invitation_code"`
-	}
-	_ = json.NewDecoder(w.Body).Decode(&hostResp)
-	if hostResp.InvitationCode == "" {
-		t.Fatal("empty invitation code returned")
-	}
-
-	// Node 2: Member (Bob)
 	node2 := setupTestNode(t, vNet, "node-2", peerPort)
-	defer node2.trans.Close()
-	defer node2.store.Close()
 	node2.login(t)
 
-	// Set display name on Node 2
-	w = node2.doJSON("POST", "/api/v1/profile", map[string]string{"display_name": "Bob"})
-	if w.Code != http.StatusOK {
-		t.Fatalf("set profile Bob: %d", w.Code)
-	}
-
 	// Gate Check 1: Join room using invitation code with no manual networking setup
-	w = node2.doJSON("POST", "/api/v1/room/join", map[string]string{"invitation_code": hostResp.InvitationCode})
-	if w.Code != http.StatusOK {
+	if w := node2.joinRoom(t, "Bob", invitation); w.Code != http.StatusOK {
 		t.Fatalf("join room Bob: %d, %s", w.Code, w.Body.String())
 	}
 
-	// Check Bob's state shows member in room
-	w = node2.doJSON("GET", "/api/v1/state", nil)
+	w := node2.doJSON("GET", "/api/v1/state", nil)
 	var bobState struct {
 		DisplayName string `json:"display_name"`
 		Room        struct {
-			RoomID string `json:"room_id"`
-			Role   string `json:"role"`
+			RoomID         string `json:"room_id"`
+			RoomName       string `json:"room_name"`
+			Role           string `json:"role"`
+			InvitationCode string `json:"invitation_code"`
 		} `json:"room"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&bobState)
-	if bobState.Room.Role != "member" || bobState.Room.RoomID != hostResp.RoomID {
+	if bobState.Room.Role != "member" || bobState.Room.RoomID != roomID {
 		t.Fatalf("unexpected bob state: %#v", bobState)
+	}
+	// The creator sends the real room name; members no longer show a hardcoded one.
+	if bobState.Room.RoomName != "Technical Friends" {
+		t.Fatalf("member shows room name %q, want %q", bobState.Room.RoomName, "Technical Friends")
+	}
+	// A member must not hold the invitation code at all.
+	if bobState.Room.InvitationCode != "" {
+		t.Fatal("member state exposed an invitation code")
+	}
+	bobRoom, _ := node2.store.GetRoomState()
+	if bobRoom.InvitationCode != "" {
+		t.Fatal("member persisted the invitation code, which would let a leaked backup admit devices")
+	}
+
+	// The creator's address must be stored under its real member id, not one
+	// derived from the authority key.
+	if addr := node2.localSrv.peerAddress(node1.memberID); addr == "" {
+		t.Fatal("member did not learn the creator's address under the creator's member id")
 	}
 
 	// Gate Check 2: Restart retains identity
-	// Close Bob's server, create fresh instance using same store & keys
 	_ = node2.localSrv.Close()
-	restartedNode2, err := NewServer(Config{
+	restarted, err := NewServer(Config{
 		Store:      node2.store,
 		Transport:  node2.trans,
 		SetupToken: node2.setupToken,
@@ -191,13 +79,12 @@ func TestM1FullOnboardingAndAcceptanceGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restarted node 2 server: %v", err)
 	}
-	node2.localSrv = restartedNode2
+	node2.localSrv = restarted
 	w = node2.doJSON("GET", "/api/v1/state", nil)
 	var restartedBobState struct {
 		DisplayName string `json:"display_name"`
 		Room        struct {
-			RoomID string `json:"room_id"`
-			Role   string `json:"role"`
+			Role string `json:"role"`
 		} `json:"room"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&restartedBobState)
@@ -205,17 +92,16 @@ func TestM1FullOnboardingAndAcceptanceGate(t *testing.T) {
 		t.Fatalf("restart did not retain identity: %#v", restartedBobState)
 	}
 
-	// Gate Check 3: Creator cannot use remote routes to change another member's settings
-	// (Node 2 only exposes peer routes on transport; local settings are on loopback requiring local auth)
+	// Gate Check 3: A remote caller cannot change another member's settings
 	unauthReq := httptest.NewRequest("POST", "/api/v1/profile", bytes.NewReader([]byte(`{"display_name":"Hacked"}`)))
 	unauthReq.Host = "127.0.0.1:7070"
-	unauthW := httptest.NewRecorder()
-	node2.localSrv.securityMiddleware(node2.localSrv.mux).ServeHTTP(unauthW, unauthReq)
-	if unauthW.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthorized remote setting change should be 401, got %d", unauthW.Code)
+	unauthReq.Header.Set("Content-Type", "application/json")
+	unauthReq.Header.Set(csrfHeader, "1")
+	if code := node2.doRequest(unauthReq).Code; code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized remote setting change should be 401, got %d", code)
 	}
 
-	// Gate Check 4: A rotated code fails new admission while existing members remain connected
+	// Gate Check 4: A rotated code fails new admission while existing members remain
 	w = node1.doJSON("POST", "/api/v1/room-admin/invitation/rotate", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("rotate invitation: %d, %s", w.Code, w.Body.String())
@@ -224,18 +110,14 @@ func TestM1FullOnboardingAndAcceptanceGate(t *testing.T) {
 		InvitationCode string `json:"invitation_code"`
 	}
 	_ = json.NewDecoder(w.Body).Decode(&rotateResp)
-	if rotateResp.InvitationCode == hostResp.InvitationCode {
+	if rotateResp.InvitationCode == invitation {
 		t.Fatal("rotated code should differ from original code")
 	}
 
-	// Node 3 tries to join with old code -> MUST FAIL
 	node3 := setupTestNode(t, vNet, "node-3", peerPort)
-	defer node3.trans.Close()
-	defer node3.store.Close()
 	node3.login(t)
-	_ = node3.doJSON("POST", "/api/v1/profile", map[string]string{"display_name": "Charlie"})
 
-	w = node3.doJSON("POST", "/api/v1/room/join", map[string]string{"invitation_code": hostResp.InvitationCode})
+	w = node3.joinRoom(t, "Charlie", invitation)
 	if w.Code == http.StatusOK {
 		var joinCheck struct {
 			Status string `json:"status"`
@@ -246,13 +128,12 @@ func TestM1FullOnboardingAndAcceptanceGate(t *testing.T) {
 		}
 	}
 
-	// Node 3 joins with new rotated code -> MUST SUCCEED
-	w = node3.doJSON("POST", "/api/v1/room/join", map[string]string{"invitation_code": rotateResp.InvitationCode})
-	if w.Code != http.StatusOK {
+	if w := node3.doJSON("POST", "/api/v1/room/join", map[string]string{
+		"invitation_code": rotateResp.InvitationCode,
+	}); w.Code != http.StatusOK {
 		t.Fatalf("node 3 failed to join with new code: %d, %s", w.Code, w.Body.String())
 	}
 
-	// Existing member Bob is still admitted in Alice's member list
 	w = node1.doJSON("GET", "/api/v1/room-admin/members", nil)
 	var members []store.MemberRecord
 	_ = json.NewDecoder(w.Body).Decode(&members)
@@ -260,44 +141,325 @@ func TestM1FullOnboardingAndAcceptanceGate(t *testing.T) {
 	for _, m := range members {
 		if m.DisplayName == "Bob" && m.Status == "admitted" {
 			bobFound = true
-			break
 		}
 	}
 	if !bobFound {
 		t.Fatal("bob should remain admitted after invitation rotation")
 	}
 
-	// Gate Check 5: A removed member loses access on peers that receive the update
-	var bobID string
-	for _, m := range members {
-		if m.DisplayName == "Bob" {
-			bobID = m.MemberID
-			break
-		}
-	}
-	w = node1.doJSON("POST", fmt.Sprintf("/api/v1/room-admin/members/%s/remove", bobID), nil)
-	if w.Code != http.StatusOK {
+	// Gate Check 5: a removal propagates to other members and takes effect.
+	// Alice removes Bob; Charlie must learn it and refuse to serve Bob.
+	if w := node1.doJSON("POST", fmt.Sprintf("/api/v1/room-admin/members/%s/remove", node2.memberID), nil); w.Code != http.StatusOK {
 		t.Fatalf("remove bob: %d, %s", w.Code, w.Body.String())
 	}
 
-	// Verify Bob is marked removed on Alice's member list
 	w = node1.doJSON("GET", "/api/v1/room-admin/members", nil)
 	var updatedMembers []store.MemberRecord
 	_ = json.NewDecoder(w.Body).Decode(&updatedMembers)
 	for _, m := range updatedMembers {
-		if m.MemberID == bobID && m.Status != "removed" {
+		if m.MemberID == node2.memberID && m.Status != "removed" {
 			t.Fatalf("bob should be marked removed, got %q", m.Status)
 		}
+	}
+
+	// Charlie polls membership and must apply the signed removal.
+	node3.localSrv.SyncMembership(context.Background())
+	bobOnCharlie, err := node3.store.GetMember(node2.memberID)
+	if err != nil || bobOnCharlie == nil {
+		t.Fatalf("charlie has no record of bob: %v", err)
+	}
+	if bobOnCharlie.Status != string(room.StatusRemoved) {
+		t.Fatalf("removal did not propagate to charlie: status %q", bobOnCharlie.Status)
+	}
+
+	// Bob's peer connection to Charlie must now fail at the handshake.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := node2.localSrv.dialPeer(ctx, node3.memberID, "node-3"); err == nil {
+		t.Fatal("a removed member still completed a peer handshake")
+	}
+}
+
+// TestUnadmittedPeerCannotReachPeerRoutes is the core task-1 check: holding a
+// node's transport address is not sufficient to talk to its peer API.
+//
+// Under TLS 1.3 the client finishes its own handshake before the server has
+// validated the client certificate, so the refusal surfaces on the first
+// request rather than in HandshakeContext. The test therefore asserts that no
+// route ever produces a usable response.
+func TestUnadmittedPeerCannotReachPeerRoutes(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	const peerPort = 4242
+
+	creator := setupTestNode(t, vNet, "creator", peerPort)
+	creator.login(t)
+	_, invitation := creator.hostRoom(t, "Alice", "Room")
+
+	member := setupTestNode(t, vNet, "member", peerPort)
+	member.login(t)
+	if w := member.joinRoom(t, "Bob", invitation); w.Code != http.StatusOK {
+		t.Fatalf("member join failed: %d %s", w.Code, w.Body.String())
+	}
+
+	// Node C holds a valid transport address for the member but no membership.
+	outsider := setupTestNode(t, vNet, "outsider", peerPort)
+	outsider.login(t)
+
+	outsiderTLS := &tls.Config{
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: true,
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{outsider.device.CertDER},
+			PrivateKey:  outsider.device.PrivateKey,
+		}},
+	}
+
+	for _, path := range []string{
+		"/peer/v1/membership/sync",
+		"/peer/v1/catalog",
+		"/peer/v1/inference",
+		"/peer/v1/inference/cancel",
+		"/peer/v1/community/sync",
+		"/peer/v1/contributions/ack",
+		"/peer/v1/contributions/sync",
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+
+		raw, err := outsider.trans.Dial(ctx, "member", peerPort)
+		if err != nil {
+			cancel()
+			continue // the transport refused outright, which is also a refusal
+		}
+
+		conn := tls.Client(raw, outsiderTLS)
+		method := "POST"
+		if path == "/peer/v1/catalog" {
+			method = "GET"
+		}
+		resp, err := peerRoundTrip(ctx, conn, method, path, map[string]any{})
+		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
+			_ = conn.Close()
+			cancel()
+			t.Fatalf("route %s answered an unadmitted node: %d %s", path, resp.StatusCode, body)
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		_ = conn.Close()
+		cancel()
+	}
+
+	// The same is true through the product's own dialer, which additionally
+	// refuses because the outsider has no roster to name the peer with.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := outsider.localSrv.dialPeer(ctx, member.memberID, "member"); err == nil {
+		t.Fatal("an unadmitted node opened an authenticated peer connection")
+	}
+}
+
+// TestAdmittedMemberCannotImpersonateAnother covers the second half of task 1:
+// there is no member_id field left to lie in, and the queue attributes work to
+// the authenticated identity.
+func TestAdmittedMemberCannotImpersonateAnother(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	const peerPort = 4242
+
+	creator := setupTestNode(t, vNet, "creator", peerPort)
+	creator.login(t)
+	_, invitation := creator.hostRoom(t, "Alice", "Room")
+
+	bob := setupTestNode(t, vNet, "bob", peerPort)
+	bob.login(t)
+	if w := bob.joinRoom(t, "Bob", invitation); w.Code != http.StatusOK {
+		t.Fatalf("bob join: %d %s", w.Code, w.Body.String())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := bob.localSrv.dialPeer(ctx, creator.memberID, "creator")
+	if err != nil {
+		t.Fatalf("bob should reach the creator: %v", err)
+	}
+	defer conn.Close()
+
+	// Bob announces an address while claiming to be the creator. The body has
+	// no member field, so the update can only ever apply to Bob.
+	body := map[string]any{
+		"known_version": 0,
+		"member_id":     creator.memberID, // ignored: the field no longer exists
+		"tailcat_addr":  "attacker-node",
+	}
+	resp, err := peerRoundTrip(ctx, conn, "POST", "/peer/v1/membership/sync", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sync returned %d", resp.StatusCode)
+	}
+
+	addrs, _ := creator.store.ListPeerAddresses()
+	for _, pa := range addrs {
+		if pa.MemberID == creator.memberID && pa.TailcatAddr == "attacker-node" {
+			t.Fatal("a member rebound the creator's address")
+		}
+		if pa.MemberID == bob.memberID && pa.TailcatAddr != "attacker-node" {
+			t.Fatalf("the caller's own address was not applied: %q", pa.TailcatAddr)
+		}
+	}
+}
+
+// TestJoinAdmissionRules covers task 2.
+func TestJoinAdmissionRules(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	const peerPort = 4242
+
+	creator := setupTestNode(t, vNet, "creator", peerPort)
+	creator.login(t)
+	_, invitation := creator.hostRoom(t, "Alice", "Room")
+
+	bob := setupTestNode(t, vNet, "bob", peerPort)
+	bob.login(t)
+	if w := bob.joinRoom(t, "Bob", invitation); w.Code != http.StatusOK {
+		t.Fatalf("bob join: %d %s", w.Code, w.Body.String())
+	}
+
+	t.Run("join via a member node is refused", func(t *testing.T) {
+		// A member serves no bootstrap listener at all, so the port is dead.
+		charlie := setupTestNode(t, vNet, "charlie-a", peerPort)
+		charlie.login(t)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		bobRoom, _ := bob.store.GetRoomState()
+		if len(bobRoom.RoomCertDER) != 0 {
+			t.Fatal("a member must not hold a room certificate")
+		}
+		if _, err := charlie.trans.Dial(ctx, "bob", peerPort+peerapi.BootstrapPortOffset); err == nil {
+			t.Fatal("a member node is serving a bootstrap listener")
+		}
+	})
+
+	t.Run("rejoin by an admitted device is refused", func(t *testing.T) {
+		// Bob's device is already admitted; presenting the code again must not
+		// overwrite his roster row.
+		w := bob.doJSON("POST", "/api/v1/room/join", map[string]string{"invitation_code": invitation})
+		if w.Code == http.StatusOK {
+			var resp struct {
+				Status string `json:"status"`
+			}
+			_ = json.NewDecoder(w.Body).Decode(&resp)
+			if resp.Status == "admitted" {
+				t.Fatal("an already-admitted device was re-admitted")
+			}
+		}
+	})
+
+	t.Run("rejoin by a removed device is refused", func(t *testing.T) {
+		charlie := setupTestNode(t, vNet, "charlie-b", peerPort)
+		charlie.login(t)
+		if w := charlie.joinRoom(t, "Charlie", invitation); w.Code != http.StatusOK {
+			t.Fatalf("charlie join: %d %s", w.Code, w.Body.String())
+		}
+
+		// The creator removes Charlie but does not rotate the code.
+		w := creator.doJSON("POST",
+			fmt.Sprintf("/api/v1/room-admin/members/%s/remove", charlie.memberID),
+			map[string]any{"rotate_invitation": false})
+		if w.Code != http.StatusOK {
+			t.Fatalf("remove charlie: %d %s", w.Code, w.Body.String())
+		}
+
+		_ = charlie.store.ClearRoom()
+		w = charlie.doJSON("POST", "/api/v1/room/join", map[string]string{"invitation_code": invitation})
+		if w.Code == http.StatusOK {
+			var resp struct {
+				Status string `json:"status"`
+			}
+			_ = json.NewDecoder(w.Body).Decode(&resp)
+			if resp.Status == "admitted" {
+				t.Fatal("a removed device rejoined on an unrotated code")
+			}
+		}
+
+		onCreator, _ := creator.store.GetMember(charlie.memberID)
+		if onCreator == nil || onCreator.Status != string(room.StatusRemoved) {
+			t.Fatalf("removed member row was overwritten by a rejoin: %#v", onCreator)
+		}
+	})
+
+	t.Run("malformed device key cannot reach admission", func(t *testing.T) {
+		// device_public is derived from the certificate, so a short or absent
+		// key in the body has nowhere to land: there is no field to send one
+		// in, and a connection with no client certificate never reaches the
+		// handler. This is the regression for slicing a caller-supplied string
+		// to sixteen characters without decoding it.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		raw, err := bob.trans.Dial(ctx, "creator", peerPort+peerapi.BootstrapPortOffset)
+		if err != nil {
+			t.Fatalf("dial bootstrap: %v", err)
+		}
+		conn := tls.Client(raw, &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true})
+		defer conn.Close()
+
+		resp, err := peerRoundTrip(ctx, conn, "POST", "/bootstrap/v1/join", map[string]any{
+			"room_id":       "whatever",
+			"device_public": "ab", // no such field exists any more
+		})
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				t.Fatal("bootstrap answered a client with no device certificate")
+			}
+		}
+
+		// And a short device_public in the body is simply ignored rather than
+		// sliced, so nothing panics.
+		if _, err := peerapi.MemberIDForDevicePublic("ab"); err == nil {
+			t.Fatal("a 2-character device key should not yield a member id")
+		}
+	})
+}
+
+// TestBootstrapPinsRoomAuthority covers the joiner side of task 2: the
+// bootstrap endpoint must be signed by the authority in the invitation.
+func TestBootstrapPinsRoomAuthority(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	const peerPort = 4242
+
+	creator := setupTestNode(t, vNet, "creator", peerPort)
+	creator.login(t)
+	_, invitation := creator.hostRoom(t, "Alice", "Room")
+
+	joiner := setupTestNode(t, vNet, "joiner", peerPort)
+	joiner.login(t)
+
+	inv, err := room.ParseInvitation(invitation)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// A different authority key must not verify the creator's certificate.
+	wrongAuthority := make([]byte, 32)
+	wrongAuthority[0] = 1
+	if _, err := joiner.localSrv.dialBootstrap(ctx, inv.BootstrapAddr, wrongAuthority); err == nil {
+		t.Fatal("bootstrap accepted a certificate not signed by the pinned authority")
 	}
 }
 
 func TestSecurityMiddlewareLANAndDNSRebinding(t *testing.T) {
 	vNet := transport.NewMemoryNetwork()
 	node := setupTestNode(t, vNet, "sec-node", 4242)
-	defer node.trans.Close()
-	defer node.store.Close()
-
-	// Update node to have configured allowed host
 	node.localSrv.allowedHosts = []string{"woolwire.local", "my-nas.lan"}
 
 	tests := []struct {
@@ -325,90 +487,253 @@ func TestSecurityMiddlewareLANAndDNSRebinding(t *testing.T) {
 	for _, tc := range tests {
 		req := httptest.NewRequest("GET", "/api/v1/state", nil)
 		req.Host = tc.host
-		w := httptest.NewRecorder()
-		node.localSrv.securityMiddleware(node.localSrv.mux).ServeHTTP(w, req)
+		w := node.doRequest(req)
 
-		if tc.wantBlock {
-			if w.Code != http.StatusForbidden {
-				t.Errorf("[%s] host %q should be blocked with 403, got %d", tc.desc, tc.host, w.Code)
-			}
-		} else {
-			if w.Code == http.StatusForbidden {
-				t.Errorf("[%s] host %q should NOT be blocked with 403 Forbidden", tc.desc, tc.host)
-			}
+		if tc.wantBlock && w.Code != http.StatusForbidden {
+			t.Errorf("[%s] host %q should be blocked with 403, got %d", tc.desc, tc.host, w.Code)
+		}
+		if !tc.wantBlock && w.Code == http.StatusForbidden {
+			t.Errorf("[%s] host %q should NOT be blocked with 403 Forbidden", tc.desc, tc.host)
 		}
 	}
 }
 
-func TestSetupTokenManagement(t *testing.T) {
+// TestCSRFProtection covers task 7. A page on another 127.0.0.1 port is
+// same-site to the browser, so SameSite alone never blocked it.
+func TestCSRFProtection(t *testing.T) {
 	vNet := transport.NewMemoryNetwork()
-	node := setupTestNode(t, vNet, "setup-node", 4299)
-	defer node.trans.Close()
-	defer node.store.Close()
-
-	// 1. Unauthenticated GET /api/v1/setup/info should return 401
-	w := node.doJSON("GET", "/api/v1/setup/info", nil)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 unauthorized, got %d", w.Code)
-	}
-
-	// 2. Login with initial token
+	node := setupTestNode(t, vNet, "csrf-node", 4242)
 	node.login(t)
 
-	// 3. Authenticated GET /api/v1/setup/info should return current token
-	w = node.doJSON("GET", "/api/v1/setup/info", nil)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", w.Code)
+	t.Run("cross-origin POST with a valid cookie is rejected", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/api/v1/profile",
+			bytes.NewReader([]byte(`{"display_name":"Hacked"}`)))
+		req.Host = "127.0.0.1:7070"
+		req.Header.Set("Origin", "http://127.0.0.1:3000")
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(node.cookie)
+
+		if code := node.doRequest(req).Code; code != http.StatusForbidden {
+			t.Fatalf("expected 403 for a cross-origin POST, got %d", code)
+		}
+	})
+
+	t.Run("simple cross-origin POST with text/plain is rejected", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/api/v1/room/leave", bytes.NewReader([]byte(`{}`)))
+		req.Host = "127.0.0.1:7070"
+		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
+		req.Header.Set("Origin", "http://127.0.0.1:7070")
+		req.AddCookie(node.cookie)
+
+		if code := node.doRequest(req).Code; code != http.StatusForbidden {
+			t.Fatalf("expected 403 for a text/plain POST, got %d", code)
+		}
+	})
+
+	t.Run("same-origin POST is accepted", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/api/v1/profile",
+			bytes.NewReader([]byte(`{"display_name":"Alice"}`)))
+		req.Host = "127.0.0.1:7070"
+		req.Header.Set("Origin", "http://127.0.0.1:7070")
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(node.cookie)
+
+		if code := node.doRequest(req).Code; code != http.StatusOK {
+			t.Fatalf("expected 200 for a same-origin POST, got %d", code)
+		}
+	})
+
+	t.Run("the SPA header alone is accepted", func(t *testing.T) {
+		if code := node.doJSON("POST", "/api/v1/profile",
+			map[string]string{"display_name": "Alice"}).Code; code != http.StatusOK {
+			t.Fatalf("expected 200 with the SPA header, got %d", code)
+		}
+	})
+
+	t.Run("session cookie is SameSite=Strict", func(t *testing.T) {
+		if node.cookie.SameSite != http.SameSiteStrictMode {
+			t.Fatalf("session cookie SameSite is %v, want Strict", node.cookie.SameSite)
+		}
+	})
+}
+
+// TestSetupSecretIsOneTimeAndRateLimited covers task 6.
+func TestSetupSecretIsOneTimeAndRateLimited(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	node := setupTestNode(t, vNet, "setup-node", 4299)
+
+	// Unauthenticated setup info is refused.
+	if code := node.doJSON("GET", "/api/v1/setup/info", nil).Code; code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 unauthorized, got %d", code)
 	}
-	var infoResp struct {
+
+	node.login(t)
+
+	// The secret is never echoed back, only its state.
+	w := node.doJSON("GET", "/api/v1/setup/info", nil)
+	var info map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&info)
+	if _, leaked := info["token"]; leaked {
+		t.Fatal("setup info returned the secret itself")
+	}
+	if info["redeemed"] != true {
+		t.Fatalf("expected the secret to be marked redeemed, got %#v", info)
+	}
+
+	// Redeeming again fails: the secret is one-time.
+	replay := node.doJSON("POST", "/api/v1/setup", map[string]string{"token": node.setupToken})
+	if replay.Code != http.StatusGone {
+		t.Fatalf("expected 410 on a redeemed secret, got %d: %s", replay.Code, replay.Body.String())
+	}
+
+	// A short custom secret is refused.
+	if code := node.doJSON("POST", "/api/v1/setup/token", map[string]string{"token": "987654"}).Code; code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a 6-character secret, got %d", code)
+	}
+
+	// Resetting with no body mints a fresh 128-bit secret, returned once.
+	w = node.doJSON("POST", "/api/v1/setup/token", map[string]any{})
+	if w.Code != http.StatusOK {
+		t.Fatalf("reset setup secret: %d %s", w.Code, w.Body.String())
+	}
+	var reset struct {
 		Token string `json:"token"`
 	}
-	_ = json.NewDecoder(w.Body).Decode(&infoResp)
-	if infoResp.Token != node.setupToken {
-		t.Fatalf("expected token %q, got %q", node.setupToken, infoResp.Token)
+	_ = json.NewDecoder(w.Body).Decode(&reset)
+	if len(reset.Token) != 32 {
+		t.Fatalf("expected a 128-bit hex secret, got %q", reset.Token)
 	}
 
-	// 4. Update setup token to custom PIN "987654"
-	w = node.doJSON("POST", "/api/v1/setup/token", map[string]string{"token": "987654"})
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", w.Code)
-	}
-
-	// 5. Test login with old token should fail
-	oldReqBody, _ := json.Marshal(map[string]string{"token": node.setupToken})
-	req := httptest.NewRequest("POST", "/api/v1/setup", bytes.NewReader(oldReqBody))
-	rec := httptest.NewRecorder()
-	node.localSrv.mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected old token to fail with 401, got %d", rec.Code)
-	}
-
-	// 6. Test login with new token should succeed and set session cookie
-	newReqBody, _ := json.Marshal(map[string]string{"token": "987654"})
-	req = httptest.NewRequest("POST", "/api/v1/setup", bytes.NewReader(newReqBody))
-	rec = httptest.NewRecorder()
-	node.localSrv.mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected new token to succeed with 200, got %d", rec.Code)
-	}
-	foundCookie := false
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == "woolwire_session" {
-			foundCookie = true
-			if c.MaxAge <= 0 {
-				t.Errorf("expected MaxAge > 0 for persistent login cookie")
-			}
+	// Ten wrong guesses must be delayed.
+	var sawBackoff bool
+	for i := 0; i < 10; i++ {
+		req := node.newRequest("POST", "/api/v1/setup", map[string]string{"token": "wrong"})
+		req.RemoteAddr = "192.0.2.10:5555"
+		if node.doRequest(req).Code == http.StatusTooManyRequests {
+			sawBackoff = true
 			break
 		}
 	}
-	if !foundCookie {
-		t.Fatal("session cookie not found after login with new token")
+	if !sawBackoff {
+		t.Fatal("ten failed setup attempts were not rate limited")
 	}
 
-	// 7. Update with too short token should fail
-	w = node.doJSON("POST", "/api/v1/setup/token", map[string]string{"token": "12"})
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 Bad Request for short token, got %d", w.Code)
+	// The freshly minted secret still works from a different address.
+	req := node.newRequest("POST", "/api/v1/setup", map[string]string{"token": reset.Token})
+	req.RemoteAddr = "192.0.2.20:5555"
+	if code := node.doRequest(req).Code; code != http.StatusOK {
+		t.Fatalf("fresh secret should be redeemable, got %d", code)
 	}
 }
 
+// TestRoomStateEdgeCases covers task 27.
+func TestRoomStateEdgeCases(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	const peerPort = 4242
+
+	t.Run("hosting requires a display name", func(t *testing.T) {
+		node := setupTestNode(t, vNet, "no-name", peerPort)
+		node.login(t)
+		if code := node.doJSON("POST", "/api/v1/room/host",
+			map[string]string{"room_name": "Room"}).Code; code != http.StatusBadRequest {
+			t.Fatalf("expected 400 without a display name, got %d", code)
+		}
+	})
+
+	t.Run("hosting twice is refused", func(t *testing.T) {
+		node := setupTestNode(t, vNet, "double-host", peerPort)
+		node.login(t)
+		node.hostRoom(t, "Alice", "First")
+
+		if code := node.doJSON("POST", "/api/v1/room/host",
+			map[string]string{"room_name": "Second"}).Code; code != http.StatusConflict {
+			t.Fatalf("expected 409 for a second room, got %d", code)
+		}
+		if n, _ := node.store.CountRoomStates(); n != 1 {
+			t.Fatalf("expected exactly one room row, got %d", n)
+		}
+	})
+
+	t.Run("leaving stops the peer server", func(t *testing.T) {
+		node := setupTestNode(t, vNet, "leaver", peerPort)
+		node.login(t)
+		node.hostRoom(t, "Alice", "Room")
+
+		if node.peerServer() == nil {
+			t.Fatal("hosting did not start a peer server")
+		}
+		if code := node.doJSON("POST", "/api/v1/room/leave", nil).Code; code != http.StatusOK {
+			t.Fatal("leave failed")
+		}
+		if node.peerServer() != nil {
+			t.Fatal("leaving a room left the peer server running")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		other := setupTestNode(t, vNet, "leaver-probe", peerPort)
+		if _, err := other.trans.Dial(ctx, "leaver", peerPort); err == nil {
+			t.Fatal("the peer listener is still accepting connections after leave")
+		}
+	})
+
+	t.Run("approval mode admits through the creator", func(t *testing.T) {
+		creator := setupTestNode(t, vNet, "approval-creator", peerPort)
+		creator.login(t)
+		_, invitation := creator.hostRoom(t, "Alice", "Room")
+
+		if code := creator.doJSON("POST", "/api/v1/room-admin/approval-mode",
+			map[string]any{"approval_mode": true}).Code; code != http.StatusOK {
+			t.Fatal("failed to enable approval mode")
+		}
+
+		joiner := setupTestNode(t, vNet, "approval-joiner", peerPort)
+		joiner.login(t)
+		w := joiner.joinRoom(t, "Bob", invitation)
+		if w.Code != http.StatusOK {
+			t.Fatalf("join under approval mode: %d %s", w.Code, w.Body.String())
+		}
+		var joinResp struct {
+			Status string `json:"status"`
+		}
+		_ = json.NewDecoder(w.Body).Decode(&joinResp)
+		if joinResp.Status != string(room.StatusPending) {
+			t.Fatalf("expected pending, got %q", joinResp.Status)
+		}
+
+		w = creator.doJSON("GET", "/api/v1/room-admin/pending", nil)
+		var pending []store.MemberRecord
+		_ = json.NewDecoder(w.Body).Decode(&pending)
+		if len(pending) != 1 || pending[0].MemberID != joiner.memberID {
+			t.Fatalf("unexpected pending list: %#v", pending)
+		}
+
+		if code := creator.doJSON("POST",
+			fmt.Sprintf("/api/v1/room-admin/members/%s/approve", joiner.memberID), nil).Code; code != http.StatusOK {
+			t.Fatal("approve failed")
+		}
+
+		approved, _ := creator.store.GetMember(joiner.memberID)
+		if approved == nil || approved.Status != string(room.StatusAdmitted) {
+			t.Fatalf("approval did not admit the member: %#v", approved)
+		}
+		// The approval must be verifiable by every peer.
+		authority, err := peerauth.NewRoster(creator.store).Authority()
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := room.Membership{
+			MemberID:      approved.MemberID,
+			RoomID:        approved.RoomID,
+			DevicePublic:  approved.DevicePublic,
+			DisplayName:   approved.DisplayName,
+			Status:        room.MemberStatus(approved.Status),
+			RosterVersion: approved.RosterVersion,
+			Signature:     approved.Signature,
+			SigVersion:    approved.SigVersion,
+		}
+		if err := m.Verify(authority); err != nil {
+			t.Fatalf("approved membership does not verify: %v", err)
+		}
+	})
+}

@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"sync"
@@ -18,6 +17,7 @@ import (
 	"github.com/cbaack/woolwire/internal/peerauth"
 	"github.com/cbaack/woolwire/internal/room"
 	"github.com/cbaack/woolwire/internal/store"
+	"github.com/cbaack/woolwire/internal/transport"
 )
 
 // BootstrapPortOffset places /bootstrap/v1/join on its own Tailcat port. The
@@ -55,6 +55,7 @@ type Server struct {
 	deviceCert tls.Certificate
 	roomCert   *tls.Certificate
 
+	listeners    []net.Listener
 	peerMux      *http.ServeMux
 	bootstrapMux *http.ServeMux
 	peerHTTP     *http.Server
@@ -273,15 +274,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.SaveMember(store.MemberRecord{
-		MemberID:      membership.MemberID,
-		RoomID:        membership.RoomID,
-		DevicePublic:  membership.DevicePublic,
-		DisplayName:   membership.DisplayName,
-		Status:        string(membership.Status),
-		RosterVersion: membership.RosterVersion,
-		Signature:     membership.Signature,
-	}); err != nil {
+	if err := s.store.SaveMember(peerauth.MemberRecord(membership)); err != nil {
 		http.Error(w, "save membership failed", http.StatusInternalServerError)
 		return
 	}
@@ -321,15 +314,9 @@ func (s *Server) rosterSnapshot(roomID string, minVersion int64) []room.Membersh
 		if m.RosterVersion <= minVersion {
 			continue
 		}
-		roster = append(roster, room.Membership{
-			MemberID:      m.MemberID,
-			RoomID:        m.RoomID,
-			DevicePublic:  m.DevicePublic,
-			DisplayName:   m.DisplayName,
-			Status:        room.MemberStatus(m.Status),
-			RosterVersion: m.RosterVersion,
-			Signature:     m.Signature,
-		})
+		// SigVersion travels with the signature; without it the recipient
+		// rebuilds the legacy payload and every record fails to verify.
+		roster = append(roster, peerauth.Membership(m))
 	}
 	return roster
 }
@@ -470,4 +457,47 @@ func (s *Server) Close() error {
 	return s.peerHTTP.Close()
 }
 
-var errNotAdmitted = fmt.Errorf("caller is not an admitted member")
+// Start listens on the transport for peer connections and, when this node is
+// the creator, for bootstrap connections on the adjacent port. Both listeners
+// are wrapped in TLS here so no caller can accidentally serve the peer API in
+// the clear.
+func (s *Server) Start(t transport.Transport, peerPort uint16) error {
+	peerListener, err := t.Listen(peerPort)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.listeners = append(s.listeners, peerListener)
+	s.mu.Unlock()
+	go func() { _ = s.Serve(tls.NewListener(peerListener, s.PeerTLSConfig())) }()
+
+	if bootstrapCfg := s.BootstrapTLSConfig(); bootstrapCfg != nil {
+		bootstrapListener, err := t.Listen(peerPort + BootstrapPortOffset)
+		if err != nil {
+			_ = s.Stop(context.Background())
+			return err
+		}
+		s.mu.Lock()
+		s.listeners = append(s.listeners, bootstrapListener)
+		s.mu.Unlock()
+		go func() { _ = s.ServeBootstrap(tls.NewListener(bootstrapListener, bootstrapCfg)) }()
+	}
+
+	return nil
+}
+
+// Stop drains both servers and closes the listeners this server opened.
+func (s *Server) Stop(ctx context.Context) error {
+	err := s.Shutdown(ctx)
+
+	s.mu.Lock()
+	listeners := s.listeners
+	s.listeners = nil
+	s.mu.Unlock()
+
+	for _, l := range listeners {
+		_ = l.Close()
+	}
+	return err
+}

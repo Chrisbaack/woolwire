@@ -22,18 +22,12 @@ func TestM2LiveDashboardAndExternalInferenceGate(t *testing.T) {
 	// Node 2: Host (Bob)
 	// Node 3: Requester (Charlie)
 	node1 := setupTestNode(t, vNet, "node-1", peerPort)
-	defer node1.trans.Close()
-	defer node1.store.Close()
 	node1.login(t)
 
 	node2 := setupTestNode(t, vNet, "node-2", peerPort)
-	defer node2.trans.Close()
-	defer node2.store.Close()
 	node2.login(t)
 
 	node3 := setupTestNode(t, vNet, "node-3", peerPort)
-	defer node3.trans.Close()
-	defer node3.store.Close()
 	node3.login(t)
 
 	// Set display names
@@ -65,10 +59,8 @@ func TestM2LiveDashboardAndExternalInferenceGate(t *testing.T) {
 	}
 
 	// Give peers a moment to sync addresses if needed
-	bobDev, _ := node2.store.GetDeviceIdentity()
-	bobMemberID := "m-" + bobDev.DevicePublic[:16]
-	charlieDev, _ := node3.store.GetDeviceIdentity()
-	charlieMemberID := "m-" + charlieDev.DevicePublic[:16]
+	bobMemberID := node2.memberID
+	charlieMemberID := node3.memberID
 
 	// Sync roster and addresses
 	_ = node3.store.SavePeerAddress(bobMemberID, "node-2")
@@ -80,9 +72,23 @@ func TestM2LiveDashboardAndExternalInferenceGate(t *testing.T) {
 
 	// Setup a mock external LLM server for Bob
 	var mockServerHang sync.WaitGroup
+	var backendModelMu sync.Mutex
+	var backendModelSeen []string
+
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/hang") {
 			mockServerHang.Wait()
+		}
+
+		if strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			var body struct {
+				Model     string `json:"model"`
+				MaxTokens int    `json:"max_tokens"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			backendModelMu.Lock()
+			backendModelSeen = append(backendModelSeen, body.Model)
+			backendModelMu.Unlock()
 		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -150,8 +156,8 @@ func TestM2LiveDashboardAndExternalInferenceGate(t *testing.T) {
 	// GATE CRITERION 2: Non-creator host serves another member while the creator is offline
 	// ---------------------------------------------------------------------------------
 	t.Run("Criterion 2: Bob serves Charlie while Alice (creator) is stopped", func(t *testing.T) {
-		// Stop Creator (Alice)
-		_ = node1.peerSrv.Close()
+		// Stop Creator (Alice) entirely: peer listener, local API, transport.
+		_ = node1.stopPeer()
 		_ = node1.localSrv.Close()
 		_ = node1.trans.Close()
 
@@ -192,6 +198,21 @@ func TestM2LiveDashboardAndExternalInferenceGate(t *testing.T) {
 		if msgs[1].Role != "assistant" || !strings.Contains(msgs[1].Content, "Hello from Bob's model!") {
 			t.Errorf("unexpected assistant message: %#v", msgs[1])
 		}
+
+		// The backend must be sent the model name it knows. Passing the opaque
+		// Woolwire ID only ever worked against single-model servers that
+		// ignore the field.
+		backendModelMu.Lock()
+		seen := append([]string(nil), backendModelSeen...)
+		backendModelMu.Unlock()
+		if len(seen) == 0 {
+			t.Fatal("the backend received no chat completion request")
+		}
+		for _, got := range seen {
+			if got != "Llama-3-8B" {
+				t.Fatalf("backend received model %q, want the configured name %q", got, "Llama-3-8B")
+			}
+		}
 	})
 
 	// ---------------------------------------------------------------------------------
@@ -229,6 +250,34 @@ func TestM2LiveDashboardAndExternalInferenceGate(t *testing.T) {
 
 		// Check Charlie's database: No messages should be saved for this conversation
 		charlieNoSaveMsgs, _ := node3.store.ListMessages(noSaveConv.ID)
+		if len(charlieNoSaveMsgs) != 0 {
+			t.Fatalf("No-save mode leaked messages into Charlie's DB: %#v", charlieNoSaveMsgs)
+		}
+
+		// A second turn must still carry the first: privacy mode must not also
+		// mean the model forgets what was just said.
+		w = node3.doJSON("POST", fmt.Sprintf("/api/v1/chats/%s/message", noSaveConv.ID), map[string]string{
+			"content":        "And the follow-up?",
+			"host_member_id": bobMemberID,
+			"model_id":       bobModel.ID,
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("second no-save message failed: %d, %s", w.Code, w.Body.String())
+		}
+
+		turns := node3.localSrv.noSaveHistory(noSaveConv.ID)
+		var sawFirstTurn bool
+		for _, m := range turns {
+			if m.Role == "user" && m.Content == "Top secret question" {
+				sawFirstTurn = true
+			}
+		}
+		if !sawFirstTurn {
+			t.Fatalf("no-save conversation lost its first turn: %#v", turns)
+		}
+
+		// Still nothing on disk.
+		charlieNoSaveMsgs, _ = node3.store.ListMessages(noSaveConv.ID)
 		if len(charlieNoSaveMsgs) != 0 {
 			t.Fatalf("No-save mode leaked messages into Charlie's DB: %#v", charlieNoSaveMsgs)
 		}
@@ -273,8 +322,7 @@ func TestM2LiveDashboardAndExternalInferenceGate(t *testing.T) {
 			t.Fatalf("save limits failed: %d", w.Code)
 		}
 
-		// Update Bob's peer server queue with the new limits
-		node2.peerSrv = nil // will be updated if needed or test queue limits directly
+		// The shared queue picks the new limits up immediately.
 		// Test SSRF destination validation: remote off-machine plain HTTP must be rejected
 		w = node2.doJSON("POST", "/api/v1/hosted-models", map[string]any{
 			"name":         "Insecure Remote Model",
@@ -293,8 +341,15 @@ func TestM2LiveDashboardAndExternalInferenceGate(t *testing.T) {
 			t.Fatalf("expected 400 rejection for metadata service, got: %d", w.Code)
 		}
 
-		// Test OpenAI compatibility endpoints
-		w = node3.doJSON("GET", "/v1/models", nil)
+		// The OpenAI-compatible routes always require the local API token.
+		unauth := node3.newRequest("GET", "/v1/models", nil)
+		if code := node3.doRequest(unauth).Code; code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 without the local API token, got %d", code)
+		}
+
+		req := node3.newRequest("GET", "/v1/models", nil)
+		req.Header.Set("Authorization", node3.localAPIBearer(t))
+		w = node3.doRequest(req)
 		if w.Code != http.StatusOK {
 			t.Fatalf("OpenAI models list failed: %d, %s", w.Code, w.Body.String())
 		}
@@ -336,8 +391,6 @@ func TestTestAndDiscoverEndpoints(t *testing.T) {
 
 	vNet := transport.NewMemoryNetwork()
 	node := setupTestNode(t, vNet, "test-node", 4242)
-	defer node.trans.Close()
-	defer node.store.Close()
 	node.login(t)
 
 	// Test discover models

@@ -82,15 +82,7 @@ func (r *Roster) Admitted(devicePublic string) (*room.Membership, error) {
 	if err != nil || rec == nil {
 		return nil, ErrNotAdmitted
 	}
-	m := room.Membership{
-		MemberID:      rec.MemberID,
-		RoomID:        rec.RoomID,
-		DevicePublic:  rec.DevicePublic,
-		DisplayName:   rec.DisplayName,
-		Status:        room.MemberStatus(rec.Status),
-		RosterVersion: rec.RosterVersion,
-		Signature:     rec.Signature,
-	}
+	m := Membership(*rec)
 	if m.Status != room.StatusAdmitted {
 		return nil, ErrNotAdmitted
 	}
@@ -161,6 +153,11 @@ func PeerServerTLSConfig(cert tls.Certificate, r *Roster) *tls.Config {
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{cert},
 		ClientAuth:   tls.RequireAnyClientCert,
+		// Every peer request opens a fresh connection over the transport, so
+		// resumption buys nothing and only adds a ticket the server writes
+		// after the handshake — which a client that immediately sends its
+		// request never drains.
+		SessionTicketsDisabled: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			devicePublic, _, err := DevicePublicFromCerts(rawCerts)
 			if err != nil {
@@ -182,9 +179,10 @@ func PeerClientTLSConfig(cert tls.Certificate, r *Roster, expectMemberID string)
 		return nil, errors.New("expected member id is required")
 	}
 	return &tls.Config{
-		MinVersion:         tls.VersionTLS13,
-		Certificates:       []tls.Certificate{cert},
-		InsecureSkipVerify: true, // replaced by the pinned roster check below
+		MinVersion:             tls.VersionTLS13,
+		Certificates:           []tls.Certificate{cert},
+		SessionTicketsDisabled: true,
+		InsecureSkipVerify:     true, // replaced by the pinned roster check below
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			devicePublic, _, err := DevicePublicFromCerts(rawCerts)
 			if err != nil {
@@ -207,9 +205,10 @@ func PeerClientTLSConfig(cert tls.Certificate, r *Roster, expectMemberID string)
 // certificate, because the joiner is by definition not on the roster yet.
 func BootstrapServerTLSConfig(roomCert tls.Certificate) *tls.Config {
 	return &tls.Config{
-		MinVersion:   tls.VersionTLS13,
-		Certificates: []tls.Certificate{roomCert},
-		ClientAuth:   tls.RequireAnyClientCert,
+		MinVersion:             tls.VersionTLS13,
+		Certificates:           []tls.Certificate{roomCert},
+		ClientAuth:             tls.RequireAnyClientCert,
+		SessionTicketsDisabled: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			_, _, err := DevicePublicFromCerts(rawCerts)
 			return err
@@ -226,9 +225,10 @@ func BootstrapClientTLSConfig(cert tls.Certificate, authority ed25519.PublicKey)
 	}
 	pinned := append(ed25519.PublicKey(nil), authority...)
 	return &tls.Config{
-		MinVersion:         tls.VersionTLS13,
-		Certificates:       []tls.Certificate{cert},
-		InsecureSkipVerify: true, // replaced by the pinned authority check below
+		MinVersion:             tls.VersionTLS13,
+		Certificates:           []tls.Certificate{cert},
+		SessionTicketsDisabled: true,
+		InsecureSkipVerify:     true, // replaced by the pinned authority check below
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			_, serverCert, err := DevicePublicFromCerts(rawCerts)
 			if err != nil {
@@ -284,4 +284,35 @@ func IssueRoomCertificate(authorityPrivate ed25519.PrivateKey, devicePublic ed25
 		return nil, fmt.Errorf("create room certificate: %w", err)
 	}
 	return der, nil
+}
+
+// MemberRecord converts a signed membership to its stored form. It exists so
+// no caller has to remember the field list: an earlier hand-written copy
+// dropped SigVersion, which silently made every record fail to verify on the
+// receiving node.
+func MemberRecord(m room.Membership) store.MemberRecord {
+	return store.MemberRecord{
+		MemberID:      m.MemberID,
+		RoomID:        m.RoomID,
+		DevicePublic:  m.DevicePublic,
+		DisplayName:   m.DisplayName,
+		Status:        string(m.Status),
+		RosterVersion: m.RosterVersion,
+		Signature:     m.Signature,
+		SigVersion:    m.SigVersion,
+	}
+}
+
+// Membership converts a stored roster row back to a verifiable membership.
+func Membership(rec store.MemberRecord) room.Membership {
+	return room.Membership{
+		MemberID:      rec.MemberID,
+		RoomID:        rec.RoomID,
+		DevicePublic:  rec.DevicePublic,
+		DisplayName:   rec.DisplayName,
+		Status:        room.MemberStatus(rec.Status),
+		RosterVersion: rec.RosterVersion,
+		Signature:     rec.Signature,
+		SigVersion:    rec.SigVersion,
+	}
 }

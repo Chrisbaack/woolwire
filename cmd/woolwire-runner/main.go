@@ -31,6 +31,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The runner drives model execution on the owner's hardware, so it is
+	// never left unauthenticated even on an internal-only network.
+	if *runnerToken == "" {
+		fmt.Fprintf(os.Stderr, "a runner token is required (set RUNNER_TOKEN or -token)\n")
+		os.Exit(1)
+	}
+
 	ctrl, err := runner.NewController(runner.Config{
 		ModelDir:    *modelsDir,
 		RunnerToken: *runnerToken,
@@ -62,4 +69,6 @@ func main() {
 	<-sigCh
 
 	fmt.Println("Shutting down runner controller...")
+	// Stop and reap the engine child rather than orphaning it.
+	_ = ctrl.Close()
 }
