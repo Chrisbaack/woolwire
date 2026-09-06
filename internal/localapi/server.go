@@ -874,14 +874,20 @@ func (s *Server) handleJoinRoom(w http.ResponseWriter, r *http.Request) {
 	// The invitation code is deliberately not stored on a member node. Doing
 	// so put the admission secret in every member's database, which is how a
 	// leaked member backup could admit new devices behind the creator's back.
-	_ = s.store.SaveRoomState(store.RoomRecord{
+	//
+	// This write is checked: reporting a successful join while the room row
+	// failed to persist would leave the node believing it is in no room.
+	if err := s.store.SaveRoomState(store.RoomRecord{
 		RoomID:          inv.RoomID,
 		Role:            "member",
 		RoomName:        roomName,
 		AuthorityPublic: inv.AuthorityPublic,
 		BootstrapAddr:   inv.BootstrapAddr,
 		RosterVersion:   joinResp.Membership.RosterVersion,
-	})
+	}); err != nil {
+		http.Error(w, "failed to save room state", http.StatusInternalServerError)
+		return
+	}
 
 	saveMembership(s.store, *joinResp.Membership)
 	for _, m := range joinResp.Roster {

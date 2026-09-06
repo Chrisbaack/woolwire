@@ -237,6 +237,11 @@ func (s *Server) runOpenAIRequest(
 		return errPeerUnreachable
 	}
 
+	// Learn about removals before handing a peer a conversation, the same way
+	// the chat route does: a host removed since the last poll must not receive
+	// this prompt.
+	s.SyncMembership(r.Context())
+
 	conn, err := s.dialPeer(r.Context(), hostMemberID, targetAddr)
 	if err != nil {
 		return errPeerUnreachable
