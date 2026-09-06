@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react'
+import { api } from '../api.ts'
 
 interface ModelAd {
   room_id: string
@@ -40,7 +41,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   const fetchCatalog = async () => {
     try {
-      const res = await fetch('/api/v1/catalog')
+      const res = await api('/api/v1/catalog')
       if (res.ok) {
         const data = await res.json()
         setCatalog(data || [])
@@ -54,7 +55,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
   const fetchLeaderboard = async () => {
     try {
-      const res = await fetch('/api/v1/contributions/leaderboard')
+      const res = await api('/api/v1/contributions/leaderboard')
       if (res.ok) {
         const data = await res.json()
         setLeaderboard(data.leaderboard || [])

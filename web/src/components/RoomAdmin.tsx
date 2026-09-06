@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import QRCode from 'qrcode'
+import { api } from '../api.ts'
 
 interface Member {
   member_id?: string
@@ -14,14 +15,18 @@ interface Member {
 
 interface RoomAdminProps {
   invitationCode: string
+  approvalMode: boolean
   onRotateInvitation: () => Promise<string>
   onRemoveMember: (id: string, rotate: boolean) => Promise<void>
+  onApprovalModeChanged: () => Promise<void> | void
 }
 
 export const RoomAdmin: React.FC<RoomAdminProps> = ({
   invitationCode,
+  approvalMode,
   onRotateInvitation,
   onRemoveMember,
+  onApprovalModeChanged,
 }) => {
   const [activeCode, setActiveCode] = useState(invitationCode)
   const [members, setMembers] = useState<Member[]>([])
@@ -30,6 +35,8 @@ export const RoomAdmin: React.FC<RoomAdminProps> = ({
   const [error, setError] = useState('')
   const [showQr, setShowQr] = useState(false)
   const [qrUrl, setQrUrl] = useState('')
+  const [pending, setPending] = useState<Member[]>([])
+  const [savingApproval, setSavingApproval] = useState(false)
 
   useEffect(() => {
     setActiveCode(invitationCode)
@@ -49,10 +56,15 @@ export const RoomAdmin: React.FC<RoomAdminProps> = ({
 
   const fetchMembers = async () => {
     try {
-      const res = await fetch('/api/v1/room-admin/members')
+      const res = await api('/api/v1/room-admin/members')
       if (res.ok) {
         const data = await res.json()
         setMembers(data || [])
+      }
+      const pendingRes = await api('/api/v1/room-admin/pending')
+      if (pendingRes.ok) {
+        const data = await pendingRes.json()
+        setPending(data || [])
       }
     } catch {
       // ignore
@@ -64,6 +76,41 @@ export const RoomAdmin: React.FC<RoomAdminProps> = ({
     const interval = setInterval(fetchMembers, 5000)
     return () => clearInterval(interval)
   }, [])
+
+  const handleToggleApprovalMode = async (enabled: boolean) => {
+    try {
+      setSavingApproval(true)
+      setError('')
+      const res = await api('/api/v1/room-admin/approval-mode', {
+        method: 'POST',
+        body: JSON.stringify({ approval_mode: enabled }),
+      })
+      if (!res.ok) {
+        throw new Error((await res.text()) || 'Failed to change approval mode')
+      }
+      await onApprovalModeChanged()
+    } catch (err: any) {
+      setError(err.message || 'Failed to change approval mode')
+    } finally {
+      setSavingApproval(false)
+    }
+  }
+
+  const handleApprove = async (id: string) => {
+    try {
+      setLoading(true)
+      setError('')
+      const res = await api(`/api/v1/room-admin/members/${id}/approve`, { method: 'POST', body: '{}' })
+      if (!res.ok) {
+        throw new Error((await res.text()) || 'Failed to approve member')
+      }
+      await fetchMembers()
+    } catch (err: any) {
+      setError(err.message || 'Failed to approve member')
+    } finally {
+      setLoading(false)
+    }
+  }
 
   const handleCopy = () => {
     navigator.clipboard.writeText(activeCode)
@@ -148,6 +195,62 @@ export const RoomAdmin: React.FC<RoomAdminProps> = ({
           </div>
         )}
       </div>
+
+      <div className="form-group" style={{ display: 'flex', alignItems: 'flex-start', gap: '0.5rem', marginTop: '1rem' }}>
+        <input
+          type="checkbox"
+          id="approvalModeCheck"
+          checked={approvalMode}
+          disabled={savingApproval}
+          onChange={(e) => handleToggleApprovalMode(e.target.checked)}
+          style={{ marginTop: '0.25rem' }}
+        />
+        <label htmlFor="approvalModeCheck" style={{ marginBottom: 0, cursor: 'pointer' }}>
+          Require your approval before a new device joins
+          <small style={{ display: 'block', color: 'var(--text-secondary)', fontSize: '0.8rem', fontWeight: 400 }}>
+            With this on, a device holding the invitation code waits here until
+            you admit it, instead of joining straight away.
+          </small>
+        </label>
+      </div>
+
+      {pending.length > 0 && (
+        <>
+          <h3 style={{ fontSize: '1rem', marginTop: '1.5rem', marginBottom: '0.75rem' }}>
+            Waiting for Approval ({pending.length})
+          </h3>
+          <div className="member-list">
+            {pending.map((m) => {
+              const memberId = m.member_id || m.MemberID || ''
+              const displayName = m.display_name || m.DisplayName || 'Unknown Member'
+              const devicePublic = m.device_public || m.DevicePublic || ''
+              const shortId = devicePublic ? `${devicePublic.slice(0, 12)}...` : memberId.slice(0, 12)
+
+              return (
+                <div key={memberId} className="member-item">
+                  <div className="member-info">
+                    <span className="member-status" style={{ backgroundColor: 'var(--accent-primary)' }} />
+                    <div>
+                      <strong>{displayName}</strong>
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                        ID: {shortId}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    className="btn btn-primary"
+                    style={{ padding: '0.4rem 0.8rem', fontSize: '0.85rem' }}
+                    onClick={() => handleApprove(memberId)}
+                    disabled={loading}
+                  >
+                    Approve
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        </>
+      )}
 
       <h3 style={{ fontSize: '1rem', marginTop: '1.5rem', marginBottom: '0.75rem' }}>Manage Members</h3>
       <div className="member-list">

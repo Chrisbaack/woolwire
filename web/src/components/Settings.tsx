@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import QRCode from 'qrcode'
+import { api } from '../api.ts'
 
 interface HostedModel {
   id: string
@@ -69,6 +69,13 @@ export const Settings: React.FC = () => {
   const [contextLimit, setContextLimit] = useState(4096)
   const [maxTokens, setMaxTokens] = useState(1024)
   const [published, setPublished] = useState(true)
+  // backendModel is what the backend server is sent in the OpenAI "model"
+  // field. It defaults to the display name; a multi-model server needs the
+  // identifier it knows, not Woolwire's opaque model id.
+  const [backendModel, setBackendModel] = useState('')
+  // allowPrivateNetwork opts one endpoint out of the private-range and
+  // non-standard-port blocks. Off by default.
+  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(false)
 
   const [modelError, setModelError] = useState('')
   const [modelSuccess, setModelSuccess] = useState('')
@@ -88,72 +95,94 @@ export const Settings: React.FC = () => {
   const [dlLoading, setDlLoading] = useState(false)
   const [dlError, setDlError] = useState('')
   const [dlSuccess, setDlSuccess] = useState('')
+  const [dlProgress, setDlProgress] = useState<number | null>(null)
 
-  // Device Quick Login & Setup Token
-  const [setupToken, setSetupToken] = useState('')
-  const [setupQrUrl, setSetupQrUrl] = useState('')
-  const [copiedLoginLink, setCopiedLoginLink] = useState(false)
+  // Device pairing & setup secret
+  // The active setup secret is never fetched back: it is single-use and the
+  // server does not return it. Only a freshly minted one is shown, once.
+  const [setupRedeemed, setSetupRedeemed] = useState(true)
+  const [mintedSecret, setMintedSecret] = useState('')
   const [copiedSetupToken, setCopiedSetupToken] = useState(false)
-  const [showSetupSecret, setShowSetupSecret] = useState(false)
   const [newSetupPin, setNewSetupPin] = useState('')
   const [pinError, setPinError] = useState('')
   const [pinSuccess, setPinSuccess] = useState('')
   const [updatingPin, setUpdatingPin] = useState(false)
 
+  // Local API token for the OpenAI-compatible routes.
+  const [localAPIToken, setLocalAPIToken] = useState('')
+  const [showLocalAPIToken, setShowLocalAPIToken] = useState(false)
+  const [copiedLocalAPIToken, setCopiedLocalAPIToken] = useState(false)
+  const [regeneratingToken, setRegeneratingToken] = useState(false)
+
   const fetchSetupInfo = async () => {
     try {
-      const res = await fetch('/api/v1/setup/info')
+      const res = await api('/api/v1/setup/info')
       if (res.ok) {
         const data = await res.json()
-        if (data.token) {
-          setSetupToken(data.token)
-          const loginUrl = `${window.location.origin}/#token=${data.token}`
-          QRCode.toDataURL(loginUrl, {
-            width: 240,
-            margin: 2,
-            color: { dark: '#000000', light: '#ffffff' },
-          })
-            .then(setSetupQrUrl)
-            .catch(() => setSetupQrUrl(''))
-        }
+        setSetupRedeemed(Boolean(data.redeemed))
       }
     } catch {
       // ignore
     }
   }
 
+  const fetchLocalAPIToken = async () => {
+    try {
+      const res = await api('/api/v1/local-api-token')
+      if (res.ok) {
+        const data = await res.json()
+        setLocalAPIToken(data.token || '')
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const regenerateLocalAPIToken = async () => {
+    try {
+      setRegeneratingToken(true)
+      const res = await api('/api/v1/local-api-token/regenerate', { method: 'POST', body: '{}' })
+      if (res.ok) {
+        const data = await res.json()
+        setLocalAPIToken(data.token || '')
+      }
+    } finally {
+      setRegeneratingToken(false)
+    }
+  }
+
+  // mintSetupSecret asks the server for a fresh one-time secret. Leaving it
+  // blank generates a 128-bit value; a custom phrase must be at least 12
+  // characters, because a short PIN on a LAN-reachable node is guessable.
+  const mintSetupSecret = async (custom: string) => {
+    const res = await api('/api/v1/setup/token', {
+      method: 'POST',
+      body: JSON.stringify(custom ? { token: custom } : {}),
+    })
+    if (!res.ok) {
+      throw new Error((await res.text()) || 'Failed to mint a setup secret')
+    }
+    const data = await res.json()
+    setMintedSecret(data.token)
+    setSetupRedeemed(false)
+    return data.token as string
+  }
+
   const handleUpdatePin = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!newSetupPin.trim() || newSetupPin.trim().length < 4) {
-      setPinError('Setup secret or PIN must be at least 4 characters')
+    const custom = newSetupPin.trim()
+    if (custom && custom.length < 12) {
+      setPinError('A custom setup secret must be at least 12 characters')
       return
     }
     try {
       setUpdatingPin(true)
       setPinError('')
       setPinSuccess('')
-      const res = await fetch('/api/v1/setup/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: newSetupPin.trim() }),
-      })
-      if (!res.ok) {
-        const errText = await res.text()
-        throw new Error(errText || 'Failed to update setup secret')
-      }
-      const data = await res.json()
-      setSetupToken(data.token)
+      await mintSetupSecret(custom)
       setNewSetupPin('')
-      setPinSuccess('Setup secret / PIN updated successfully!')
-      const loginUrl = `${window.location.origin}/#token=${data.token}`
-      QRCode.toDataURL(loginUrl, {
-        width: 240,
-        margin: 2,
-        color: { dark: '#000000', light: '#ffffff' },
-      })
-        .then(setSetupQrUrl)
-        .catch(() => setSetupQrUrl(''))
-      setTimeout(() => setPinSuccess(''), 4000)
+      setPinSuccess('New one-time setup secret issued. Copy it now; it is shown only here.')
+      setTimeout(() => setPinSuccess(''), 8000)
     } catch (err: any) {
       setPinError(err.message || 'Failed to update setup secret')
     } finally {
@@ -161,15 +190,8 @@ export const Settings: React.FC = () => {
     }
   }
 
-  const copyLoginLink = () => {
-    const loginUrl = `${window.location.origin}/#token=${setupToken}`
-    navigator.clipboard.writeText(loginUrl)
-    setCopiedLoginLink(true)
-    setTimeout(() => setCopiedLoginLink(false), 2000)
-  }
-
   const copySetupToken = () => {
-    navigator.clipboard.writeText(setupToken)
+    navigator.clipboard.writeText(mintedSecret)
     setCopiedSetupToken(true)
     setTimeout(() => setCopiedSetupToken(false), 2000)
   }
@@ -180,7 +202,7 @@ export const Settings: React.FC = () => {
 
   const fetchContributionsSettings = async () => {
     try {
-      const res = await fetch('/api/v1/contributions/settings')
+      const res = await api('/api/v1/contributions/settings')
       if (res.ok) {
         const data = await res.json()
         setOptOut(Boolean(data.opt_out))
@@ -193,10 +215,9 @@ export const Settings: React.FC = () => {
   const handleToggleOptOut = async (newVal: boolean) => {
     try {
       setContribMsg('')
-      const res = await fetch('/api/v1/contributions/settings', {
+      const res = await api('/api/v1/contributions/settings', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ opt_out: newVal }),
+          body: JSON.stringify({ opt_out: newVal }),
       })
       if (res.ok) {
         setOptOut(newVal)
@@ -210,7 +231,7 @@ export const Settings: React.FC = () => {
 
   const fetchModels = async () => {
     try {
-      const res = await fetch('/api/v1/hosted-models')
+      const res = await api('/api/v1/hosted-models')
       if (res.ok) {
         const data = await res.json()
         setModels(Array.isArray(data) ? data : [])
@@ -222,7 +243,7 @@ export const Settings: React.FC = () => {
 
   const fetchLimits = async () => {
     try {
-      const res = await fetch('/api/v1/host-limits')
+      const res = await api('/api/v1/host-limits')
       if (res.ok) {
         const data = await res.json()
         if (data && typeof data === 'object') {
@@ -236,13 +257,13 @@ export const Settings: React.FC = () => {
 
   const fetchHardwareAndRunner = async () => {
     try {
-      const hwRes = await fetch('/api/v1/hardware')
+      const hwRes = await api('/api/v1/hardware')
       if (hwRes.ok) setHardware(await hwRes.json())
 
-      const rRes = await fetch('/api/v1/managed-models/runner-health')
+      const rRes = await api('/api/v1/managed-models/runner-health')
       if (rRes.ok) setRunner(await rRes.json())
 
-      const artRes = await fetch('/api/v1/managed-models/artifacts')
+      const artRes = await api('/api/v1/managed-models/artifacts')
       if (artRes.ok) {
         const data = await artRes.json()
         setArtifacts(Array.isArray(data) ? data : [])
@@ -258,6 +279,7 @@ export const Settings: React.FC = () => {
     fetchHardwareAndRunner()
     fetchContributionsSettings()
     fetchSetupInfo()
+    fetchLocalAPIToken()
   }, [])
 
   const handleAddModel = async (e: React.FormEvent) => {
@@ -266,17 +288,18 @@ export const Settings: React.FC = () => {
     setModelSuccess('')
 
     try {
-      const res = await fetch('/api/v1/hosted-models', {
+      const res = await api('/api/v1/hosted-models', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+          body: JSON.stringify({
           name: name.trim(),
           endpoint_url: endpointUrl.trim(),
           api_key: apiKey.trim(),
+          backend_model: backendModel.trim(),
           context_limit: Number(contextLimit),
           max_tokens: Number(maxTokens),
           enabled: true,
           published: published,
+          allow_private_network: allowPrivateNetwork,
         }),
       })
 
@@ -287,8 +310,10 @@ export const Settings: React.FC = () => {
 
       setModelSuccess('Hosted model saved successfully!')
       setName('')
+      setBackendModel('')
       setEndpointUrl('')
       setApiKey('')
+      setAllowPrivateNetwork(false)
       await fetchModels()
     } catch (err: any) {
       setModelError(err.message || 'Error saving model')
@@ -298,7 +323,7 @@ export const Settings: React.FC = () => {
   const handleDeleteModel = async (id: string) => {
     if (!confirm('Remove this hosted model?')) return
     try {
-      const res = await fetch(`/api/v1/hosted-models/${id}`, { method: 'DELETE' })
+      const res = await api(`/api/v1/hosted-models/${id}`, { method: 'DELETE' })
       if (res.ok) {
         await fetchModels()
       }
@@ -315,12 +340,12 @@ export const Settings: React.FC = () => {
     setTestingEndpoint(true)
     setTestResult(null)
     try {
-      const res = await fetch('/api/v1/hosted-models/test', {
+      const res = await api('/api/v1/hosted-models/test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+          body: JSON.stringify({
           endpoint_url: endpointUrl.trim(),
           api_key: apiKey.trim(),
+          allow_private_network: allowPrivateNetwork,
         }),
       })
       const data = await res.json()
@@ -353,12 +378,12 @@ export const Settings: React.FC = () => {
     setDiscoveringModels(true)
     setTestResult(null)
     try {
-      const res = await fetch('/api/v1/hosted-models/discover', {
+      const res = await api('/api/v1/hosted-models/discover', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+          body: JSON.stringify({
           endpoint_url: endpointUrl.trim(),
           api_key: apiKey.trim(),
+          allow_private_network: allowPrivateNetwork,
         }),
       })
       const data = await res.json()
@@ -384,10 +409,9 @@ export const Settings: React.FC = () => {
   const handleTestExistingModel = async (id: string) => {
     setModelTestStatus((prev) => ({ ...prev, [id]: { testing: true } }))
     try {
-      const res = await fetch('/api/v1/hosted-models/test', {
+      const res = await api('/api/v1/hosted-models/test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id }),
+          body: JSON.stringify({ id }),
       })
       const data = await res.json()
       if (data.ok) {
@@ -413,10 +437,9 @@ export const Settings: React.FC = () => {
     e.preventDefault()
     setLimitSuccess('')
     try {
-      const res = await fetch('/api/v1/host-limits', {
+      const res = await api('/api/v1/host-limits', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(limits),
+          body: JSON.stringify(limits),
       })
       if (res.ok) {
         setLimitSuccess('Host limits updated successfully!')
@@ -426,16 +449,18 @@ export const Settings: React.FC = () => {
     }
   }
 
+  // Downloads run in the background on the server; this polls the job rather
+  // than holding an HTTP request open for a multi-gigabyte transfer.
   const handleDownloadArtifact = async (e: React.FormEvent) => {
     e.preventDefault()
     setDlLoading(true)
     setDlError('')
     setDlSuccess('')
+    setDlProgress(null)
     try {
-      const res = await fetch('/api/v1/managed-models/download', {
+      const res = await api('/api/v1/managed-models/download', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+          body: JSON.stringify({
           source_url: dlUrl.trim(),
           filename: dlFilename.trim(),
           expected_sha256: dlSha.trim(),
@@ -445,6 +470,28 @@ export const Settings: React.FC = () => {
         const msg = await res.text()
         throw new Error(msg || 'Download failed')
       }
+      const { download_id: downloadID } = await res.json()
+
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+        const statusRes = await api(`/api/v1/managed-models/downloads?id=${encodeURIComponent(downloadID)}`)
+        if (!statusRes.ok) {
+          throw new Error('Lost track of the download job')
+        }
+        const jobs = await statusRes.json()
+        const job = Array.isArray(jobs) ? jobs[0] : null
+        if (!job) {
+          throw new Error('Download job disappeared')
+        }
+        setDlProgress(job.bytes_downloaded || 0)
+        if (job.status === 'complete') {
+          break
+        }
+        if (job.status === 'failed' || job.status === 'cancelled') {
+          throw new Error(job.error || `Download ${job.status}`)
+        }
+      }
+
       setDlSuccess('GGUF model artifact downloaded and verified successfully!')
       setDlUrl('')
       setDlFilename('')
@@ -454,23 +501,29 @@ export const Settings: React.FC = () => {
       setDlError(err.message || 'Download error')
     } finally {
       setDlLoading(false)
+      setDlProgress(null)
     }
   }
 
   const handleLoadArtifactIntoRunner = async (filename: string) => {
     try {
-      const res = await fetch('/api/v1/managed-models/load', {
+      const res = await api('/api/v1/managed-models/load', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model_id: filename.replace('.gguf', ''),
+          body: JSON.stringify({
+          model_id: 'managed-' + filename.replace('.gguf', ''),
+          name: filename.replace('.gguf', ''),
           filename: filename,
           context_limit: 4096,
+          max_tokens: 1024,
           threads: 4,
           gpu_layers: hardware?.has_nvidia_gpu ? 33 : 0,
+          published: true,
         }),
       })
       if (res.ok) {
+        // Loading now also creates the hosted-model row, so the catalog
+        // reflects it immediately.
+        await fetchModels()
         await fetchHardwareAndRunner()
       } else {
         alert(await res.text())
@@ -482,8 +535,9 @@ export const Settings: React.FC = () => {
 
   const handleUnloadRunner = async () => {
     try {
-      const res = await fetch('/api/v1/managed-models/unload', { method: 'POST' })
+      const res = await api('/api/v1/managed-models/unload', { method: 'POST', body: '{}' })
       if (res.ok) {
+        await fetchModels()
         await fetchHardwareAndRunner()
       }
     } catch {
@@ -494,7 +548,7 @@ export const Settings: React.FC = () => {
   const handleDeleteArtifact = async (filename: string) => {
     if (!confirm(`Delete ${filename}?`)) return
     try {
-      const res = await fetch(`/api/v1/managed-models/artifacts/${encodeURIComponent(filename)}`, {
+      const res = await api(`/api/v1/managed-models/artifacts/${encodeURIComponent(filename)}`, {
         method: 'DELETE',
       })
       if (res.ok) {
@@ -507,107 +561,124 @@ export const Settings: React.FC = () => {
 
   return (
     <div>
-      {/* Device Access & Multi-Device Login Section */}
+      {/* Device Access Section */}
       <div className="card">
-        <h2>📱 Connect Another Device / Quick Login</h2>
+        <h2>📱 Connect Another Device</h2>
         <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginBottom: '1.25rem' }}>
-          Scan the QR code or use the quick login link to instantly authenticate your phone, tablet, or another browser on this local network without typing long tokens.
+          Pairing uses a one-time setup secret that stops working the moment it
+          is redeemed. The secret is shown here once and is never stored in a
+          link: a credential in a URL ends up in browser history, referrers, and
+          proxy logs.
         </p>
 
-        <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap', alignItems: 'flex-start' }}>
-          {setupQrUrl ? (
-            <div style={{ padding: '0.75rem', background: '#ffffff', borderRadius: '8px', textAlign: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.1)' }}>
-              <img src={setupQrUrl} alt="Quick Login QR Code" style={{ display: 'block', width: '200px', height: '200px', margin: '0 auto' }} />
-              <div style={{ color: '#333333', fontSize: '0.75rem', marginTop: '0.5rem', fontWeight: 500 }}>
-                Point phone camera here to log in
-              </div>
-            </div>
-          ) : (
-            <div style={{ width: '200px', height: '200px', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-primary)', borderRadius: '8px' }}>
-              <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Loading QR...</span>
-            </div>
-          )}
+        <div style={{ marginBottom: '1rem', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+          Current status:{' '}
+          <strong style={{ color: setupRedeemed ? 'var(--text-secondary)' : 'var(--accent-primary)' }}>
+            {setupRedeemed ? 'no unredeemed secret outstanding' : 'a secret is issued and waiting to be used'}
+          </strong>
+        </div>
 
-          <div style={{ flex: '1', minWidth: '260px' }}>
-            <div className="form-group" style={{ marginBottom: '1rem' }}>
-              <label style={{ fontSize: '0.85rem', fontWeight: 600 }}>Quick Login Link</label>
-              <div style={{ display: 'flex', gap: '0.5rem' }}>
-                <input
-                  type="text"
-                  readOnly
-                  className="form-control"
-                  style={{ fontSize: '0.85rem', background: 'var(--bg-primary)' }}
-                  value={`${window.location.origin}/#token=${setupToken}`}
-                />
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  style={{ whiteSpace: 'nowrap', fontSize: '0.85rem' }}
-                  onClick={copyLoginLink}
-                >
-                  {copiedLoginLink ? 'Copied!' : 'Copy Link'}
-                </button>
-              </div>
+        {mintedSecret && (
+          <div className="form-group" style={{ marginBottom: '1.25rem' }}>
+            <label style={{ fontSize: '0.85rem', fontWeight: 600 }}>New one-time secret (shown once)</label>
+            <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.25rem' }}>
+              <input
+                type="text"
+                readOnly
+                className="form-control"
+                style={{ fontSize: '0.85rem', background: 'var(--bg-primary)', fontFamily: 'monospace' }}
+                value={mintedSecret}
+              />
+              <button
+                type="button"
+                className="btn btn-secondary"
+                style={{ whiteSpace: 'nowrap', fontSize: '0.85rem' }}
+                onClick={copySetupToken}
+              >
+                {copiedSetupToken ? 'Copied!' : 'Copy'}
+              </button>
             </div>
-
-            <div className="form-group" style={{ marginBottom: '1.25rem' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <label style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: 0 }}>Active Setup Token / PIN</label>
-                <button
-                  type="button"
-                  style={{ background: 'none', border: 'none', color: 'var(--accent-primary)', cursor: 'pointer', fontSize: '0.75rem' }}
-                  onClick={() => setShowSetupSecret(!showSetupSecret)}
-                >
-                  {showSetupSecret ? 'Hide' : 'Reveal'}
-                </button>
-              </div>
-              <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.25rem' }}>
-                <input
-                  type={showSetupSecret ? 'text' : 'password'}
-                  readOnly
-                  className="form-control"
-                  style={{ fontSize: '0.85rem', background: 'var(--bg-primary)', fontFamily: 'monospace' }}
-                  value={setupToken}
-                />
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  style={{ whiteSpace: 'nowrap', fontSize: '0.85rem' }}
-                  onClick={copySetupToken}
-                >
-                  {copiedSetupToken ? 'Copied!' : 'Copy Token'}
-                </button>
-              </div>
-            </div>
-
-            {/* Custom PIN update */}
-            <form onSubmit={handleUpdatePin} style={{ borderTop: '1px solid var(--border-color)', paddingTop: '1rem' }}>
-              <label style={{ fontSize: '0.85rem', fontWeight: 600 }}>Customize Setup Secret / PIN</label>
-              <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', margin: '0.2rem 0 0.5rem 0' }}>
-                Set a memorable PIN or password (e.g. <code>123456</code> or a passphrase) so you can easily unlock new devices manually without scanning.
-              </p>
-              {pinError && <div className="alert alert-error" style={{ fontSize: '0.85rem', padding: '0.5rem', marginBottom: '0.5rem' }}>{pinError}</div>}
-              {pinSuccess && <div className="alert alert-success" style={{ fontSize: '0.85rem', padding: '0.5rem', marginBottom: '0.5rem' }}>{pinSuccess}</div>}
-              <div style={{ display: 'flex', gap: '0.5rem' }}>
-                <input
-                  type="text"
-                  className="form-control"
-                  placeholder="e.g. 123456 or my-secret-pin"
-                  value={newSetupPin}
-                  onChange={(e) => setNewSetupPin(e.target.value)}
-                  style={{ fontSize: '0.85rem' }}
-                />
-                <button
-                  type="submit"
-                  className="btn btn-primary"
-                  style={{ whiteSpace: 'nowrap', fontSize: '0.85rem' }}
-                  disabled={updatingPin || !newSetupPin.trim()}
-                >
-                  {updatingPin ? 'Saving...' : 'Set New PIN'}
-                </button>
-              </div>
-            </form>
           </div>
+        )}
+
+        <form onSubmit={handleUpdatePin} style={{ borderTop: '1px solid var(--border-color)', paddingTop: '1rem' }}>
+          <label style={{ fontSize: '0.85rem', fontWeight: 600 }}>Issue a new setup secret</label>
+          <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', margin: '0.2rem 0 0.5rem 0' }}>
+            Leave the field blank for a random 128-bit secret, or supply a
+            passphrase of at least 12 characters. Anything shorter is guessable
+            over a LAN, so short PINs are refused.
+          </p>
+          {pinError && <div className="alert alert-error" style={{ fontSize: '0.85rem', padding: '0.5rem', marginBottom: '0.5rem' }}>{pinError}</div>}
+          {pinSuccess && <div className="alert alert-success" style={{ fontSize: '0.85rem', padding: '0.5rem', marginBottom: '0.5rem' }}>{pinSuccess}</div>}
+          <div style={{ display: 'flex', gap: '0.5rem' }}>
+            <input
+              type="text"
+              className="form-control"
+              placeholder="blank for a random secret, or a passphrase of 12+ characters"
+              value={newSetupPin}
+              onChange={(e) => setNewSetupPin(e.target.value)}
+              style={{ fontSize: '0.85rem' }}
+            />
+            <button
+              type="submit"
+              className="btn btn-primary"
+              style={{ whiteSpace: 'nowrap', fontSize: '0.85rem' }}
+              disabled={updatingPin}
+            >
+              {updatingPin ? 'Issuing...' : 'Issue Secret'}
+            </button>
+          </div>
+        </form>
+      </div>
+
+      {/* Local API token for OpenAI-compatible clients */}
+      <div className="card">
+        <h2>🔑 Local API Token</h2>
+        <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginBottom: '1.25rem' }}>
+          OpenAI-compatible clients must send this as a bearer token on{' '}
+          <code>/v1/models</code> and <code>/v1/chat/completions</code>. It is
+          always required: these routes drive inference on other members'
+          hardware, so leaving them open to any page in your browser is not an
+          option.
+        </p>
+
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <input
+            type={showLocalAPIToken ? 'text' : 'password'}
+            readOnly
+            className="form-control"
+            style={{ fontSize: '0.85rem', background: 'var(--bg-primary)', fontFamily: 'monospace' }}
+            value={localAPIToken}
+          />
+          <button
+            type="button"
+            className="btn btn-secondary"
+            style={{ whiteSpace: 'nowrap', fontSize: '0.85rem' }}
+            onClick={() => setShowLocalAPIToken(!showLocalAPIToken)}
+          >
+            {showLocalAPIToken ? 'Hide' : 'Reveal'}
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            style={{ whiteSpace: 'nowrap', fontSize: '0.85rem' }}
+            onClick={() => {
+              navigator.clipboard.writeText(localAPIToken)
+              setCopiedLocalAPIToken(true)
+              setTimeout(() => setCopiedLocalAPIToken(false), 2000)
+            }}
+          >
+            {copiedLocalAPIToken ? 'Copied!' : 'Copy'}
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            style={{ whiteSpace: 'nowrap', fontSize: '0.85rem' }}
+            onClick={regenerateLocalAPIToken}
+            disabled={regeneratingToken}
+          >
+            {regeneratingToken ? 'Rotating...' : 'Regenerate'}
+          </button>
         </div>
       </div>
 
@@ -754,7 +825,11 @@ export const Settings: React.FC = () => {
               </div>
 
               <button type="submit" className="btn btn-primary" style={{ marginTop: '0.75rem' }} disabled={dlLoading}>
-                {dlLoading ? 'Downloading Artifact...' : 'Download & Verify GGUF'}
+                {dlLoading
+                  ? dlProgress !== null
+                    ? `Downloading... ${(dlProgress / (1024 * 1024)).toFixed(1)} MiB`
+                    : 'Starting download...'
+                  : 'Download & Verify GGUF'}
               </button>
             </form>
           </div>
@@ -918,7 +993,10 @@ export const Settings: React.FC = () => {
                           fontSize: '0.85rem',
                           padding: '0.3rem 0.6rem',
                         }}
-                        onClick={() => setName(mName)}
+                        onClick={() => {
+                          setName(mName)
+                          setBackendModel(mName)
+                        }}
                       >
                         {mName}
                       </button>
@@ -979,6 +1057,22 @@ export const Settings: React.FC = () => {
                 </div>
               </div>
 
+              <div className="form-group">
+                <label>Backend Model Identifier (Optional)</label>
+                <input
+                  type="text"
+                  className="form-control"
+                  placeholder="defaults to the display name, e.g. llama3:latest"
+                  value={backendModel}
+                  onChange={(e) => setBackendModel(e.target.value)}
+                />
+                <small style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>
+                  What the backend server expects in the OpenAI <code>model</code> field.
+                  Set this if you want a friendlier display name than the identifier
+                  the server knows.
+                </small>
+              </div>
+
               <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 <input
                   type="checkbox"
@@ -988,6 +1082,25 @@ export const Settings: React.FC = () => {
                 />
                 <label htmlFor="pubCheck" style={{ marginBottom: 0, cursor: 'pointer' }}>
                   Publish model advertisement to room members
+                </label>
+              </div>
+
+              <div className="form-group" style={{ display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
+                <input
+                  type="checkbox"
+                  id="privateNetCheck"
+                  checked={allowPrivateNetwork}
+                  onChange={(e) => setAllowPrivateNetwork(e.target.checked)}
+                  style={{ marginTop: '0.25rem' }}
+                />
+                <label htmlFor="privateNetCheck" style={{ marginBottom: 0, cursor: 'pointer' }}>
+                  Allow this endpoint to reach your private network
+                  <small style={{ display: 'block', color: 'var(--text-secondary)', fontSize: '0.8rem', fontWeight: 400 }}>
+                    Needed for a model server on another machine on your LAN, or on a
+                    non-standard port. Off by default: without it Woolwire refuses
+                    private, link-local, and cloud metadata addresses no matter what
+                    the hostname resolves to.
+                  </small>
                 </label>
               </div>
 

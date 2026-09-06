@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
+import { api } from '../api.ts'
 
 interface Channel {
   id: string
@@ -45,7 +46,7 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
 
   const fetchChannels = async () => {
     try {
-      const res = await fetch('/api/v1/community/channels')
+      const res = await api('/api/v1/community/channels')
       if (res.ok) {
         const data: Channel[] = await res.json()
         setChannels(data || [])
@@ -60,7 +61,7 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
 
   const fetchMessages = async (channelId: string) => {
     try {
-      const res = await fetch(`/api/v1/community/channels/${channelId}/messages`)
+      const res = await api(`/api/v1/community/channels/${channelId}/messages`)
       if (res.ok) {
         const data = await res.json()
         setMessages(data || [])
@@ -94,10 +95,9 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
     e.preventDefault()
     if (!newChanName.trim()) return
     try {
-      const res = await fetch('/api/v1/community/channels', {
+      const res = await api('/api/v1/community/channels', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+          body: JSON.stringify({
           name: newChanName.trim(),
           description: newChanDesc.trim(),
         }),
@@ -123,10 +123,9 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
     setInputContent('')
 
     try {
-      const res = await fetch(`/api/v1/community/channels/${activeChannelId}/messages`, {
+      const res = await api(`/api/v1/community/channels/${activeChannelId}/messages`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content }),
+          body: JSON.stringify({ content }),
       })
       if (res.ok) {
         await fetchMessages(activeChannelId)
@@ -139,10 +138,9 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
   const handleSaveEdit = async (msgId: string) => {
     if (!editContent.trim() || !activeChannelId) return
     try {
-      const res = await fetch(`/api/v1/community/messages/${msgId}`, {
+      const res = await api(`/api/v1/community/messages/${msgId}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+          body: JSON.stringify({
           content: editContent.trim(),
           channel_id: activeChannelId,
         }),
@@ -160,10 +158,9 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
   const handleDeleteMessage = async (msgId: string) => {
     if (!confirm('Delete this message?')) return
     try {
-      const res = await fetch(`/api/v1/community/messages/${msgId}`, {
+      const res = await api(`/api/v1/community/messages/${msgId}`, {
         method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channel_id: activeChannelId }),
+          body: JSON.stringify({ channel_id: activeChannelId }),
       })
       if (res.ok) {
         await fetchMessages(activeChannelId!)
@@ -177,10 +174,9 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
     const reason = prompt('Enter moderation reason to tombstone this message:', 'Inappropriate content')
     if (!reason) return
     try {
-      const res = await fetch(`/api/v1/community/messages/${msgId}/moderate`, {
+      const res = await api(`/api/v1/community/messages/${msgId}/moderate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+          body: JSON.stringify({
           channel_id: activeChannelId,
           reason: reason.trim(),
         }),
@@ -195,7 +191,7 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
 
   const handleManualSync = async () => {
     try {
-      await fetch('/api/v1/community/sync', { method: 'POST' })
+      await api('/api/v1/community/sync', { method: 'POST' })
       if (activeChannelId) {
         await fetchMessages(activeChannelId)
       }

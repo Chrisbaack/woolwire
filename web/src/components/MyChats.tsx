@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
+import { api } from '../api.ts'
 
 interface ModelAd {
   room_id: string
@@ -60,7 +61,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
 
   const fetchConversations = async () => {
     try {
-      const res = await fetch('/api/v1/chats')
+      const res = await api('/api/v1/chats')
       if (res.ok) {
         const data = await res.json()
         setConversations(data || [])
@@ -75,7 +76,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
 
   const fetchCatalog = async () => {
     try {
-      const res = await fetch('/api/v1/catalog')
+      const res = await api('/api/v1/catalog')
       if (res.ok) {
         const data: ModelAd[] = await res.json()
         setModels(data || [])
@@ -102,7 +103,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
         }
       }
       try {
-        const resLocal = await fetch('/api/v1/hosted-models')
+        const resLocal = await api('/api/v1/hosted-models')
         if (resLocal.ok) {
           const localModels = await resLocal.json()
           if (Array.isArray(localModels)) {
@@ -130,7 +131,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
 
   const fetchChatMessages = async (id: string) => {
     try {
-      const res = await fetch(`/api/v1/chats/${id}`)
+      const res = await api(`/api/v1/chats/${id}`)
       if (res.ok) {
         const data = await res.json()
         setMessages(data.messages || [])
@@ -160,10 +161,9 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
   const handleCreateChat = async (e: React.FormEvent) => {
     e.preventDefault()
     try {
-      const res = await fetch('/api/v1/chats', {
+      const res = await api('/api/v1/chats', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+          body: JSON.stringify({
           title: newTitle.trim() || 'New Chat',
           no_save: newNoSave,
         }),
@@ -184,7 +184,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
   const handleDeleteChat = async (id: string) => {
     if (!confirm('Delete this conversation?')) return
     try {
-      const res = await fetch(`/api/v1/chats/${id}`, { method: 'DELETE' })
+      const res = await api(`/api/v1/chats/${id}`, { method: 'DELETE' })
       if (res.ok) {
         const updated = conversations.filter((c) => c.ID !== id)
         setConversations(updated)
@@ -230,10 +230,9 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
     setMessages((prev) => [...prev, tempUserMsg])
 
     try {
-      const res = await fetch(`/api/v1/chats/${activeConvId}/message`, {
+      const res = await api(`/api/v1/chats/${activeConvId}/message`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+          body: JSON.stringify({
           content: currentContent,
           host_member_id: hostId,
           model_id: modelId,
@@ -311,10 +310,9 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
   const handleCancel = async () => {
     if (!activeConvId || !streamingRequestId || !streamingHostId) return
     try {
-      await fetch(`/api/v1/chats/${activeConvId}/cancel`, {
+      await api(`/api/v1/chats/${activeConvId}/cancel`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+          body: JSON.stringify({
           request_id: streamingRequestId,
           host_member_id: streamingHostId,
         }),

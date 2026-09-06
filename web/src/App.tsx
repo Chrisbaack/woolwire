@@ -1,12 +1,11 @@
-import React, { useState, useEffect, useRef } from 'react'
-import QRCode from 'qrcode'
-import jsQR from 'jsqr'
+import React, { useState, useEffect } from 'react'
 import { Welcome } from './components/Welcome.tsx'
 import { Dashboard } from './components/Dashboard.tsx'
 import { MyChats } from './components/MyChats.tsx'
 import { Community } from './components/Community.tsx'
 import { Settings } from './components/Settings.tsx'
 import { RoomAdmin } from './components/RoomAdmin.tsx'
+import { api, apiJSON } from './api.ts'
 
 interface AppState {
   configured: boolean
@@ -75,25 +74,16 @@ export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard')
   const [selectedChatModel, setSelectedChatModel] = useState<any>(null)
 
-  // Connect Device Modal (when authenticated)
+  // Connect Device modal (when authenticated). It mints a fresh one-time
+  // secret rather than revealing the one already in use.
   const [showConnectModal, setShowConnectModal] = useState(false)
   const [modalToken, setModalToken] = useState('')
-  const [modalQrUrl, setModalQrUrl] = useState('')
-  const [modalCopiedLink, setModalCopiedLink] = useState(false)
+  const [modalError, setModalError] = useState('')
   const [modalCopiedToken, setModalCopiedToken] = useState(false)
-
-  // Scanner state for the Setup login card (when unauthenticated)
-  const [loginScanning, setLoginScanning] = useState(false)
-  const [loginScanError, setLoginScanError] = useState('')
-  const loginVideoRef = useRef<HTMLVideoElement | null>(null)
-  const loginCanvasRef = useRef<HTMLCanvasElement | null>(null)
-  const loginAnimFrameRef = useRef<number | null>(null)
-  const loginStreamRef = useRef<MediaStream | null>(null)
-  const loginCameraInputRef = useRef<HTMLInputElement | null>(null)
 
   const fetchState = async () => {
     try {
-      const res = await fetch('/api/v1/state')
+      const res = await api('/api/v1/state')
       if (res.status === 401) {
         setAuthRequired(true)
         setLoading(false)
@@ -115,10 +105,9 @@ export const App: React.FC = () => {
     try {
       setAuthError('')
       setLoading(true)
-      const res = await fetch('/api/v1/setup', {
+      const res = await api('/api/v1/setup', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: token.trim() }),
+          body: JSON.stringify({ token: token.trim() }),
       })
       if (!res.ok) {
         throw new Error('Invalid setup token or expired link')
@@ -134,15 +123,7 @@ export const App: React.FC = () => {
   }
 
   useEffect(() => {
-    const hash = window.location.hash
-    const match = hash.match(/token=([a-zA-Z0-9_-]+)/)
-    if (match && match[1]) {
-      const token = match[1]
-      window.history.replaceState(null, '', window.location.pathname + window.location.search)
-      loginWithToken(token)
-    } else {
-      fetchState()
-    }
+    fetchState()
   }, [])
 
   const handleSetup = async (e: React.FormEvent) => {
@@ -151,157 +132,27 @@ export const App: React.FC = () => {
     await loginWithToken(setupToken.trim())
   }
 
-  const stopLoginScanner = () => {
-    if (loginAnimFrameRef.current) {
-      cancelAnimationFrame(loginAnimFrameRef.current)
-      loginAnimFrameRef.current = null
-    }
-    if (loginStreamRef.current) {
-      loginStreamRef.current.getTracks().forEach((track) => track.stop())
-      loginStreamRef.current = null
-    }
-    setLoginScanning(false)
-  }
-
-  const processDecodedToken = (rawText: string) => {
-    let token = rawText.trim()
-    const match = token.match(/token=([a-zA-Z0-9_-]+)/)
-    if (match && match[1]) {
-      token = match[1]
-    }
-    stopLoginScanner()
-    setSetupToken(token)
-    loginWithToken(token)
-  }
-
-  const tickLoginScan = () => {
-    if (loginVideoRef.current && loginVideoRef.current.readyState === loginVideoRef.current.HAVE_ENOUGH_DATA) {
-      const canvas = loginCanvasRef.current || document.createElement('canvas')
-      canvas.width = loginVideoRef.current.videoWidth
-      canvas.height = loginVideoRef.current.videoHeight
-      const ctx = canvas.getContext('2d')
-      if (ctx) {
-        ctx.drawImage(loginVideoRef.current, 0, 0, canvas.width, canvas.height)
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
-        const code = jsQR(imageData.data, imageData.width, imageData.height, {
-          inversionAttempts: 'attemptBoth',
-        })
-        if (code && code.data) {
-          processDecodedToken(code.data)
-          return
-        }
-      }
-    }
-    loginAnimFrameRef.current = requestAnimationFrame(tickLoginScan)
-  }
-
-  const startLoginScanner = async () => {
-    setLoginScanError('')
-    setLoginScanning(true)
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' },
-      })
-      loginStreamRef.current = stream
-      if (loginVideoRef.current) {
-        loginVideoRef.current.srcObject = stream
-        loginVideoRef.current.setAttribute('playsinline', 'true')
-        await loginVideoRef.current.play()
-        loginAnimFrameRef.current = requestAnimationFrame(tickLoginScan)
-      }
-    } catch (err: any) {
-      setLoginScanError(err.message || 'Camera permission denied or camera not accessible')
-    }
-  }
-
-  const handleLoginScanClick = () => {
-    if (loginScanning) {
-      stopLoginScanner()
-      return
-    }
-    setLoginScanError('')
-    if (typeof navigator !== 'undefined' && navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function') {
-      startLoginScanner()
-    } else {
-      loginCameraInputRef.current?.click()
-    }
-  }
-
-  const handleLoginImageCapture = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setLoginScanError('')
-    const reader = new FileReader()
-    reader.onload = (event) => {
-      const img = new Image()
-      img.onload = () => {
-        let width = img.width
-        let height = img.height
-        const maxDim = 1200
-        if (width > maxDim || height > maxDim) {
-          if (width > height) {
-            height = Math.round((height * maxDim) / width)
-            width = maxDim
-          } else {
-            width = Math.round((width * maxDim) / height)
-            height = maxDim
-          }
-        }
-        const canvas = document.createElement('canvas')
-        canvas.width = width
-        canvas.height = height
-        const ctx = canvas.getContext('2d')
-        if (!ctx) {
-          setLoginScanError('Could not process captured image.')
-          return
-        }
-        ctx.drawImage(img, 0, 0, width, height)
-        const imageData = ctx.getImageData(0, 0, width, height)
-        const code = jsQR(imageData.data, imageData.width, imageData.height, {
-          inversionAttempts: 'attemptBoth',
-        })
-        if (code && code.data) {
-          processDecodedToken(code.data)
-        } else {
-          setLoginScanError('Could not detect a QR code in the image. Please try taking a closer photo or enter the secret.')
-        }
-      }
-      img.onerror = () => {
-        setLoginScanError('Failed to read image file')
-      }
-      img.src = event.target?.result as string
-    }
-    reader.readAsDataURL(file)
-    e.target.value = ''
-  }
-
+  // openConnectModal mints a fresh one-time setup secret for pairing another
+  // device. The secret already in use is never revealed: it is single-use, so
+  // showing it again would only create another copy to leak.
   const openConnectModal = async () => {
     setShowConnectModal(true)
+    setModalToken('')
+    setModalError('')
     try {
-      const res = await fetch('/api/v1/setup/info')
-      if (res.ok) {
-        const data = await res.json()
-        if (data.token) {
-          setModalToken(data.token)
-          const loginUrl = `${window.location.origin}/#token=${data.token}`
-          QRCode.toDataURL(loginUrl, {
-            width: 240,
-            margin: 2,
-            color: { dark: '#000000', light: '#ffffff' },
-          })
-            .then(setModalQrUrl)
-            .catch(() => setModalQrUrl(''))
-        }
-      }
-    } catch {
-      // ignore
+      const data = await apiJSON<{ token: string }>('/api/v1/setup/token', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      })
+      setModalToken(data.token)
+    } catch (err: any) {
+      setModalError(err.message || 'Failed to mint a setup secret')
     }
   }
 
   const handleUpdateProfile = async (displayName: string) => {
-    const res = await fetch('/api/v1/profile', {
+    const res = await api('/api/v1/profile', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ display_name: displayName }),
     })
     if (!res.ok) {
@@ -312,9 +163,8 @@ export const App: React.FC = () => {
   }
 
   const handleHostRoom = async (roomName: string): Promise<string> => {
-    const res = await fetch('/api/v1/room/host', {
+    const res = await api('/api/v1/room/host', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ room_name: roomName }),
     })
     if (!res.ok) {
@@ -328,9 +178,8 @@ export const App: React.FC = () => {
   }
 
   const handleJoinRoom = async (code: string) => {
-    const res = await fetch('/api/v1/room/join', {
+    const res = await api('/api/v1/room/join', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ invitation_code: code }),
     })
     if (!res.ok) {
@@ -342,7 +191,7 @@ export const App: React.FC = () => {
   }
 
   const handleLeaveRoom = async () => {
-    const res = await fetch('/api/v1/room/leave', { method: 'POST' })
+    const res = await api('/api/v1/room/leave', { method: 'POST' })
     if (res.ok) {
       await fetchState()
       setActiveTab('dashboard')
@@ -350,7 +199,7 @@ export const App: React.FC = () => {
   }
 
   const handleRotateInvitation = async (): Promise<string> => {
-    const res = await fetch('/api/v1/room-admin/invitation/rotate', { method: 'POST' })
+    const res = await api('/api/v1/room-admin/invitation/rotate', { method: 'POST' })
     if (!res.ok) {
       throw new Error('Failed to rotate invitation')
     }
@@ -360,9 +209,8 @@ export const App: React.FC = () => {
   }
 
   const handleRemoveMember = async (id: string, rotate: boolean) => {
-    const res = await fetch(`/api/v1/room-admin/members/${id}/remove`, {
+    const res = await api(`/api/v1/room-admin/members/${id}/remove`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ rotate_invitation: rotate }),
     })
     if (!res.ok) {
@@ -384,72 +232,13 @@ export const App: React.FC = () => {
     return (
       <div className="app-container">
         <div className="card" style={{ maxWidth: '480px', margin: '4rem auto' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem', flexWrap: 'wrap', gap: '0.5rem' }}>
-            <h2 style={{ margin: 0 }}>Owner Setup Authentication</h2>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              style={{ padding: '0.25rem 0.6rem', fontSize: '0.8rem' }}
-              onClick={handleLoginScanClick}
-            >
-              {loginScanning ? 'Stop Camera' : '📷 Scan Login QR'}
-            </button>
-            <input
-              ref={loginCameraInputRef}
-              type="file"
-              accept="image/*"
-              capture="environment"
-              style={{ display: 'none' }}
-              onChange={handleLoginImageCapture}
-            />
-          </div>
+          <h2 style={{ margin: '0 0 0.5rem 0' }}>Owner Setup Authentication</h2>
 
           <p style={{ color: 'var(--text-secondary)', marginBottom: '1rem', fontSize: '0.9rem' }}>
-            Enter your setup secret / PIN, or scan the Login QR code from another device already authenticated.
+            Enter the one-time setup secret printed on this node's first start.
+            It stops working once redeemed; mint a new one from Settings on a
+            device that is already signed in.
           </p>
-
-          {loginScanError && !loginScanning && (
-            <div className="alert alert-error" style={{ marginBottom: '0.75rem', fontSize: '0.85rem' }}>
-              {loginScanError}
-            </div>
-          )}
-
-          {loginScanning && (
-            <div style={{ marginBottom: '1rem', padding: '0.75rem', backgroundColor: 'var(--bg-primary)', borderRadius: 'var(--radius)', border: '1px solid var(--accent-primary)', textAlign: 'center' }}>
-              <div style={{ position: 'relative', width: '100%', maxWidth: '280px', margin: '0 auto', overflow: 'hidden', borderRadius: '8px', background: '#000' }}>
-                <video
-                  ref={loginVideoRef}
-                  style={{ width: '100%', height: 'auto', display: 'block' }}
-                  playsInline
-                  muted
-                />
-                <div style={{ position: 'absolute', top: '15%', left: '15%', right: '15%', bottom: '15%', border: '2px dashed var(--accent-primary)', pointerEvents: 'none', borderRadius: '8px' }} />
-              </div>
-              <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '0.5rem' }}>
-                Point camera at the Login QR code on your computer
-              </p>
-              <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'center', marginTop: '0.5rem', flexWrap: 'wrap' }}>
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  style={{ padding: '0.2rem 0.6rem', fontSize: '0.8rem' }}
-                  onClick={() => loginCameraInputRef.current?.click()}
-                >
-                  📸 Take Photo / Pick Image
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  style={{ padding: '0.2rem 0.6rem', fontSize: '0.8rem' }}
-                  onClick={stopLoginScanner}
-                >
-                  Close
-                </button>
-              </div>
-              {loginScanError && <div className="alert alert-error" style={{ marginTop: '0.5rem', fontSize: '0.85rem' }}>{loginScanError}</div>}
-              <canvas ref={loginCanvasRef} style={{ display: 'none' }} />
-            </div>
-          )}
 
           {authError && <div className="alert alert-error">{authError}</div>}
           <form onSubmit={handleSetup}>
@@ -588,8 +377,10 @@ export const App: React.FC = () => {
               {activeTab === 'admin' && state.room.role === 'creator' && (
                 <RoomAdmin
                   invitationCode={state.room.invitation_code}
+                  approvalMode={state.room.approval_mode}
                   onRotateInvitation={handleRotateInvitation}
                   onRemoveMember={handleRemoveMember}
+                  onApprovalModeChanged={fetchState}
                 />
               )}
             </ErrorBoundary>
@@ -625,20 +416,35 @@ export const App: React.FC = () => {
             </div>
 
             <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1rem' }}>
-              Scan this QR code with your phone or tablet camera to instantly log in without typing.
+              This is a fresh one-time setup secret. Type or paste it into the
+              other device's setup screen; it stops working the moment it is
+              used. It is shown once, so copy it before closing this dialog.
             </p>
 
-            {modalQrUrl ? (
-              <div style={{ padding: '1rem', background: '#ffffff', borderRadius: '8px', textAlign: 'center', marginBottom: '1rem' }}>
-                <img src={modalQrUrl} alt="Login QR Code" style={{ display: 'block', maxWidth: '200px', margin: '0 auto' }} />
-                <div style={{ color: '#333333', fontSize: '0.75rem', marginTop: '0.5rem', fontWeight: 500 }}>
-                  Open phone camera and point at this code
-                </div>
+            {modalError && <div className="alert alert-error" style={{ marginBottom: '1rem' }}>{modalError}</div>}
+
+            {modalToken ? (
+              <div
+                style={{
+                  padding: '0.85rem',
+                  background: 'var(--bg-primary)',
+                  borderRadius: 'var(--radius)',
+                  border: '1px solid var(--border-color)',
+                  marginBottom: '1rem',
+                  fontFamily: 'monospace',
+                  fontSize: '0.95rem',
+                  wordBreak: 'break-all',
+                  textAlign: 'center',
+                }}
+              >
+                {modalToken}
               </div>
             ) : (
-              <div style={{ width: '200px', height: '200px', margin: '0 auto 1rem auto', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-primary)', borderRadius: '8px' }}>
-                <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Loading QR...</span>
-              </div>
+              !modalError && (
+                <div style={{ marginBottom: '1rem', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                  Minting a one-time secret...
+                </div>
+              )
             )}
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginBottom: '1rem' }}>
@@ -646,31 +452,19 @@ export const App: React.FC = () => {
                 type="button"
                 className="btn btn-primary"
                 style={{ fontSize: '0.85rem' }}
-                onClick={() => {
-                  const url = `${window.location.origin}/#token=${modalToken}`
-                  navigator.clipboard.writeText(url)
-                  setModalCopiedLink(true)
-                  setTimeout(() => setModalCopiedLink(false), 2000)
-                }}
-              >
-                {modalCopiedLink ? 'Copied Link!' : '📋 Copy Quick Login Link'}
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary"
-                style={{ fontSize: '0.85rem' }}
+                disabled={!modalToken}
                 onClick={() => {
                   navigator.clipboard.writeText(modalToken)
                   setModalCopiedToken(true)
                   setTimeout(() => setModalCopiedToken(false), 2000)
                 }}
               >
-                {modalCopiedToken ? 'Copied Token!' : '🔑 Copy Setup Secret'}
+                {modalCopiedToken ? 'Copied!' : '🔑 Copy Setup Secret'}
               </button>
             </div>
 
             <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '0.75rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Want a memorable PIN?</span>
+              <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Prefer your own phrase?</span>
               <button
                 type="button"
                 className="btn btn-secondary"
