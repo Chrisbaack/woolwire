@@ -9,11 +9,11 @@ Status: in progress, September 5, 2026. This document records evidence for the f
 - The probe uses Tailcat's userspace networking path, a fixed TCP application port, and TLS 1.3 above the encrypted transport.
 - The public Tailcat DERP map and relays are development dependencies for this feasibility run, not a Woolwire availability or anonymity promise.
 
-The Tailcat API is explicitly unstable. The probe keeps its use behind `internal/m0` and records the exact module version so a future dependency update must rerun this gate. See the [Tailcat README](https://github.com/tailscale/tailcat/blob/v0.6.0/README.md) and [v0.6.0 module file](https://github.com/tailscale/tailcat/blob/v0.6.0/go.mod).
+The Tailcat API is explicitly unstable. The probe keeps its use behind `hack/m0` and records the exact module version so a future dependency update must rerun this gate. See the [Tailcat README](https://github.com/tailscale/tailcat/blob/v0.6.0/README.md) and [v0.6.0 module file](https://github.com/tailscale/tailcat/blob/v0.6.0/go.mod).
 
 ## Implemented probe
 
-`cmd/m0probe` starts a room endpoint or connects a client. It exercises:
+`hack/m0probe` starts a room endpoint or connects a client. It exercises:
 
 - persisted Tailcat node key, WireGuard pre-shared key, resolved address, and device identity;
 - a bounded URL-safe invitation containing the room ID, room-authority public key, bootstrap address, invitation ID, and 256-bit admission secret;
@@ -24,7 +24,7 @@ The Tailcat API is explicitly unstable. The probe keeps its use behind `internal
 
 The admitted-device list is a disposable M0 mechanism. It does not implement M1's signed membership credentials, roster propagation, or removal. Invitation rotation is exercised through the registry API in tests; the probe does not expose a rotation command.
 
-The container profile in `deploy/m0/compose.yaml` uses three separate application egress networks, no host networking, no TUN device, no Docker socket, no added capabilities, and a read-only root filesystem. It shares only the invitation file with the member containers.
+The container profile in `hack/m0-compose/compose.yaml` uses three separate application egress networks, no host networking, no TUN device, no Docker socket, no added capabilities, and a read-only root filesystem. It shares only the invitation file with the member containers.
 
 The runtime image installs CA certificates for Tailcat's HTTPS bootstrap and seeds `/state` and `/shared` with UID/GID `65532:65532` and mode `0700`, allowing the runtime user to write fresh named volumes.
 
@@ -42,7 +42,7 @@ On this development host, with the pinned Go 1.27.1 toolchain and network access
 
 The review-fix regression suite passes with `go test -race -count=1 -timeout=30s ./...`; `go vet ./...` also passes. It exercises TLS admission and reconnect after invitation rotation and room-state reload, rejection of new devices using an old invitation, storage failure without admission, concurrent admission persistence, stalled frame read/write interruption, cancellation callback cleanup, authority-signed peer credentials, two admitted members exchanging data with the creator offline/stopped, rejection of substituted peers via room-authority certificate pinning, rejection of unauthorized peers, and address regeneration across relay-region changes.
 
-During container validation, rootless Podman built the actual `deploy/m0/Dockerfile`. A container running as UID 65532 with a read-only root filesystem, all capabilities dropped, and `no-new-privileges` wrote to fresh named state/invitation volumes and had a populated CA bundle. A room bootstrapped and published an invitation under that profile; a client completed three authenticated streams, then repeated them successfully after the room container restarted.
+During container validation, rootless Podman built the actual `hack/m0-compose/Dockerfile`. A container running as UID 65532 with a read-only root filesystem, all capabilities dropped, and `no-new-privileges` wrote to fresh named state/invitation volumes and had a populated CA bundle. A room bootstrapped and published an invitation under that profile; a client completed three authenticated streams, then repeated them successfully after the room container restarted.
 
 ## Completed M0 checks
 
@@ -63,8 +63,8 @@ From the repository root, with Go 1.27.1 and network access:
 go test -v ./...
 go test -race ./...
 go vet ./...
-go run ./cmd/m0probe room --state ./state/room.json --room-id local-m0 --invitation ./state/invitation.code
-go run ./cmd/m0probe client --invitation ./state/invitation.code --state ./state/client.json --count 3
+go run ./hack/m0probe room --state ./state/room.json --room-id local-m0 --invitation ./state/invitation.code
+go run ./hack/m0probe client --invitation ./state/invitation.code --state ./state/client.json --count 3
 ```
 
 The invitation file is a bearer capability. Keep it out of logs, shell history, URLs, and telemetry; delete the temporary state after a feasibility run.

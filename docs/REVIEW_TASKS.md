@@ -2,11 +2,98 @@
 
 Source: code review of the initial commit (`3645338`) against `docs/ARCHITECTURE.md` and `docs/IMPLEMENTATION_PLAN.md`, September 5, 2026.
 
+**Status: all 29 tasks are addressed.** Each fix carries a regression test that
+would have caught the original defect. `go vet ./...` and `go test -race ./...`
+are green.
+
+Two things remain outside what the tasks asked for, and are recorded in the
+README's status section rather than here:
+
+- The multi-process gate over real Tailcat
+  ([test/integration](../test/integration), build tag `integration`) has not
+  been run against a live relay. A single node *has* been brought up under
+  Podman with the managed profile's network shape: the UI answered on the
+  published loopback port, the node reached a DERP relay and printed a real
+  Tailcat address, that address was unchanged across a restart, the one-time
+  setup secret was refused on replay, and a cross-origin POST was refused.
+- The runner is covered against a fake engine, not a real `llama-server`.
+
+Where the fix diverged from the task's suggested approach, the divergence is
+noted under that task below.
+
+---
+
+## What each task became
+
+| # | Task | Where it landed |
+|---|------|-----------------|
+| 1 | Peer mutual TLS and cert-derived identity | `internal/peerauth`, `internal/peerapi/server.go` |
+| 2 | Bootstrap key possession, creator-only admission | `peerapi.handleJoin`, `localapi.handleJoinRoom` |
+| 3 | Membership sync so removals propagate | `internal/localapi/background.go` |
+| 4 | No address updates from unauthenticated bodies | `peerapi.handleSync` |
+| 5 | Cancellation scoped to the request owner | `inference.FairQueue.Cancel` |
+| 6 | One-time, rate-limited setup secret | `internal/localapi/server.go`, `cmd/woolwire/main.go`, `web/src` |
+| 7 | CSRF protection | `localapi.securityMiddleware`, `web/src/api.ts` |
+| 8 | Token on the OpenAI-compatible routes | `internal/localapi/openai.go` |
+| 9 | Stop leaking the transport private key | `internal/localapi/metrics.go` |
+| 10 | Persist the Tailcat preshared key and region | `cmd/woolwire/main.go`, migration 005 |
+| 11 | Remove the write timeout from streaming | `internal/sse`, both servers |
+| 12 | Send the backend model name | `inference.BackendModelName`, `hosting.ChatRequest` |
+| 13 | Wire managed models end to end | `internal/runner/controller.go`, `localapi/managed.go` |
+| 14 | Fix the managed Compose profile | `deploy/managed/compose.yaml` |
+| 15 | Replicate community channels | `community.EventChannel`, `localapi.materializeChannels` |
+| 16 | Per-author cursors instead of full ID lists | `store/queries.go`, `peerapi/replication.go` |
+| 17 | Retention and storage caps | `localapi.EnforceRetention`, `peerapi.AcceptInboundEvent` |
+| 18 | Keep conversation context in no-save mode | `internal/localapi/chats.go` |
+| 19 | Enforce limits and queue local requests | `internal/inference/service.go` |
+| 20 | Fair queue slot leak and double-decrement | `internal/inference/queue.go` |
+| 21 | SSRF policy | `internal/hosting/destination.go` |
+| 22 | Backup location, secrecy, permissions | `internal/localapi/metrics.go`, `store.Open`, `hack/backup-decrypt` |
+| 23 | Artifact manager lock and background jobs | `internal/hosting/artifacts.go` |
+| 24 | Canonicalize signed payloads | `identity.SigningPayload`, all four `Payload()` |
+| 25 | Quarantine author-sequence conflicts | `community.Materialize`, migration 005 |
+| 26 | Double-escaped community text | `internal/community/sanitize.go` |
+| 27 | Room-state edge cases | `internal/localapi/server.go` |
+| 28 | Restart-safety of `startPeer` and shutdown | `cmd/woolwire/main.go` |
+| 29 | Docs and README drift | `README.md`, `docs/`, `hack/` |
+
+### Divergences worth knowing about
+
+- **Task 1** reused M0's *approach* (a certificate pinned to the room
+  authority, mutual TLS 1.3, substituted-peer rejection) rather than the M0
+  package itself. The peer API needs roster-based verification of ordinary
+  HTTP requests; M0 speaks a fixed-port framed protocol over one connection.
+  M0 is now under [hack/](../hack/) as the feasibility evidence it is.
+- **Task 1's verify** asks for "a TLS handshake failure" on every peer route.
+  Under TLS 1.3 the client finishes its own handshake before the server has
+  validated the client certificate, so the refusal surfaces on the first
+  request. The test asserts the stronger property: no peer route ever returns
+  a usable response to an unadmitted node.
+- **Task 2** decided that re-admission of a removed key is **not** automatic.
+  The creator must remove the roster row deliberately before that device can
+  rejoin, so an unrotated code cannot let a removed member back in.
+- **Task 4** implements the TLS-bound version. Signed address announcements
+  would add nothing on top: the address already applies only to the member the
+  handshake proved.
+- **Task 21's** port allowlist applies off-machine only. Loopback is exempt
+  because local inference servers bind on arbitrary ports, and the allowlist
+  exists to bound what a mistyped URL can reach on the network.
+- **Task 6** removed the QR/URL-fragment login rather than replacing it. The
+  hazard is the credential in the URL; a QR that encodes only a secret still
+  has to be typed, so it earned nothing.
+- The in-memory transport was switched from `net.Pipe` to loopback sockets.
+  `net.Pipe` is unbuffered, so a TLS peer writing its post-handshake records
+  while the other side wrote a request deadlocked both.
+
+---
+
+## Original task list
+
 Context for whoever picks this up:
 
 - Go monorepo. Local owner API in `internal/localapi`, peer API in `internal/peerapi`, Tailcat wrapper in `internal/transport`, SQLite in `internal/store`, React SPA in `web/src`.
 - `go vet ./...` and `go test -race ./...` are green today. The tests use `httptest` recorders and the in-memory transport, so they do not cover most of the items below. Every task should add or extend a test that would have caught it.
-- The disposable `internal/m0` package contains a working mutual-TLS-over-Tailcat implementation with room-authority pinning. It was never promoted into the v1 seam. Reuse it rather than rewriting.
+- The disposable `hack/m0` package (was `internal/m0`) contains a working mutual-TLS-over-Tailcat implementation with room-authority pinning. It was never promoted into the v1 seam. Reuse it rather than rewriting.
 - Do not change the documented trust model. Where the code contradicts a doc claim, fix the code. Where a doc claims a feature the code lacks, either implement it or edit the doc status line so it stops claiming acceptance.
 
 Priority legend: P0 = security or data-exposure, fix before any pilot. P1 = core flow broken. P2 = correctness, robustness, or doc drift.
@@ -21,7 +108,7 @@ Work the P0 items in order. Tasks 1 and 2 unblock most of the others.
 
 - **Problem:** `internal/peerapi/server.go` serves plain HTTP over the Tailcat stream. Every handler trusts a caller-supplied `member_id` in the JSON body: inference at `internal/peerapi/server.go:337`, community sync at `:465`, contributions sync at `:611`, cancel at `:425`. Anyone who can reach a node's Tailcat address can impersonate any admitted member.
 - **Fix:** Wrap the listener returned by `transport.Listen` in a `tls.Server` using the device certificate from `identity.Device.TLSCertificate()`. Require client certs. The verifier must check that the peer cert's Ed25519 key matches an admitted member's `device_public` in the local roster and that the membership signature verifies against the pinned room authority. On the dial side, `localapi` must present the device cert and verify the remote presents an admitted member cert for the member ID it intends to talk to. Set the authenticated member ID in the request context and delete every `MemberID` field from `SyncRequest`, `InferenceRequest`, `CommunitySyncRequest`, and `ContributionsSyncRequest`.
-- **Reference implementation:** `internal/m0/peer.go` and `internal/m0/endpoint.go` already do authority-signed peer credentials and pinning. See `TestAdmittedPeersExchangeDataWithCreatorStopped` and `TestSubstitutedPeerRejectedByClientTLS` in `internal/m0`.
+- **Reference implementation:** `hack/m0/peer.go` and `hack/m0/endpoint.go` already do authority-signed peer credentials and pinning. See `TestAdmittedPeersExchangeDataWithCreatorStopped` and `TestSubstitutedPeerRejectedByClientTLS` in `hack/m0`.
 - **Verify:** A test where node C, holding a valid Tailcat address for node B but no membership, gets a TLS handshake failure on every `/peer/v1/*` route. A test where an admitted member cannot submit a request claiming another member's ID.
 
 ### 2. Bootstrap join must prove key possession and only the creator may admit
@@ -91,7 +178,7 @@ Work the P0 items in order. Tasks 1 and 2 unblock most of the others.
 
 - **Problem:** Tailcat embeds the WireGuard preshared key in the address. `tailcat.Server.PresharedKey` docs: "A persistent server must restore this value along with Key so its address remains usable across restarts." `cmd/woolwire/main.go:86` restores only the node key, so every restart yields a new address, invalidating the invitation code and every peer's stored address for the node.
 - **Fix:** Add a `tailcat_psk` column to `device_identity`, generate once with `tailcat.NewPresharedKey()`, pass it in `transport.TailcatConfig.PresharedKey`. Also persist the resolved region so the address is stable.
-- **Verify:** Integration test that restarts the transport with the same store and asserts `Address()` is unchanged. `internal/m0/state.go` already persists the PSK; mirror it.
+- **Verify:** Integration test that restarts the transport with the same store and asserts `Address()` is unchanged. `hack/m0/state.go` already persists the PSK; mirror it.
 
 ### 11. Remove the 15 second write timeout from streaming routes
 

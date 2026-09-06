@@ -2,7 +2,7 @@ services:
   room:
     build:
       context: ../..
-      dockerfile: deploy/m0/Dockerfile
+      dockerfile: hack/m0-compose/Dockerfile
     command:
       - room
       - --state
@@ -27,7 +27,7 @@ services:
   member-a:
     build:
       context: ../..
-      dockerfile: deploy/m0/Dockerfile
+      dockerfile: hack/m0-compose/Dockerfile
     command:
       - client
       - --invitation
@@ -55,7 +55,7 @@ services:
   member-b:
     build:
       context: ../..
-      dockerfile: deploy/m0/Dockerfile
+      dockerfile: hack/m0-compose/Dockerfile
     command:
       - client
       - --invitation

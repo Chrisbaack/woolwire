@@ -21,7 +21,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/m0"
+	"github.com/cbaack/woolwire/hack/m0"
 	"github.com/tailscale/tailcat"
 )
 

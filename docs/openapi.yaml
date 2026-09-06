@@ -1,18 +1,217 @@
 openapi: 3.1.0
 info:
   title: Woolwire API
-  description: HTTP API specification for Woolwire local owner, room creator, bootstrap, and peer interfaces.
-  version: 1.0.0
+  description: |
+    HTTP API for Woolwire's three interfaces.
+
+    **Local owner API** (`/api/v1`, `/v1`) is served on loopback. It is
+    protected by a session cookie obtained from the one-time setup secret,
+    and every state-changing request must carry either an `Origin` matching
+    the request's own host or the `X-Woolwire-Request` header. JSON routes
+    reject any content type other than `application/json`. Without this, a
+    page served from another port on 127.0.0.1 is same-site to the browser
+    and could act with the owner's session.
+
+    **Peer API** (`/peer/v1`) is served over the transport under mutual TLS
+    1.3. A connection completes only when the client certificate's Ed25519
+    key belongs to an admitted member whose membership verifies against the
+    pinned room authority. The caller's identity comes from that certificate,
+    so no request body carries a member id.
+
+    **Bootstrap API** (`/bootstrap/v1`) is served only by the room creator, on
+    the peer port plus one, under a certificate signed by the room authority.
+    The joiner pins that authority from its invitation code. The creator takes
+    the joining device's key from its certificate.
+
+    **Runner API** (`/runner/v1`) is served by the companion runner container
+    on an internal network and always requires a bearer token.
+  version: 2.0.0
 
 servers:
   - url: http://127.0.0.1:7070
     description: Local owner interface
 
+tags:
+  - name: setup
+  - name: room
+  - name: room-admin
+  - name: models
+  - name: chats
+  - name: community
+  - name: contributions
+  - name: openai
+  - name: peer
+  - name: bootstrap
+  - name: runner
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: woolwire_session
+    localAPIToken:
+      type: http
+      scheme: bearer
+      description: |
+        Token for the OpenAI-compatible routes, generated on first boot and
+        readable from `GET /api/v1/local-api-token`. It is always required.
+    runnerToken:
+      type: http
+      scheme: bearer
+    peerCertificate:
+      type: mutualTLS
+      description: |
+        The peer's device certificate. Its Ed25519 key must name an admitted
+        member of this room.
+
+  parameters:
+    csrfHeader:
+      name: X-Woolwire-Request
+      in: header
+      required: true
+      description: |
+        Required on every state-changing request unless a matching `Origin`
+        header is present. A cross-origin page cannot set it without a
+        preflight, and the preflight is refused.
+      schema:
+        type: string
+        enum: ['1']
+
+  schemas:
+    Membership:
+      type: object
+      properties:
+        member_id: { type: string }
+        room_id: { type: string }
+        device_public: { type: string }
+        display_name: { type: string }
+        status:
+          type: string
+          enum: [admitted, pending, removed]
+        roster_version: { type: integer, format: int64 }
+        signature:
+          type: string
+          description: Ed25519 signature by the room authority.
+        sig_version:
+          type: integer
+          description: |
+            Signing payload format. 1 is the canonical length-prefixed,
+            domain-separated encoding; 0 is the legacy colon-joined form kept
+            only so records written before the change still verify.
+
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant]
+        content: { type: string }
+
+    HostedModel:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Opaque room-wide identifier.
+        name:
+          type: string
+          description: Owner-facing display name.
+        backend_model:
+          type: string
+          description: |
+            What the backend server is sent in the OpenAI `model` field.
+            Defaults to `name`; the opaque `id` is never sent to a backend.
+        model_type:
+          type: string
+          enum: [external, managed]
+        endpoint_url: { type: string }
+        context_limit: { type: integer }
+        max_tokens: { type: integer }
+        enabled: { type: boolean }
+        published: { type: boolean }
+        revision: { type: integer }
+        allow_private_network:
+          type: boolean
+          description: |
+            Opts this one endpoint out of the private-range and non-standard
+            port blocks. Off by default.
+
+    CommunityEvent:
+      type: object
+      properties:
+        id: { type: string }
+        room_id: { type: string }
+        channel_id: { type: string }
+        author_member_id: { type: string }
+        author_seq: { type: integer, format: int64 }
+        event_type:
+          type: string
+          enum: [message, edit, delete, tombstone, channel]
+        target_event_id: { type: string }
+        content: { type: string }
+        timestamp: { type: integer, format: int64 }
+        signature: { type: string }
+        sig_version: { type: integer }
+
+    Receipt:
+      type: object
+      properties:
+        request_id: { type: string }
+        room_id: { type: string }
+        host_member_id: { type: string }
+        requester_member_id: { type: string }
+        timestamp: { type: integer, format: int64 }
+        completed: { type: boolean }
+        host_signature: { type: string }
+        requester_signature: { type: string }
+        sig_version: { type: integer }
+
+    ModelAd:
+      type: object
+      properties:
+        room_id: { type: string }
+        host_member_id: { type: string }
+        model_id: { type: string }
+        revision: { type: integer }
+        name: { type: string }
+        context_limit: { type: integer }
+        availability:
+          type: string
+          enum: [ready, busy, offline]
+        queue_estimate: { type: integer }
+        is_managed: { type: boolean }
+        timestamp: { type: integer, format: int64 }
+        signature: { type: string }
+        sig_version: { type: integer }
+
+  responses:
+    Unauthorized:
+      description: No valid session cookie.
+    CSRFRefused:
+      description: |
+        Cross-site request refused: the request had neither a matching
+        `Origin` nor `X-Woolwire-Request`, or used a disallowed content type.
+    CreatorOnly:
+      description: This route requires the room authority.
+
+security:
+  - sessionCookie: []
+
 paths:
-  # Local Owner API
+  # ---------------------------------------------------------------- setup ---
   /api/v1/setup:
     post:
-      summary: Exchange one-time setup token for session cookie
+      tags: [setup]
+      summary: Exchange the one-time setup secret for a session cookie
+      description: |
+        The secret is single-use. Once redeemed it returns 410 forever; mint
+        another from an authenticated session. Failed attempts are rate
+        limited per client address with exponential backoff.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
       requestBody:
         required: true
         content:
@@ -21,17 +220,24 @@ paths:
               type: object
               required: [token]
               properties:
-                token:
-                  type: string
+                token: { type: string }
       responses:
         '200':
-          description: Session established
+          description: Session established. Sets `woolwire_session`, SameSite=Strict.
         '401':
-          description: Invalid setup token
+          description: Invalid setup secret.
+        '403':
+          $ref: '#/components/responses/CSRFRefused'
+        '410':
+          description: The setup secret has already been redeemed.
+        '429':
+          description: Too many failed attempts. `Retry-After` gives the delay.
 
-  /api/v1/state:
+  /api/v1/setup/info:
     get:
-      summary: Get current local installation and room state
+      tags: [setup]
+      summary: Report whether an unredeemed setup secret is outstanding
+      description: The secret itself is never returned.
       responses:
         '200':
           content:
@@ -39,31 +245,111 @@ paths:
               schema:
                 type: object
                 properties:
-                  configured:
-                    type: boolean
-                  display_name:
-                    type: string
-                  device_public:
-                    type: string
+                  active: { type: boolean }
+                  redeemed: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/setup/token:
+    post:
+      tags: [setup]
+      summary: Mint a new one-time setup secret
+      description: |
+        With an empty body, generates a 128-bit secret. A custom secret must
+        be at least 12 characters. The value is returned once.
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                token:
+                  type: string
+                  minLength: 12
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  token: { type: string }
+        '400':
+          description: The custom secret is shorter than 12 characters.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/local-api-token:
+    get:
+      tags: [setup]
+      summary: Read the bearer token for the OpenAI-compatible routes
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/local-api-token/regenerate:
+    post:
+      tags: [setup]
+      summary: Rotate the OpenAI-compatible bearer token
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ----------------------------------------------------------------- room ---
+  /api/v1/state:
+    get:
+      tags: [room]
+      summary: Get local installation and room state
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configured: { type: boolean }
+                  display_name: { type: string }
+                  device_public: { type: string }
+                  member_id: { type: string }
                   room:
                     type: object
                     nullable: true
                     properties:
-                      room_id:
-                        type: string
-                      room_name:
-                        type: string
+                      room_id: { type: string }
+                      room_name: { type: string }
                       role:
                         type: string
                         enum: [creator, member]
                       invitation_code:
                         type: string
-                      approval_mode:
-                        type: boolean
+                        description: |
+                          Present only for the creator. Members never hold an
+                          invitation code.
+                      approval_mode: { type: boolean }
+                      roster_version: { type: integer, format: int64 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/v1/profile:
     post:
-      summary: Update display name
+      tags: [room]
+      summary: Update the display name
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
       requestBody:
         required: true
         content:
@@ -72,15 +358,21 @@ paths:
               type: object
               required: [display_name]
               properties:
-                display_name:
-                  type: string
+                display_name: { type: string }
       responses:
-        '200':
-          description: Profile updated
+        '200': { description: Profile updated. }
+        '400': { description: Empty display name. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/v1/room/host:
     post:
-      summary: Host / create a new room
+      tags: [room]
+      summary: Create a room
+      description: |
+        Generates the room authority, the invitation, and the authority-signed
+        bootstrap certificate, then starts the peer and bootstrap listeners.
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
       requestBody:
         required: true
         content:
@@ -89,15 +381,27 @@ paths:
               type: object
               required: [room_name]
               properties:
-                room_name:
-                  type: string
+                room_name: { type: string }
       responses:
         '200':
-          description: Room created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  room_id: { type: string }
+                  invitation_code: { type: string }
+        '400':
+          description: Missing room name, or no display name is set yet.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: Already in a room. }
 
   /api/v1/room/join:
     post:
-      summary: Join an existing room using invitation code
+      tags: [room]
+      summary: Join a room using an invitation code
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
       requestBody:
         required: true
         content:
@@ -106,27 +410,49 @@ paths:
               type: object
               required: [invitation_code]
               properties:
-                invitation_code:
-                  type: string
+                invitation_code: { type: string }
       responses:
         '200':
-          description: Room joined
-        '400':
-          description: Invalid code format
-        '403':
-          description: Admission rejected
+          description: |
+            Admitted, or pending when the creator requires approval, or
+            rejected with a reason.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [admitted, pending, rejected]
+                  room_id: { type: string }
+                  reason: { type: string }
+        '400': { description: Invalid code, or no display name is set yet. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Admission rejected by the creator. }
+        '409': { description: Already in a room. }
+        '502':
+          description: |
+            The creator was unreachable, or its bootstrap certificate is not
+            signed by the authority in the invitation.
 
   /api/v1/room/leave:
     post:
-      summary: Leave current room
+      tags: [room]
+      summary: Leave the current room
+      description: Stops the peer listener before clearing room state.
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
       responses:
-        '200':
-          description: Left room
+        '200': { description: Left the room. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
-  # Room Admin API (Creator only)
+  # ----------------------------------------------------------- room-admin ---
   /api/v1/room-admin/invitation/rotate:
     post:
-      summary: Rotate active room invitation code
+      tags: [room-admin]
+      summary: Rotate the invitation code
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
       responses:
         '200':
           content:
@@ -134,40 +460,65 @@ paths:
               schema:
                 type: object
                 properties:
-                  invitation_code:
-                    type: string
+                  invitation_code: { type: string }
+        '403': { $ref: '#/components/responses/CreatorOnly' }
 
   /api/v1/room-admin/members:
     get:
-      summary: List all room members
+      tags: [room-admin]
+      summary: List room members
       responses:
         '200':
           content:
             application/json:
               schema:
                 type: array
-                items:
-                  type: object
-                  properties:
-                    member_id:
-                      type: string
-                    display_name:
-                      type: string
-                    device_public:
-                      type: string
-                    status:
-                      type: string
-                      enum: [admitted, pending, removed]
+                items: { $ref: '#/components/schemas/Membership' }
+        '403': { $ref: '#/components/responses/CreatorOnly' }
 
-  /api/v1/room-admin/members/{id}/remove:
+  /api/v1/room-admin/pending:
+    get:
+      tags: [room-admin]
+      summary: List devices waiting for approval
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Membership' }
+        '403': { $ref: '#/components/responses/CreatorOnly' }
+
+  /api/v1/room-admin/members/{id}/approve:
     post:
-      summary: Remove a member from the room
+      tags: [room-admin]
+      summary: Admit a pending device
       parameters:
         - name: id
           in: path
           required: true
-          schema:
-            type: string
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200': { description: Member admitted. }
+        '403': { $ref: '#/components/responses/CreatorOnly' }
+        '404': { description: No such member. }
+        '409': { description: The member is not pending. }
+
+  /api/v1/room-admin/members/{id}/remove:
+    post:
+      tags: [room-admin]
+      summary: Remove a member
+      description: |
+        Signs a removal at a higher roster version, cancels that member's
+        queued and running work, forgets their address, and pushes the update
+        to peers. Rotates the invitation code by default.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
       requestBody:
         content:
           application/json:
@@ -179,32 +530,855 @@ paths:
                   default: true
       responses:
         '200':
-          description: Member removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  invitation_code: { type: string }
+        '403': { $ref: '#/components/responses/CreatorOnly' }
+        '404': { description: No such member. }
 
-  # Bootstrap API (Peer transport listener)
-  /bootstrap/v1/join:
+  /api/v1/room-admin/approval-mode:
     post:
-      summary: Submit join request to room creator
+      tags: [room-admin]
+      summary: Require creator approval for new devices
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [room_id, invitation_id, admission_secret, device_public, display_name, tailcat_addr]
+              required: [approval_mode]
               properties:
-                room_id:
+                approval_mode: { type: boolean }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  approval_mode: { type: boolean }
+        '403': { $ref: '#/components/responses/CreatorOnly' }
+
+  # --------------------------------------------------------------- models ---
+  /api/v1/hosted-models:
+    get:
+      tags: [models]
+      summary: List locally hosted models
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/HostedModel' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [models]
+      summary: Create or update a hosted model
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HostedModel' }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HostedModel' }
+        '400':
+          description: |
+            Missing name, or the endpoint is refused by the destination
+            policy (metadata address, blocked range, blocked port, or plain
+            HTTP off-machine without the private-network opt-in).
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/hosted-models/{id}:
+    delete:
+      tags: [models]
+      summary: Delete a hosted model
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/hosted-models/test:
+    post:
+      tags: [models]
+      summary: Test reachability of a model endpoint
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id: { type: string }
+                endpoint_url: { type: string }
+                api_key: { type: string }
+                allow_private_network: { type: boolean }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  latency_ms: { type: integer }
+                  models:
+                    type: array
+                    items: { type: string }
+                  error: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/hosted-models/discover:
+    post:
+      tags: [models]
+      summary: List the models an endpoint offers
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [endpoint_url]
+              properties:
+                endpoint_url: { type: string }
+                api_key: { type: string }
+                allow_private_network: { type: boolean }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  models:
+                    type: array
+                    items: { type: string }
+                  error: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/host-limits:
+    get:
+      tags: [models]
+      summary: Read the fair-queue limits
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  MaxActive: { type: integer }
+                  MaxQueuedPerMember: { type: integer }
+                  MaxQueuedTotal: { type: integer }
+                  QueueTimeoutSeconds: { type: integer }
+                  ExecutionTimeoutSeconds: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [models]
+      summary: Update the fair-queue limits
+      description: Applies to the shared queue immediately.
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200': { description: Limits saved. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/hardware:
+    get:
+      tags: [models]
+      summary: Detected CPU, memory, and GPU profile
+      responses:
+        '200': { description: Hardware profile. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/catalog:
+    get:
+      tags: [models]
+      summary: Models offered by this node and its peers
+      description: |
+        Queries every known peer over an authenticated connection. An
+        advertisement is accepted only from the member the handshake proved,
+        and only if that member's signature verifies.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  allOf:
+                    - $ref: '#/components/schemas/ModelAd'
+                    - type: object
+                      properties:
+                        host_display_name: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ------------------------------------------------------- managed models ---
+  /api/v1/managed-models/artifacts:
+    get:
+      tags: [models]
+      summary: List downloaded GGUF weights
+      responses:
+        '200': { description: Artifact manifests. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/managed-models/artifacts/{filename}:
+    delete:
+      tags: [models]
+      summary: Delete a downloaded weight file
+      parameters:
+        - name: filename
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200': { description: Deleted. }
+        '400': { description: Invalid filename. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/managed-models/download:
+    post:
+      tags: [models]
+      summary: Start a background weight download
+      description: |
+        Returns immediately with a job id. Poll
+        `GET /api/v1/managed-models/downloads` for progress; a multi-gigabyte
+        transfer is not held open inside a request.
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_url, filename]
+              properties:
+                source_url:
                   type: string
-                invitation_id:
+                  description: Must be HTTPS and pass the destination policy.
+                filename:
                   type: string
-                admission_secret:
+                  description: Must be a bare `.gguf` name with no path separators.
+                expected_sha256: { type: string }
+                max_size_bytes: { type: integer, format: int64 }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  download_id: { type: string }
+                  status: { type: string }
+        '400': { description: Rejected filename, URL, or storage budget. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/managed-models/downloads:
+    get:
+      tags: [models]
+      summary: Download job status
+      parameters:
+        - name: id
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string }
+                    filename: { type: string }
+                    status:
+                      type: string
+                      enum: [downloading, complete, failed, cancelled]
+                    bytes_downloaded: { type: integer, format: int64 }
+                    total_bytes: { type: integer, format: int64 }
+                    error: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such job. }
+
+  /api/v1/managed-models/downloads/{id}/cancel:
+    post:
+      tags: [models]
+      summary: Cancel a download job
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200': { description: Cancelled. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such job. }
+
+  /api/v1/managed-models/runner-health:
+    get:
+      tags: [models]
+      summary: Runner companion status
+      responses:
+        '200': { description: Runner status. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/managed-models/load:
+    post:
+      tags: [models]
+      summary: Load weights into the runner and advertise them
+      description: |
+        Waits for the engine to report healthy, then creates or updates the
+        hosted-model row so the model appears in the catalog and can be
+        served to peers.
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model_id, filename]
+              properties:
+                model_id: { type: string }
+                name: { type: string }
+                filename: { type: string }
+                context_limit: { type: integer }
+                max_tokens: { type: integer }
+                threads: { type: integer }
+                gpu_layers: { type: integer }
+                published: { type: boolean }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HostedModel' }
+        '400': { description: Invalid filename. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { description: No runner is configured. }
+
+  /api/v1/managed-models/unload:
+    post:
+      tags: [models]
+      summary: Unload the runner's model and withdraw its advertisement
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200': { description: Unloaded. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { description: No runner is configured. }
+
+  # ---------------------------------------------------------------- chats ---
+  /api/v1/chats:
+    get:
+      tags: [chats]
+      summary: List conversations
+      responses:
+        '200': { description: Conversations. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [chats]
+      summary: Create a conversation
+      description: |
+        A `no_save` conversation is never written to the messages table on any
+        node; its transcript is kept in memory so it stays multi-turn.
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                no_save: { type: boolean }
+      responses:
+        '200': { description: Created. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/chats/{id}:
+    get:
+      tags: [chats]
+      summary: Read a conversation and its messages
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Conversation and messages. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No such conversation. }
+    delete:
+      tags: [chats]
+      summary: Delete a conversation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/chats/{id}/message:
+    post:
+      tags: [chats]
+      summary: Send a message and stream the reply
+      description: |
+        Responds with Server-Sent Events. Frames are `data: {"delta":...}`,
+        a `: ping` comment every 15 seconds while idle, and a final
+        `data: [DONE]`. Local requests go through the same fair queue as
+        remote ones.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content, host_member_id, model_id]
+              properties:
+                content: { type: string }
+                host_member_id: { type: string }
+                model_id: { type: string }
+      responses:
+        '200':
+          description: SSE stream.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { description: The model is offline or the host is unreachable. }
+
+  /api/v1/chats/{id}/cancel:
+    post:
+      tags: [chats]
+      summary: Cancel an in-flight request
+      description: |
+        Cancellation is scoped to the submitting member, both locally and on
+        the host.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id]
+              properties:
+                request_id: { type: string }
+                host_member_id: { type: string }
+      responses:
+        '200': { description: Cancellation requested. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ------------------------------------------------------------ community ---
+  /api/v1/community/channels:
+    get:
+      tags: [community]
+      summary: List channels
+      description: |
+        Channels are materialized from the replicated event log, so a channel
+        created on any node is visible on all of them.
+      responses:
+        '200': { description: Channels. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [community]
+      summary: Create a channel
+      description: Publishes a signed `channel` event so it replicates.
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                description: { type: string }
+      responses:
+        '200': { description: Channel created. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/community/channels/{id}/messages:
+    get:
+      tags: [community]
+      summary: Read a channel
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Materialized messages. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [community]
+      summary: Post to a channel
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CommunityEvent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/community/channels/{id}/read:
+    post:
+      tags: [community]
+      summary: Update local read and mute state
+      description: Local only; never replicated.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                muted: { type: boolean }
+      responses:
+        '200': { description: Saved. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/community/messages/{id}:
+    put:
+      tags: [community]
+      summary: Edit your own message
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string }
+                channel_id: { type: string }
+      responses:
+        '200': { description: Edit published. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Not the author. }
+        '404': { description: No such message. }
+    delete:
+      tags: [community]
+      summary: Delete your own message
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200': { description: Deletion published. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Not the author. }
+        '404': { description: No such message. }
+
+  /api/v1/community/messages/{id}/moderate:
+    post:
+      tags: [community]
+      summary: Tombstone a message as the room creator
+      description: Signed with the room authority, so peers can verify it.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+                channel_id: { type: string }
+      responses:
+        '200': { description: Tombstone published. }
+        '403': { $ref: '#/components/responses/CreatorOnly' }
+
+  /api/v1/community/sync:
+    post:
+      tags: [community]
+      summary: Sync community events with peers now
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200': { description: Sync attempted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # -------------------------------------------------------- contributions ---
+  /api/v1/contributions/leaderboard:
+    get:
+      tags: [contributions]
+      summary: 30-day social recognition leaderboard
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  leaderboard:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        host_member_id: { type: string }
+                        display_name: { type: string }
+                        score: { type: integer }
+                        distinct_members_helped: { type: integer }
+                  disclaimer: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/contributions/settings:
+    get:
+      tags: [contributions]
+      summary: Read the contributions opt-out
+      responses:
+        '200': { description: Settings. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [contributions]
+      summary: Set the contributions opt-out
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [opt_out]
+              properties:
+                opt_out: { type: boolean }
+      responses:
+        '200': { description: Saved. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/contributions/sync:
+    post:
+      tags: [contributions]
+      summary: Sync receipts with peers now
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200': { description: Sync attempted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # -------------------------------------------------- metrics and backups ---
+  /api/v1/metrics:
+    get:
+      tags: [setup]
+      summary: Local metrics
+      description: Reports the transport's public address, never a private key.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connectivity:
+                    type: object
+                    properties:
+                      tailcat_addr: { type: string }
+                      known_peers: { type: integer }
+                  storage: { type: object }
+                  engine: { type: object }
+                  queue:
+                    type: object
+                    properties:
+                      active: { type: integer }
+                      queued: { type: integer }
+                  telemetry_enabled:
+                    type: boolean
+                    description: Always false.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/backup/export:
+    post:
+      tags: [setup]
+      summary: Export an encrypted backup
+      description: |
+        Written under the state directory and sealed with an Argon2id-derived
+        key. The plaintext database holds the device private key, the node
+        key, the session token, and every endpoint API key, so a passphrase is
+        required.
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [passphrase]
+              properties:
+                passphrase:
                   type: string
-                device_public:
-                  type: string
-                display_name:
-                  type: string
-                tailcat_addr:
-                  type: string
+                  minLength: 12
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  backup_path: { type: string }
+                  size_bytes: { type: integer, format: int64 }
+                  encrypted: { type: boolean }
+        '400': { description: Missing or too-short passphrase. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # --------------------------------------------------- OpenAI compatibility --
+  /v1/models:
+    get:
+      tags: [openai]
+      summary: List available models (OpenAI-compatible)
+      security:
+        - localAPIToken: []
+      responses:
+        '200': { description: Model list. }
+        '401': { description: Missing or wrong bearer token. }
+
+  /v1/chat/completions:
+    post:
+      tags: [openai]
+      summary: Chat completion (OpenAI-compatible)
+      description: |
+        Requests for a self-hosted model go through the same fair queue as
+        peer requests. Requests for a peer's model are forwarded over an
+        authenticated peer connection.
+      security:
+        - localAPIToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, messages]
+              properties:
+                model: { type: string }
+                messages:
+                  type: array
+                  items: { $ref: '#/components/schemas/ChatMessage' }
+                stream: { type: boolean }
+      responses:
+        '200':
+          description: A completion object, or an SSE stream when `stream` is set.
+        '401': { description: Missing or wrong bearer token. }
+        '403': { $ref: '#/components/responses/CSRFRefused' }
+        '404': { description: No such model. }
+
+  # ------------------------------------------------------------- bootstrap --
+  /bootstrap/v1/join:
+    servers:
+      - url: 'tailcat://{address}:{port}'
+        description: |
+          The creator's bootstrap listener, on the peer port plus one, over
+          TLS with a certificate signed by the room authority.
+        variables:
+          address: { default: '<creator tailcat address>' }
+          port: { default: '4243' }
+    post:
+      tags: [bootstrap]
+      summary: Request admission to a room
+      description: |
+        Served only by the creator; a member node runs no bootstrap listener
+        at all. The joining device's key is taken from its TLS certificate,
+        never from the body, and a device already admitted or previously
+        removed is refused.
+      security:
+        - peerCertificate: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_id, invitation_id, admission_secret, display_name]
+              properties:
+                room_id: { type: string }
+                invitation_id: { type: string }
+                admission_secret: { type: string }
+                display_name: { type: string }
+                tailcat_addr: { type: string }
       responses:
         '200':
           content:
@@ -215,26 +1389,48 @@ paths:
                   status:
                     type: string
                     enum: [admitted, pending, rejected]
-                  membership:
-                    type: object
+                  room_name: { type: string }
+                  creator_member_id: { type: string }
+                  membership: { $ref: '#/components/schemas/Membership' }
                   roster:
+                    type: array
+                    items: { $ref: '#/components/schemas/Membership' }
+                  peer_addresses:
                     type: array
                     items:
                       type: object
+                      properties:
+                        MemberID: { type: string }
+                        TailcatAddr: { type: string }
+                  reason: { type: string }
+        '400': { description: Wrong room, missing display name, or no device certificate. }
+        '403': { description: This node is not the creator, or invitations are disabled. }
+        '404': { description: No room on this node. }
 
-  # Peer API (Peer transport listener)
+  # ------------------------------------------------------------------ peer --
   /peer/v1/membership/sync:
+    servers:
+      - url: 'tailcat://{address}:{port}'
+        variables:
+          address: { default: '<peer tailcat address>' }
+          port: { default: '4242' }
     post:
-      summary: Exchange membership updates with a peer
+      tags: [peer]
+      summary: Exchange roster updates
+      description: |
+        `tailcat_addr` updates only the authenticated caller's own address.
+        There is no member id in the body: a member cannot rebind anyone
+        else's address to a node it controls.
+      security:
+        - peerCertificate: []
       requestBody:
-        required: true
         content:
           application/json:
             schema:
               type: object
               properties:
-                known_version:
-                  type: integer
+                known_version: { type: integer, format: int64 }
+                tailcat_addr: { type: string }
       responses:
         '200':
           content:
@@ -242,9 +1438,308 @@ paths:
               schema:
                 type: object
                 properties:
-                  roster_version:
-                    type: integer
+                  roster_version: { type: integer, format: int64 }
                   members:
                     type: array
-                    items:
-                      type: object
+                    items: { $ref: '#/components/schemas/Membership' }
+                  peer_addresses:
+                    type: array
+                    items: { type: object }
+        '403': { description: The caller is not an admitted member. }
+        '404': { description: No room on this node. }
+
+  /peer/v1/catalog:
+    get:
+      tags: [peer]
+      summary: Signed advertisements for this host's models
+      security:
+        - peerCertificate: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ModelAd' }
+        '403': { description: The caller is not an admitted member. }
+
+  /peer/v1/inference:
+    post:
+      tags: [peer]
+      summary: Request inference from this host
+      description: |
+        The requester is the authenticated TLS identity; there is no
+        `member_id` field to claim someone else's. Responds with SSE:
+        `data: {"delta":...}` frames, a `: ping` keepalive, an optional
+        `event: receipt`, and a final `data: [DONE]`.
+      security:
+        - peerCertificate: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id, model_id, messages]
+              properties:
+                request_id: { type: string }
+                model_id: { type: string }
+                messages:
+                  type: array
+                  items: { $ref: '#/components/schemas/ChatMessage' }
+      responses:
+        '200':
+          description: SSE stream.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '400': { description: Missing fields or oversized body. }
+        '403': { description: The caller is not an admitted member. }
+        '404': { description: No such model. }
+        '413': { description: The prompt exceeds the model's context limit. }
+        '429': { description: The member's queue allowance is exhausted. }
+        '503': { description: The host queue is full. }
+
+  /peer/v1/inference/cancel:
+    post:
+      tags: [peer]
+      summary: Cancel one of your own in-flight requests
+      description: A request submitted by another member is not cancellable.
+      security:
+        - peerCertificate: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id]
+              properties:
+                request_id: { type: string }
+      responses:
+        '200': { description: Cancelled. }
+        '400': { description: Missing request id. }
+        '403': { description: The caller is not an admitted member. }
+        '404': { description: No such request belonging to the caller. }
+
+  /peer/v1/community/sync:
+    post:
+      tags: [peer]
+      summary: Exchange community events using per-author cursors
+      description: |
+        The request carries one cursor per author rather than every known
+        event id, so its size does not grow with the room's history. Loop on
+        the returned cursors until a page comes back empty.
+      security:
+        - peerCertificate: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_id]
+              properties:
+                room_id: { type: string }
+                cursors:
+                  type: object
+                  additionalProperties: { type: integer, format: int64 }
+                push_events:
+                  type: array
+                  items: { $ref: '#/components/schemas/CommunityEvent' }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pull_events:
+                    type: array
+                    items: { $ref: '#/components/schemas/CommunityEvent' }
+                  next_cursors:
+                    type: object
+                    additionalProperties: { type: integer, format: int64 }
+        '400': { description: Room mismatch or oversized body. }
+        '403': { description: The caller is not an admitted member. }
+
+  /peer/v1/contributions/sync:
+    post:
+      tags: [peer]
+      summary: Exchange contribution receipts using per-pair cursors
+      security:
+        - peerCertificate: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room_id]
+              properties:
+                room_id: { type: string }
+                cursors:
+                  type: object
+                  additionalProperties: { type: integer, format: int64 }
+                push_receipts:
+                  type: array
+                  items: { $ref: '#/components/schemas/Receipt' }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pull_receipts:
+                    type: array
+                    items: { $ref: '#/components/schemas/Receipt' }
+                  next_cursors:
+                    type: object
+                    additionalProperties: { type: integer, format: int64 }
+        '400': { description: Room mismatch or oversized body. }
+        '403': { description: The caller is not an admitted member. }
+
+  /peer/v1/contributions/ack:
+    post:
+      tags: [peer]
+      summary: Return a counter-signed receipt to the host
+      description: |
+        The caller must be the receipt's requester, and both signatures must
+        verify against the roster.
+      security:
+        - peerCertificate: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Receipt' }
+      responses:
+        '200': { description: Receipt stored. }
+        '400': { description: Room mismatch or invalid signatures. }
+        '403':
+          description: |
+            The caller is not an admitted member, or the receipt names a
+            different requester.
+
+  # ---------------------------------------------------------------- runner --
+  /runner/v1/health:
+    servers:
+      - url: 'http://woolwire-runner:8080'
+        description: Companion runner on the internal network.
+    get:
+      tags: [runner]
+      summary: Engine status
+      security:
+        - runnerToken: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [idle, loading, ready, busy, error]
+                  loaded_model_id: { type: string }
+                  loaded_file: { type: string }
+                  engine_pid: { type: integer }
+                  error: { type: string }
+        '401': { description: Missing or wrong runner token. }
+
+  /runner/v1/models/load:
+    post:
+      tags: [runner]
+      summary: Launch the engine and wait for it to become healthy
+      description: |
+        Returns only once the engine's own health endpoint answers, so
+        `ready` means loaded rather than merely started.
+      security:
+        - runnerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model_id, filename]
+              properties:
+                model_id: { type: string }
+                filename: { type: string }
+                context_limit: { type: integer }
+                threads: { type: integer }
+                gpu_layers: { type: integer }
+      responses:
+        '200': { description: Engine ready. }
+        '400': { description: Invalid filename. }
+        '401': { description: Missing or wrong runner token. }
+        '404': { description: No such weight file. }
+        '500': { description: The engine failed to launch or become healthy. }
+
+  /runner/v1/models/unload:
+    post:
+      tags: [runner]
+      summary: Stop and reap the engine
+      security:
+        - runnerToken: []
+      responses:
+        '200': { description: Unloaded. }
+        '401': { description: Missing or wrong runner token. }
+
+  /runner/v1/engine/restart:
+    post:
+      tags: [runner]
+      summary: Restart the engine with the same load arguments
+      security:
+        - runnerToken: []
+      responses:
+        '200': { description: Restarted, or nothing was loaded. }
+        '401': { description: Missing or wrong runner token. }
+        '500': { description: The restart failed. }
+
+  /runner/v1/inference:
+    post:
+      tags: [runner]
+      summary: Run inference on the loaded model
+      description: |
+        The engine request is built from these fields; nothing else in the
+        body reaches the engine. Requests are serialized, and the engine is
+        restarted when the requesting member changes so no session state
+        carries between members.
+      security:
+        - runnerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, messages]
+              properties:
+                model: { type: string }
+                messages:
+                  type: array
+                  items: { $ref: '#/components/schemas/ChatMessage' }
+                stream: { type: boolean }
+                max_tokens: { type: integer }
+                requester_member_id: { type: string }
+      responses:
+        '200':
+          description: SSE stream from the engine.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '400': { description: Invalid body or unsupported message role. }
+        '401': { description: Missing or wrong runner token. }
+        '503': { description: No model is loaded. }
+
+  /runner/v1/inference/cancel:
+    post:
+      tags: [runner]
+      summary: Cancel the active inference
+      security:
+        - runnerToken: []
+      responses:
+        '200': { description: Cancellation requested. }
+        '401': { description: Missing or wrong runner token. }

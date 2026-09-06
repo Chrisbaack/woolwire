@@ -1,18 +1,48 @@
 # Woolwire implementation plan
 
-Status: All milestones (M0 through M6) completed and accepted as of September 5, 2026. Fully functional, verified peer-to-peer local LLM sharing platform. Read [ARCHITECTURE.md](ARCHITECTURE.md) for product decisions and trust boundaries.
+Status: M0 through M6 are implemented. The gates are **not** all passed.
+
+The September 5, 2026 code review ([REVIEW_TASKS.md](REVIEW_TASKS.md)) found
+that the milestone entries below recorded acceptance on the strength of the
+package tests alone, and that those tests could not have caught most of what
+the review found: they run over an in-memory transport, drive handlers through
+`httptest` recorders rather than a real server, and never exercised the peer
+listener's authentication because there was none.
+
+The findings have been fixed and each one now has a regression test. What
+remains outstanding before any of these gates can honestly be called accepted:
+
+- **Every milestone:** the acceptance criteria have only been demonstrated over
+  the in-memory transport. The multi-process gate over real Tailcat lives in
+  [test/integration](../test/integration) behind the `integration` build tag and
+  has not been run against a live relay.
+- **M3:** the runner is covered against a fake engine, not a real
+  `llama-server`, and no peer has requested a managed model end to end.
+- **M6:** no external security review has been done.
+
+A single node has been brought up under Podman with the managed profile's
+network shape: the UI answered on the published loopback port, the node
+reached a DERP relay and printed a real Tailcat address, that address was
+unchanged across a restart, the one-time setup secret was refused on replay,
+and a cross-origin POST was refused.
+
+Read [ARCHITECTURE.md](ARCHITECTURE.md) for product decisions and trust boundaries.
 
 ## Progress log
 
 ### 2026-09-05 — M0 started
 
 - Read and applied the architecture, trust-boundary, deployment, and acceptance requirements in this plan.
-- Pinned the initial feasibility dependency to Tailcat `v0.6.0` and Go `1.27.1`; the unstable Tailcat API is isolated behind `internal/m0`.
+- Pinned the initial feasibility dependency to Tailcat `v0.6.0` and Go `1.27.1`; the unstable Tailcat API is isolated behind `hack/m0`.
 - Added a disposable Go probe with persisted Tailcat/device identities, stable-address restart handling, bounded invitations, explicit rotation, TLS 1.3, room-authority certificate pinning, and fixed-size framed application messages.
 - Added unit tests and collected live evidence for three concurrent streams, DERP bootstrap/direct-path upgrade, and room restart/reconnect.
 - Verification is green with `go test ./...`, `go test -race ./...`, and `go vet ./...` using Go 1.27.1.
 - Added a non-privileged three-service Compose profile with separate egress networks. See [M0 feasibility evidence](M0_FEASIBILITY.md).
 - M0 remains open for Docker/Docker Desktop, three independent networks with creator-offline continuation, forced relay fallback, cancellation under relay loss, relay-region recovery, and deployment firewall/relay evidence.
+
+> The entries below are the original milestone log. Each records acceptance on
+> the evidence available at the time; see the status note above for what the
+> September 5, 2026 review showed that evidence did not cover.
 
 ### 2026-09-05 — M0 completed & accepted
 
@@ -20,7 +50,7 @@ Status: All milestones (M0 through M6) completed and accepted as of September 5,
 - Verified client-side Ed25519 room-authority pinning strictly rejects substituted Tailcat peers during TLS handshake.
 - Verified peer endpoint strictly rejects unauthorized peers and forged/tampered credentials.
 - Verified custom DERP regions and address regeneration across relay-region changes.
-- Validated all 14 tests in `internal/m0` with `go test -race ./...` and `go vet ./...`. Podman container checks completed. M0 gate is closed and accepted.
+- Validated all 14 tests in `hack/m0` with `go test -race ./...` and `go vet ./...`. Podman container checks completed. M0 gate is closed and accepted.
 
 ### 2026-09-05 — M1 completed & accepted
 
