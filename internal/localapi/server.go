@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -99,6 +100,13 @@ type attemptRecord struct {
 	nextAllow time.Time
 }
 
+// The models directory holds multi-gigabyte weights, so the ceiling on what
+// Woolwire will download into it is a setting rather than a constant.
+const (
+	modelBudgetSetting        = "models_storage_budget_bytes"
+	defaultModelStorageBudget = 50 * (1 << 30) // 50 GB
+)
+
 func NewServer(cfg Config) (*Server, error) {
 	if cfg.Store == nil || cfg.Transport == nil {
 		return nil, errors.New("store and transport are required")
@@ -116,7 +124,16 @@ func NewServer(cfg Config) (*Server, error) {
 
 	var artMgr *hosting.ArtifactManager
 	if cfg.ModelsDir != "" {
-		artMgr, _ = hosting.NewArtifactManager(cfg.ModelsDir, 50*(1<<30))
+		// The storage budget is a setting rather than a constant: how much
+		// disk a node is willing to give models is the node operator's call,
+		// and it is changed from the Settings page.
+		budget := int64(defaultModelStorageBudget)
+		if raw, err := cfg.Store.GetSetting(modelBudgetSetting); err == nil {
+			if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+				budget = parsed
+			}
+		}
+		artMgr, _ = hosting.NewArtifactManager(cfg.ModelsDir, budget)
 	}
 	var runnerCli *hosting.RunnerClient
 	if cfg.RunnerURL != "" {
@@ -349,6 +366,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/hardware", s.authMiddleware(s.handleGetHardware))
 	s.mux.HandleFunc("GET /api/v1/managed-models/artifacts", s.authMiddleware(s.handleListArtifacts))
 	s.mux.HandleFunc("GET /api/v1/managed-models/storage", s.authMiddleware(s.handleArtifactStorage))
+	s.mux.HandleFunc("POST /api/v1/managed-models/storage", s.authMiddleware(s.handleSetArtifactStorage))
 	s.mux.HandleFunc("POST /api/v1/managed-models/download", s.authMiddleware(s.handleDownloadArtifact))
 	s.mux.HandleFunc("GET /api/v1/managed-models/downloads", s.authMiddleware(s.handleDownloadStatus))
 	s.mux.HandleFunc("GET /api/v1/managed-models/huggingface", s.authMiddleware(s.handleResolveHuggingFaceRepo))

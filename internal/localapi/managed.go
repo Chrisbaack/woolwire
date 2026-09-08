@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,6 +67,50 @@ func (s *Server) handleArtifactStorage(w http.ResponseWriter, r *http.Request) {
 		"configured":   true,
 		"used_bytes":   used,
 		"budget_bytes": budget,
+		"read_only":    s.artifactMgr.ReadOnly(),
+	})
+}
+
+// handleSetArtifactStorage changes the ceiling on downloaded weights. The new
+// value is persisted, so it survives a restart, and applied to the running
+// manager, so the next download is measured against it immediately.
+func (s *Server) handleSetArtifactStorage(w http.ResponseWriter, r *http.Request) {
+	if s.artifactMgr == nil {
+		http.Error(w, "artifact manager not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	var body struct {
+		BudgetBytes int64 `json:"budget_bytes"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if body.BudgetBytes <= 0 {
+		http.Error(w, "budget_bytes must be greater than zero", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.artifactMgr.SetMaxBudget(body.BudgetBytes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.SetSetting(modelBudgetSetting, strconv.FormatInt(body.BudgetBytes, 10)); err != nil {
+		http.Error(w, "failed to save the storage budget", http.StatusInternalServerError)
+		return
+	}
+
+	used, err := s.artifactMgr.GetUsedDiskSpace()
+	if err != nil {
+		used = 0
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"configured":   true,
+		"used_bytes":   used,
+		"budget_bytes": s.artifactMgr.MaxBudget(),
 		"read_only":    s.artifactMgr.ReadOnly(),
 	})
 }

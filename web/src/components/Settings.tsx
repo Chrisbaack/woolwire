@@ -1,5 +1,7 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { api } from '../api.ts'
+import { RunnerStatus } from './RunnerStatus.tsx'
+import './settings.css'
 
 interface HostedModel {
   id: string
@@ -69,6 +71,17 @@ interface RunnerHealth {
   // explains itself instead of leaving the runner silently in "error".
   engine_error?: string
   error?: string
+  // The launch settings the engine is actually running with. They seed the
+  // advanced form, and read back as zero while no model is loaded.
+  context_limit?: number
+  threads?: number
+  gpu_layers?: number | null
+  extra_args?: string[]
+  processing?: boolean
+  queued_requests?: number
+  prompt_tokens?: number
+  completion_tokens?: number
+  current_context_tokens?: number | null
 }
 
 interface ArtifactManifest {
@@ -276,6 +289,15 @@ function getHardwareFitBadge(modelSizeMB: number, hw: HardwareProfile | null): {
 }
 
 export const Settings: React.FC = () => {
+  type SettingsTab = 'status' | 'managed' | 'connected' | 'hosting' | 'access'
+  const [activeTab, setActiveTab] = useState<SettingsTab>('status')
+  const [managedContextLimit, setManagedContextLimit] = useState(4096)
+  const [managedThreads, setManagedThreads] = useState(4)
+  const [managedGpuLayers, setManagedGpuLayers] = useState<'auto' | string>('auto')
+  const [managedCustomGpuLayers, setManagedCustomGpuLayers] = useState('0')
+  const [managedExtraArgs, setManagedExtraArgs] = useState('[]')
+  const [managedConfigError, setManagedConfigError] = useState('')
+  const managedConfigHydrated = useRef(false)
   const [models, setModels] = useState<HostedModel[]>([])
   const [limits, setLimits] = useState<HostLimits>({
     MaxActive: 1,
@@ -295,12 +317,29 @@ export const Settings: React.FC = () => {
   const gpuLabel = (runner?.configured ? runner.gpu_name : hardware?.gpu_name) || 'NVIDIA GPU'
   const [artifacts, setArtifacts] = useState<ArtifactManifest[]>([])
   const [loadError, setLoadError] = useState<string>('')
+  const [loadSuccess, setLoadSuccess] = useState<string>('')
+  // The model the loader is pointed at, and — while a load is in flight — the
+  // one being started. The load request does not return until the engine
+  // reports healthy, so that wait has to be visible.
+  const [selectedArtifactID, setSelectedArtifactID] = useState<string>('')
+  const [loadingModelID, setLoadingModelID] = useState<string>('')
+  const selectedArtifact = (artifacts || []).find((a) => a.id === selectedArtifactID) || null
+  const selectedIsLoaded = !!selectedArtifact && runner?.loaded_file === (selectedArtifact.path || selectedArtifact.filename)
+  const loadingModel = loadingModelID !== ''
+  const loadingName = (artifacts || []).find((a) => a.id === loadingModelID)?.name || 'the model'
+  // What the runner is serving, named rather than pathed: a Hugging Face
+  // cache path is long enough to swamp anything shown beside it.
+  const loadedModelName = runner?.loaded_file
+    ? (artifacts || []).find((a) => (a.path || a.filename) === runner.loaded_file)?.name
+      || runner.loaded_file.split('/').pop()?.replace(/\.gguf$/i, '')
+      || ''
+    : ''
 
   const [name, setName] = useState('')
   const [endpointUrl, setEndpointUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [contextLimit, setContextLimit] = useState(4096)
-  const [maxTokens, setMaxTokens] = useState(1024)
+  const [maxTokens, setMaxTokens] = useState(2048)
   const [published, setPublished] = useState(true)
   // backendModel is what the backend server is sent in the OpenAI "model"
   // field. It defaults to the display name; a multi-model server needs the
@@ -332,6 +371,10 @@ export const Settings: React.FC = () => {
 
   // Storage & Popular Models
   const [storageInfo, setStorageInfo] = useState<{ configured: boolean; used_bytes?: number; budget_bytes?: number; read_only?: boolean } | null>(null)
+  const [budgetGB, setBudgetGB] = useState('')
+  const [savingBudget, setSavingBudget] = useState(false)
+  const [budgetMsg, setBudgetMsg] = useState('')
+  const budgetHydrated = useRef(false)
   const [popularCategory, setPopularCategory] = useState<string>('All')
   const [hfResolveInput, setHfResolveInput] = useState<string>('')
   const [hfResolveMsg, setHfResolveMsg] = useState<string>('')
@@ -502,7 +545,31 @@ export const Settings: React.FC = () => {
       if (hwRes.ok) setHardware(await hwRes.json())
 
       const rRes = await api('/api/v1/managed-models/runner-health')
-      if (rRes.ok) setRunner(await rRes.json())
+      if (rRes.ok) {
+        const nextRunner = await rRes.json()
+        setRunner(nextRunner)
+        // Seed the advanced fields from the settings the runner is actually
+        // using, but only once a model is loaded: with an idle runner every
+        // number reads back as zero, which would show "0 threads" and then be
+        // rejected by this form's own validation. Hydration is a one-shot so
+        // polling never overwrites what the user is typing.
+        if (!managedConfigHydrated.current && Number(nextRunner.context_limit) > 0) {
+          setManagedContextLimit(Number(nextRunner.context_limit))
+          if (Number(nextRunner.threads) > 0) setManagedThreads(Number(nextRunner.threads))
+          // The dropdown only offers auto / 0 / custom, so any other layer
+          // count has to arrive as "custom" or the select would render blank.
+          if (nextRunner.gpu_layers == null) {
+            setManagedGpuLayers('auto')
+          } else if (Number(nextRunner.gpu_layers) === 0) {
+            setManagedGpuLayers('0')
+          } else {
+            setManagedGpuLayers('custom')
+            setManagedCustomGpuLayers(String(nextRunner.gpu_layers))
+          }
+          setManagedExtraArgs(JSON.stringify(nextRunner.extra_args ?? [], null, 2))
+          managedConfigHydrated.current = true
+        }
+      }
 
       const artRes = await api('/api/v1/managed-models/artifacts')
       if (artRes.ok) {
@@ -512,7 +579,14 @@ export const Settings: React.FC = () => {
 
       const sRes = await api('/api/v1/managed-models/storage')
       if (sRes.ok) {
-        setStorageInfo(await sRes.json())
+        const storage = await sRes.json()
+        setStorageInfo(storage)
+        // Seeded once, so the field is not rewritten under someone typing in
+        // it every time this polls.
+        if (!budgetHydrated.current && Number(storage.budget_bytes) > 0) {
+          setBudgetGB(String(Math.round(Number(storage.budget_bytes) / (1024 * 1024 * 1024))))
+          budgetHydrated.current = true
+        }
       }
     } catch {
       // ignore
@@ -527,6 +601,45 @@ export const Settings: React.FC = () => {
     fetchSetupInfo()
     fetchLocalAPIToken()
   }, [])
+
+  // Keep the picker pointed at something real: the model the runner is
+  // already serving when there is one, otherwise the first on disk.
+  useEffect(() => {
+    if ((artifacts || []).length === 0) {
+      setSelectedArtifactID('')
+      return
+    }
+    setSelectedArtifactID((prev) => {
+      if (prev && artifacts.some((a) => a.id === prev)) return prev
+      const loaded = artifacts.find((a) => (a.path || a.filename) === runner?.loaded_file)
+      return (loaded || artifacts[0]).id
+    })
+  }, [artifacts, runner?.loaded_file])
+
+  // A model's own context limit is the right default for it. The engine's
+  // live value wins for the model already loaded, and this deliberately does
+  // not re-run on every keystroke, so a typed value survives polling.
+  useEffect(() => {
+    const artifact = (artifacts || []).find((a) => a.id === selectedArtifactID)
+    if (!artifact) return
+    if ((artifact.path || artifact.filename) === runner?.loaded_file && Number(runner?.context_limit) > 0) return
+    setManagedContextLimit(artifact.context_limit || 4096)
+  }, [selectedArtifactID])
+
+  const handleSelectArtifact = (id: string) => {
+    setSelectedArtifactID(id)
+    setLoadError('')
+    setLoadSuccess('')
+    setManagedConfigError('')
+  }
+
+  // Downloaded weights are handed to the loader rather than started from the
+  // download list: loading is the other section's job.
+  const handleRevealInLoader = (artifact: ArtifactManifest) => {
+    handleSelectArtifact(artifact.id)
+    document.getElementById('model-loader')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    document.getElementById('model-loader-select')?.focus({ preventScroll: true })
+  }
 
   const handleAddModel = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -763,6 +876,34 @@ export const Settings: React.FC = () => {
     }
   }
 
+  const handleSaveBudget = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setBudgetMsg('')
+    const gb = Number(budgetGB)
+    if (!Number.isFinite(gb) || gb <= 0) {
+      setBudgetMsg('Enter a limit of at least 1 GB.')
+      return
+    }
+    try {
+      setSavingBudget(true)
+      const res = await api('/api/v1/managed-models/storage', {
+        method: 'POST',
+        body: JSON.stringify({ budget_bytes: Math.round(gb * 1024 * 1024 * 1024) }),
+      })
+      if (!res.ok) {
+        setBudgetMsg((await res.text()) || 'Could not save the storage limit.')
+        return
+      }
+      setStorageInfo(await res.json())
+      setBudgetMsg('Saved.')
+      setTimeout(() => setBudgetMsg(''), 4000)
+    } catch (err: any) {
+      setBudgetMsg(err.message || 'Could not save the storage limit.')
+    } finally {
+      setSavingBudget(false)
+    }
+  }
+
   const handleDownloadArtifact = async (e: React.FormEvent) => {
     e.preventDefault()
     await startDownloadJob(dlUrl, dlFilename, dlSha)
@@ -813,6 +954,38 @@ export const Settings: React.FC = () => {
 
   const handleLoadArtifactIntoRunner = async (artifact: ArtifactManifest) => {
     setLoadError('')
+    setLoadSuccess('')
+    setManagedConfigError('')
+    const selectedContext = Number(managedContextLimit) || artifact.context_limit || 4096
+    if (!Number.isInteger(selectedContext) || selectedContext < 256) {
+      setManagedConfigError('Context window must be a whole number of at least 256 tokens.')
+      return
+    }
+    if (!Number.isInteger(managedThreads) || managedThreads < 1) {
+      setManagedConfigError('CPU threads must be a positive whole number.')
+      return
+    }
+    const calculatedMaxTokens = Math.min(4096, Math.max(256, Math.floor(selectedContext / 2)), selectedContext)
+    let extraArgs: string[] = []
+    try {
+      const parsed = JSON.parse(managedExtraArgs)
+      if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== 'string')) {
+        throw new Error('Extra arguments must be a JSON array of strings.')
+      }
+      extraArgs = parsed
+    } catch (err: any) {
+      setManagedConfigError(err.message || 'Extra arguments must be valid JSON.')
+      return
+    }
+    const gpuLayers = managedGpuLayers === 'auto' ? undefined : Number(managedGpuLayers === 'custom' ? managedCustomGpuLayers : managedGpuLayers)
+    if (gpuLayers !== undefined && (!Number.isInteger(gpuLayers) || gpuLayers < 0)) {
+      setManagedConfigError('GPU offload must be Auto or a non-negative whole number of layers.')
+      return
+    }
+    // The request is held open until the engine reports healthy, which for a
+    // large model is a minute or more, so the button and the panel below it
+    // show the wait instead of looking inert.
+    setLoadingModelID(artifact.id)
     try {
       const res = await api('/api/v1/managed-models/load', {
         method: 'POST',
@@ -823,12 +996,12 @@ export const Settings: React.FC = () => {
           model_id: artifact.id,
           name: artifact.name,
           filename: artifact.path || artifact.filename,
-          context_limit: artifact.context_limit || 4096,
-          max_tokens: 1024,
-          threads: 4,
-          // gpu_layers is deliberately omitted: the runner holds the GPU and
-          // offloads every layer when it has one.
-          published: true,
+          context_limit: selectedContext,
+          max_tokens: calculatedMaxTokens,
+          threads: Number(managedThreads) || 4,
+          ...(gpuLayers !== undefined ? { gpu_layers: gpuLayers } : {}),
+          extra_args: extraArgs,
+          published: models.find((model) => model.id === artifact.id)?.published ?? true,
         }),
       })
       if (res.ok) {
@@ -836,11 +1009,17 @@ export const Settings: React.FC = () => {
         // reflects it immediately.
         await fetchModels()
         await fetchHardwareAndRunner()
+        setLoadSuccess(`${artifact.name} is loaded and serving.`)
+        // The runner status tab is where the freshly started engine can
+        // actually be watched, so the load ends there.
+        setActiveTab('status')
       } else {
         setLoadError(await res.text())
       }
     } catch (err: any) {
       setLoadError(err.message)
+    } finally {
+      setLoadingModelID('')
     }
   }
 
@@ -848,6 +1027,8 @@ export const Settings: React.FC = () => {
     try {
       const res = await api('/api/v1/managed-models/unload', { method: 'POST', body: '{}' })
       if (res.ok) {
+        setLoadSuccess('')
+        setLoadError('')
         await fetchModels()
         await fetchHardwareAndRunner()
       }
@@ -876,7 +1057,57 @@ export const Settings: React.FC = () => {
   }
 
   return (
-    <div>
+    <div className="settings-page">
+      <div className="settings-intro">
+        <div>
+          <span className="settings-eyebrow">NODE SETTINGS</span>
+          <h1>Make this node yours</h1>
+          <p>Manage your runner, model library, connected endpoints, and sharing controls from one place.</p>
+        </div>
+        <span className={`settings-status-pill${runner?.status === 'ready' || runner?.status === 'idle' ? ' is-ready' : ''}`}>
+          <span aria-hidden="true">●</span>{' '}
+          {!runner?.configured ? 'No managed runner' : `Runner ${runner.status || 'unknown'}`}
+        </span>
+      </div>
+      <nav className="settings-tabs" aria-label="Settings sections" role="tablist">
+        {([
+          ['status', 'Runner status', 'Live model and queue'],
+          ['managed', 'Managed models', 'Library and llama.cpp'],
+          ['connected', 'Connected models', 'External endpoints'],
+          ['hosting', 'Hosting', 'Limits and contributions'],
+          ['access', 'Access & API', 'Pairing and compatibility'],
+        ] as [SettingsTab, string, string][]).map(([id, label, description]) => (
+          <button
+            key={id}
+            id={`settings-tab-${id}`}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === id}
+            aria-controls={`settings-panel-${id}`}
+            tabIndex={activeTab === id ? 0 : -1}
+            className={`settings-tab ${activeTab === id ? 'active' : ''}`}
+            onClick={() => setActiveTab(id)}
+            onKeyDown={(event) => {
+              if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return
+              event.preventDefault()
+              const ids: SettingsTab[] = ['status', 'managed', 'connected', 'hosting', 'access']
+              const next = ids[(ids.indexOf(id) + (event.key === 'ArrowRight' ? 1 : ids.length - 1)) % ids.length]
+              setActiveTab(next)
+              document.getElementById(`settings-tab-${next}`)?.focus()
+            }}
+          >
+            <span>{label}</span><small>{description}</small>
+          </button>
+        ))}
+      </nav>
+      <div className="settings-tab-panels">
+      {activeTab === 'status' && (
+        <section id="settings-panel-status" role="tabpanel" aria-labelledby="settings-tab-status" tabIndex={0}>
+          <RunnerStatus modelNames={Object.fromEntries(models.map((model) => [model.id, model.name]))} />
+        </section>
+      )}
+      {activeTab === 'access' && (
+      <section id="settings-panel-access" role="tabpanel" aria-labelledby="settings-tab-access" tabIndex={0}>
       {/* Device Access Section */}
       <div className="card">
         <h2>📱 Connect Another Device</h2>
@@ -946,7 +1177,6 @@ export const Settings: React.FC = () => {
           </div>
         </form>
       </div>
-
       {/* Local API token for OpenAI-compatible clients */}
       <div className="card">
         <h2>🔑 Local API Token</h2>
@@ -998,7 +1228,24 @@ export const Settings: React.FC = () => {
         </div>
       </div>
 
+      {/* Local compatibility details stay with access credentials. */}
+      <div className="card">
+        <h2>Local Compatibility Endpoint</h2>
+        <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginBottom: '1rem' }}>
+          Connect OpenAI-compatible tools to this Woolwire instance.
+        </p>
+        <div className="settings-code-block">
+          <div><strong>Base URL:</strong> <code>http://127.0.0.1:7070/v1</code></div>
+          <div><strong>Chat Completions:</strong> <code>POST /v1/chat/completions</code></div>
+          <div><strong>Models List:</strong> <code>GET /v1/models</code></div>
+        </div>
+      </div>
+      </section>
+      )}
+
       {/* Hardware & Managed Deployment Section */}
+      {activeTab === 'managed' && (
+      <section id="settings-panel-managed" role="tabpanel" aria-labelledby="settings-tab-managed" tabIndex={0}>
       <div className="card">
         <h2>Hardware & Deployment Profile</h2>
         <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginBottom: '1.25rem' }}>
@@ -1038,7 +1285,7 @@ export const Settings: React.FC = () => {
               <div style={{ fontSize: '1rem', fontWeight: 600 }}>
                 {runner?.configured ? (
                   <span style={{ color: runner.status === 'ready' ? 'var(--accent-success)' : runner.status === 'error' ? 'var(--accent-error, #d9534f)' : 'var(--accent-primary)' }}>
-                    {runner.status.toUpperCase()} {runner.loaded_file ? `(${runner.loaded_file})` : ''}
+                    {runner.status.toUpperCase()}{loadedModelName ? ` (${loadedModelName})` : ''}
                   </span>
                 ) : (
                   <span style={{ color: 'var(--text-secondary)' }}>Not Configured</span>
@@ -1052,100 +1299,223 @@ export const Settings: React.FC = () => {
             </div>
           </div>
         )}
+      </div>
 
-        {/* Managed GGUF Artifacts (Only shown if managed runner is configured) */}
-        {runner?.configured && (
-          <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '1.25rem' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-              <h3 style={{ fontSize: '1rem' }}>Available GGUF Models ({(artifacts || []).length})</h3>
-              {runner?.loaded_model_id && (
-                <button className="btn btn-secondary" style={{ padding: '0.35rem 0.75rem', fontSize: '0.85rem' }} onClick={handleUnloadRunner}>
-                  Unload Current Model
-                </button>
-              )}
-            </div>
+      {/* Loading a model is its own job: pick one of the models on disk, set
+          the launch parameters, then start the engine. Downloading weights is
+          a different job and lives in its own card below. */}
+      <div className="card" id="model-loader">
+        <h2>Load a Model</h2>
+        <p className="settings-lede">
+          Choose one of the GGUF models on this node, set how it should run, and start the
+          engine. Loading replaces whatever the runner is serving now.
+        </p>
 
+        {!runner?.configured ? (
+          <p className="settings-muted">
+            No managed runner is attached to this node, so models cannot be loaded here.
+            Downloading weights still works from the section below.
+          </p>
+        ) : (artifacts || []).length === 0 ? (
+          <p className="settings-muted">
+            No GGUF language models found in the models directory. Woolwire scans it, including
+            a Hugging Face cache laid out as <code>hub/models--org--repo/snapshots/...</code>, so
+            pointing it at weights you already have is enough. You can also download models in
+            the section below — those are written into that same cache layout, so other tools on
+            this machine find them too.
+          </p>
+        ) : (
+          <>
             {loadError && (
               <div className="alert alert-error" style={{ fontSize: '0.8rem', overflowWrap: 'anywhere', marginBottom: '1rem' }}>
                 {loadError}
               </div>
             )}
-
-            {(artifacts || []).length === 0 ? (
-              <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '1.5rem' }}>
-                No GGUF language models found in the models directory. Woolwire scans it, including
-                a Hugging Face cache laid out as <code>hub/models--org--repo/snapshots/...</code>, so
-                pointing it at weights you already have is enough. You can also download GGUF models
-                directly via HTTPS below — those are written into that same cache layout, so other
-                tools on this machine find them too.
-              </p>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginBottom: '1.5rem' }}>
-                {(artifacts || []).map((a) => (
-                  <div
-                    key={a.id}
-                    style={{
-                      display: 'flex',
-                      justifyContent: 'space-between',
-                      alignItems: 'center',
-                      padding: '0.75rem 1rem',
-                      backgroundColor: 'var(--bg-primary)',
-                      borderRadius: 'var(--radius)',
-                      border: '1px solid var(--border-color)',
-                    }}
-                  >
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ fontWeight: 600 }}>{a.name}</div>
-                      <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                        {a.repo_id && <>{a.repo_id} &bull; </>}
-                        {(a.size_bytes / (1024 * 1024 * 1024)).toFixed(2)} GB
-                        {a.architecture && <> &bull; {a.architecture}</>}
-                        <> &bull; {(a.context_limit / 1024).toFixed(0)}k ctx</>
-                        {a.sha256 && <> &bull; SHA-256: {a.sha256.slice(0, 16)}...</>}
-                      </div>
-                      <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', opacity: 0.75, overflowWrap: 'anywhere' }}>
-                        {a.source === 'cache' ? 'found in models directory: ' : ''}{a.path || a.filename}
-                      </div>
-                      {(a.companions || []).length > 0 && (
-                        <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', opacity: 0.85 }}>
-                          loads with{' '}
-                          {(a.companions || [])
-                            .map((c) => (c.kind === 'projector' ? `vision projector (${c.filename})` : `MTP draft module (${c.filename})`))
-                            .join(' and ')}
-                        </div>
-                      )}
-                    </div>
-
-                    <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexShrink: 0 }}>
-                      {runner?.loaded_file === (a.path || a.filename) ? (
-                        <span className="badge" style={{ backgroundColor: 'var(--accent-success)' }}>Loaded Active</span>
-                      ) : (
-                        <button
-                          className="btn btn-primary"
-                          style={{ padding: '0.35rem 0.75rem', fontSize: '0.85rem' }}
-                          onClick={() => handleLoadArtifactIntoRunner(a)}
-                          disabled={!runner?.configured}
-                        >
-                          Load
-                        </button>
-                      )}
-                      {a.source !== 'cache' && (
-                        <button
-                          className="btn btn-secondary"
-                          style={{ padding: '0.35rem 0.75rem', fontSize: '0.85rem' }}
-                          onClick={() => handleDeleteArtifact(a)}
-                        >
-                          Delete
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                ))}
+            {loadSuccess && (
+              <div className="alert alert-success" style={{ fontSize: '0.85rem', marginBottom: '1rem' }}>
+                {loadSuccess}
               </div>
             )}
 
+            <div className="form-group">
+              <label htmlFor="model-loader-select">Downloaded model</label>
+              <select
+                id="model-loader-select"
+                className="form-control"
+                value={selectedArtifactID}
+                onChange={(event) => handleSelectArtifact(event.target.value)}
+                disabled={loadingModel}
+              >
+                {(artifacts || []).map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name}
+                    {' — '}
+                    {(a.size_bytes / (1024 * 1024 * 1024)).toFixed(2)} GB
+                    {a.architecture ? ` · ${a.architecture}` : ''}
+                    {runner?.loaded_file === (a.path || a.filename) ? ' · loaded now' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="settings-grid settings-grid-3">
+              <div className="form-group">
+                <label htmlFor="managed-context">Context window</label>
+                <input
+                  id="managed-context"
+                  className="form-control"
+                  type="number"
+                  min={256}
+                  step={256}
+                  value={managedContextLimit}
+                  onChange={(event) => setManagedContextLimit(Number(event.target.value))}
+                  disabled={loadingModel}
+                  aria-describedby="managed-context-help"
+                />
+                <small id="managed-context-help">Tokens the engine keeps in memory. Larger windows cost more RAM or VRAM.</small>
+              </div>
+              <div className="form-group">
+                <label htmlFor="managed-threads">CPU threads</label>
+                <input
+                  id="managed-threads"
+                  className="form-control"
+                  type="number"
+                  min={1}
+                  value={managedThreads}
+                  onChange={(event) => setManagedThreads(Number(event.target.value))}
+                  disabled={loadingModel}
+                  aria-describedby="managed-threads-help"
+                />
+                <small id="managed-threads-help">
+                  {hardware?.cpu_cores ? `This machine reports ${hardware.cpu_cores} cores.` : 'Used for layers that stay on the CPU.'}
+                </small>
+              </div>
+              <div className="form-group">
+                <label htmlFor="managed-gpu-layers">GPU offload</label>
+                <select
+                  id="managed-gpu-layers"
+                  className="form-control"
+                  value={managedGpuLayers}
+                  onChange={(event) => setManagedGpuLayers(event.target.value)}
+                  disabled={loadingModel}
+                  aria-describedby="managed-gpu-help"
+                >
+                  <option value="auto">Auto (recommended)</option>
+                  <option value="0">CPU only (0 layers)</option>
+                  <option value="custom">Custom…</option>
+                </select>
+                {managedGpuLayers === 'custom' && (
+                  <input
+                    className="form-control"
+                    type="number"
+                    min={0}
+                    aria-label="Custom GPU layers"
+                    value={managedCustomGpuLayers}
+                    onChange={(event) => setManagedCustomGpuLayers(event.target.value)}
+                    disabled={loadingModel}
+                    style={{ marginTop: '0.35rem' }}
+                  />
+                )}
+                <small id="managed-gpu-help">
+                  {gpuAvailable ? 'Auto sizes the offload to free VRAM on the runner.' : 'No GPU is attached to the runner; layers stay on the CPU.'}
+                </small>
+              </div>
+            </div>
+
+            <details className="settings-advanced-panel model-loader-advanced">
+              <summary>Advanced llama.cpp arguments</summary>
+              <div className="form-group" style={{ marginTop: '0.75rem' }}>
+                <label htmlFor="managed-extra-args">Extra arguments</label>
+                <textarea
+                  id="managed-extra-args"
+                  className="form-control settings-code-input"
+                  rows={3}
+                  value={managedExtraArgs}
+                  onChange={(event) => setManagedExtraArgs(event.target.value)}
+                  disabled={loadingModel}
+                  aria-describedby="managed-extra-help"
+                />
+                <small id="managed-extra-help">
+                  JSON array of strings, for example <code>[&quot;--no-mmap&quot;]</code>. Woolwire validates each item before sending it to the runner.
+                </small>
+              </div>
+            </details>
+
+            {managedConfigError && <div className="alert alert-error" role="alert" style={{ fontSize: '0.8rem' }}>{managedConfigError}</div>}
+
+            <div className="model-loader-actions">
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => selectedArtifact && handleLoadArtifactIntoRunner(selectedArtifact)}
+                disabled={loadingModel || !selectedArtifact}
+              >
+                {loadingModel ? (
+                  <>
+                    <span className="model-loader-spinner" aria-hidden="true" />
+                    Loading…
+                  </>
+                ) : selectedIsLoaded ? (
+                  'Reload Model'
+                ) : (
+                  'Load Model'
+                )}
+              </button>
+              {runner?.loaded_model_id && (
+                <button type="button" className="btn btn-secondary" onClick={handleUnloadRunner} disabled={loadingModel}>
+                  Unload current model
+                </button>
+              )}
+              {selectedArtifact && selectedArtifact.source !== 'cache' && (
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ color: 'var(--accent-danger)' }}
+                  onClick={() => handleDeleteArtifact(selectedArtifact)}
+                  disabled={loadingModel}
+                >
+                  Delete weights
+                </button>
+              )}
+              {selectedIsLoaded && !loadingModel && (
+                <span className="badge" style={{ backgroundColor: 'var(--accent-success)' }}>Loaded</span>
+              )}
+            </div>
+
+            {/* The load request does not return until the engine reports
+                healthy, so the wait is real and needs to be visible. */}
+            {loadingModel && (
+              <div className="model-loader-progress" role="status" aria-live="polite">
+                <div className="model-loader-bar"><span /></div>
+                <p>
+                  Starting llama.cpp with <strong>{loadingName}</strong> and waiting for it to report
+                  healthy. A large model can take a minute or two the first time it is read from disk.
+                </p>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Downloading weights is a separate function from loading them, so it
+          gets its own card rather than sitting under the model list. */}
+      <div className="card">
+        <h2>Download Models</h2>
+        <p className="settings-lede">
+          Fetch GGUF weights over HTTPS into this node's models directory. Downloads run in the
+          background on the server; a finished model shows up in the loader above.
+        </p>
+
+        {storageInfo && !storageInfo.configured && (
+          <p className="settings-muted">
+            No models directory is configured on this node, so downloads are unavailable.
+          </p>
+        )}
+
+        {storageInfo && storageInfo.configured && (
+          <>
             {/* Storage Usage Meter */}
-            {storageInfo && storageInfo.configured && storageInfo.budget_bytes && (
+            {storageInfo.budget_bytes ? (
               <div style={{ marginBottom: '1.5rem', padding: '0.85rem 1rem', backgroundColor: 'var(--bg-primary)', borderRadius: 'var(--radius)', border: '1px solid var(--border-color)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', marginBottom: '0.4rem' }}>
                   <span><strong>Model Storage Usage:</strong> {((storageInfo.used_bytes || 0) / (1024 * 1024 * 1024)).toFixed(2)} GB / {((storageInfo.budget_bytes || 0) / (1024 * 1024 * 1024)).toFixed(0)} GB</span>
@@ -1159,8 +1529,34 @@ export const Settings: React.FC = () => {
                 <div style={{ height: '8px', backgroundColor: 'var(--bg-secondary)', borderRadius: '4px', overflow: 'hidden' }}>
                   <div style={{ height: '100%', width: `${Math.min(100, (((storageInfo.used_bytes || 0) / (storageInfo.budget_bytes || 1)) * 100))}%`, backgroundColor: 'var(--accent-primary)', transition: 'width 0.3s ease' }} />
                 </div>
+
+                {/* The budget used to be a constant nobody could reach. How
+                    much disk this node gives models is the operator's call. */}
+                <form className="storage-budget" onSubmit={handleSaveBudget}>
+                  <label htmlFor="storage-budget-input">Storage limit</label>
+                  <input
+                    id="storage-budget-input"
+                    className="form-control"
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={budgetGB}
+                    onChange={(event) => setBudgetGB(event.target.value)}
+                    disabled={savingBudget}
+                    aria-describedby="storage-budget-help"
+                  />
+                  <span className="storage-budget__unit">GB</span>
+                  <button type="submit" className="btn btn-secondary" disabled={savingBudget}>
+                    {savingBudget ? 'Saving…' : 'Save limit'}
+                  </button>
+                  {budgetMsg && <span className="storage-budget__msg">{budgetMsg}</span>}
+                </form>
+                <div id="storage-budget-help" style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.35rem' }}>
+                  Lowering the limit below what is already installed blocks new downloads; it never
+                  deletes weights you already have.
+                </div>
               </div>
-            )}
+            ) : null}
 
             {/* Curated Popular Hugging Face Models Section */}
             <div style={{ marginBottom: '1.75rem', backgroundColor: 'var(--bg-primary)', padding: '1rem', borderRadius: 'var(--radius)', border: '1px solid var(--border-color)' }}>
@@ -1237,14 +1633,16 @@ export const Settings: React.FC = () => {
                             Loaded Active
                           </span>
                         ) : isInstalled ? (
+                          // Already on disk: loading is the loader's job, so this
+                          // hands the model to it rather than starting an engine
+                          // from inside the download list.
                           <button
                             type="button"
-                            className="btn btn-primary"
+                            className="btn btn-secondary"
                             style={{ flex: 1, padding: '0.35rem', fontSize: '0.8rem' }}
-                            onClick={() => installed && handleLoadArtifactIntoRunner(installed)}
-                            disabled={!runner?.configured}
+                            onClick={() => installed && handleRevealInLoader(installed)}
                           >
-                            Load Model
+                            Downloaded — select to load
                           </button>
                         ) : (
                           <>
@@ -1261,7 +1659,7 @@ export const Settings: React.FC = () => {
                               type="button"
                               className="btn btn-secondary"
                               style={{ padding: '0.35rem 0.5rem', fontSize: '0.8rem' }}
-                              title="Copy details to form below"
+                              title="Copy details to the custom download form below"
                               onClick={() => {
                                 setDlUrl(m.url)
                                 setDlFilename(m.filename)
@@ -1421,11 +1819,15 @@ export const Settings: React.FC = () => {
                   : 'Download & Verify GGUF'}
               </button>
             </form>
-          </div>
+          </>
         )}
       </div>
 
       {/* Hosted Models Section */}
+      </section>
+      )}
+      {activeTab === 'connected' && (
+      <section id="settings-panel-connected" role="tabpanel" aria-labelledby="settings-tab-connected" tabIndex={0}>
       <div className="card">
         <h2>External Hosted Models</h2>
         <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginBottom: '1.25rem' }}>
@@ -1702,6 +2104,10 @@ export const Settings: React.FC = () => {
       </div>
 
       {/* Host Limits Section */}
+      </section>
+      )}
+      {activeTab === 'hosting' && (
+      <section id="settings-panel-hosting" role="tabpanel" aria-labelledby="settings-tab-hosting" tabIndex={0}>
       <div className="card">
         <h2>Host Resource Limits</h2>
         <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginBottom: '1.25rem' }}>
@@ -1805,19 +2211,9 @@ export const Settings: React.FC = () => {
           </div>
         </label>
       </div>
+      </section>
+      )}
 
-      {/* Local Compatibility Section */}
-      <div className="card">
-        <h2>Local Compatibility Endpoint</h2>
-        <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginBottom: '1rem' }}>
-          Connect third-party tools (like Open WebUI, Continue.dev, or Python OpenAI SDK) to your Woolwire instance.
-        </p>
-
-        <div style={{ backgroundColor: 'var(--bg-primary)', padding: '1rem', borderRadius: 'var(--radius)', border: '1px solid var(--border-color)', fontSize: '0.9rem' }}>
-          <div><strong>Base URL:</strong> <code>http://127.0.0.1:7070/v1</code></div>
-          <div style={{ marginTop: '0.5rem' }}><strong>Chat Completions:</strong> <code>POST /v1/chat/completions</code></div>
-          <div style={{ marginTop: '0.5rem' }}><strong>Models List:</strong> <code>GET /v1/models</code></div>
-        </div>
       </div>
     </div>
   )

@@ -88,7 +88,13 @@ func (s *Server) handleSaveHostedModel(w http.ResponseWriter, r *http.Request) {
 	}
 	maxTokens := body.MaxTokens
 	if maxTokens <= 0 {
-		maxTokens = 1024
+		maxTokens = contextLimit / 2
+		if maxTokens < 2048 && contextLimit >= 2048 {
+			maxTokens = 2048
+		}
+		if maxTokens > 4096 {
+			maxTokens = 4096
+		}
 	}
 
 	enabled := true

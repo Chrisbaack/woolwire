@@ -183,6 +183,10 @@ manage their own retention explicitly.
 - `GET /api/v1/managed-models/storage` reports configured status, usage, budget,
   and read-only status. Usage is zero if scanning fails; it is not a free-space
   guarantee.
+- `POST /api/v1/managed-models/storage` sets `budget_bytes`, the ceiling on
+  downloaded weights. It is persisted and applied immediately; a budget below
+  what is installed blocks new downloads rather than deleting anything. The
+  default is 50 GB.
 - `GET /api/v1/managed-models/huggingface?repo=org/repository` resolves public
   repository weight choices. The current route exposes only the repo query.
 - `POST /api/v1/managed-models/download` starts a job. Poll `/downloads` and use
@@ -255,6 +259,7 @@ parameters, security overrides, and individual responses.
 | `GET` | `/api/v1/catalog` | Models offered by this node and its peers |
 | `GET` | `/api/v1/managed-models/artifacts` | List available GGUF models |
 | `GET` | `/api/v1/managed-models/storage` | Read model storage usage, budget, and read-only status |
+| `POST` | `/api/v1/managed-models/storage` | Change the model storage budget |
 | `DELETE` | `/api/v1/managed-models/artifacts/{filename}` | Delete a downloaded weight file |
 | `POST` | `/api/v1/managed-models/download` | Start a background weight download |
 | `GET` | `/api/v1/managed-models/huggingface` | List the GGUF weights a Hugging Face repository publishes |

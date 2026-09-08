@@ -236,6 +236,19 @@ func (m *ArtifactManager) MaxBudget() int64 {
 	return m.maxBudget
 }
 
+// SetMaxBudget changes the ceiling on downloaded weights. A budget below what
+// is already installed is allowed: it stops further downloads rather than
+// deleting anything, which is what someone lowering it is asking for.
+func (m *ArtifactManager) SetMaxBudget(maxBudget int64) error {
+	if maxBudget <= 0 {
+		return errors.New("storage budget must be greater than zero")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.maxBudget = maxBudget
+	return nil
+}
+
 // DownloadArtifact fetches one model weight file. The storage budget is
 // reserved under the lock and then released; the multi-gigabyte transfer runs
 // with the lock free, so ListArtifacts and the metrics endpoint keep answering

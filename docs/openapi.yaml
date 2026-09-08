@@ -858,6 +858,40 @@ paths:
                   budget_bytes: { type: integer, format: int64 }
                   read_only: { type: boolean }
         '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [models]
+      summary: Change the model storage budget
+      description: |
+        Sets the ceiling on weights Woolwire will download into the models
+        directory. The value is persisted and applied to the running manager,
+        so the next download is measured against it. A budget below what is
+        already installed is accepted: it blocks new downloads and never
+        deletes anything.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [budget_bytes]
+              properties:
+                budget_bytes: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '200':
+          description: The updated artifact storage status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [configured]
+                properties:
+                  configured: { type: boolean }
+                  used_bytes: { type: integer, format: int64 }
+                  budget_bytes: { type: integer, format: int64 }
+                  read_only: { type: boolean }
+        '400': { description: budget_bytes missing or not greater than zero. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { description: No artifact manager is configured on this node. }
 
   /api/v1/managed-models/artifacts/{filename}:
     delete:

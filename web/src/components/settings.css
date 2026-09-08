@@ -1,0 +1,64 @@
+.settings-page { max-width: 1180px; margin: 0 auto; }
+.settings-intro { display: flex; justify-content: space-between; align-items: flex-end; gap: 1rem; margin-bottom: 1.25rem; }
+.settings-intro h1 { margin: .2rem 0 .35rem; font-size: clamp(1.6rem, 3vw, 2.2rem); letter-spacing: -.03em; }
+.settings-intro p { margin: 0; color: var(--text-secondary); max-width: 42rem; }
+.settings-eyebrow { color: var(--accent-primary); font-size: .72rem; font-weight: 700; letter-spacing: .12em; }
+.settings-status-pill { border: 1px solid var(--border-color); border-radius: 999px; padding: .45rem .75rem; color: var(--text-secondary); text-transform: capitalize; white-space: nowrap; font-size: .82rem; }
+.settings-status-pill.is-ready { color: var(--accent-success); border-color: color-mix(in srgb, var(--accent-success) 45%, var(--border-color)); }
+.settings-tabs { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .5rem; border-bottom: 1px solid var(--border-color); margin-bottom: 1.25rem; }
+.settings-tab { appearance: none; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--text-secondary); text-align: left; padding: .7rem .8rem .8rem; cursor: pointer; border-radius: var(--radius) var(--radius) 0 0; }
+.settings-tab:hover, .settings-tab:focus-visible { background: var(--bg-secondary); color: var(--text-primary); outline: none; }
+.settings-tab.active { color: var(--text-primary); border-bottom-color: var(--accent-primary); }
+.settings-tab span { display: block; font-weight: 650; font-size: .88rem; }
+.settings-tab small { display: block; margin-top: .18rem; color: var(--text-secondary); font-size: .72rem; }
+.settings-tab-panels { min-width: 0; }
+.settings-grid { display: grid; gap: .85rem; }
+.settings-grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.settings-grid-span-full { grid-column: 1 / -1; }
+.settings-advanced-panel { margin: 0 0 1.25rem; padding: 1rem; border: 1px solid var(--border-color); border-radius: var(--radius); background: var(--bg-primary); }
+.settings-panel-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+.settings-panel-heading h3 { margin: 0 0 .25rem; font-size: 1rem; }
+.settings-panel-heading p, .settings-muted { color: var(--text-secondary); font-size: .8rem; margin: 0; }
+.settings-switch { display: inline-flex; align-items: center; gap: .45rem; font-size: .82rem; white-space: nowrap; cursor: pointer; }
+.settings-switch input { accent-color: var(--accent-primary); }
+.settings-code-input { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; }
+.settings-code-block { display: grid; gap: .45rem; background: var(--bg-primary); padding: 1rem; border-radius: var(--radius); border: 1px solid var(--border-color); font-size: .86rem; }
+.settings-advanced-panel small, .settings-grid .form-group small { display: block; margin-top: .35rem; color: var(--text-secondary); font-size: .72rem; }
+.settings-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.settings-lede { color: var(--text-secondary); font-size: .9rem; margin: 0 0 1.25rem; max-width: 46rem; }
+
+/* Model loader: pick a model, set how it runs, start the engine. */
+.model-loader-advanced { margin-top: 1rem; }
+.model-loader-advanced summary { cursor: pointer; font-size: .85rem; font-weight: 600; }
+.model-loader-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-top: 1.25rem; }
+.model-loader-actions .btn-primary { display: inline-flex; align-items: center; gap: .5rem; }
+.model-loader-spinner { width: .85rem; height: .85rem; border-radius: 50%; border: 2px solid currentColor; border-top-color: transparent; animation: model-loader-spin .8s linear infinite; }
+.model-loader-progress { margin-top: 1rem; padding: .85rem 1rem; border: 1px solid var(--border-color); border-radius: var(--radius); background: var(--bg-primary); }
+.model-loader-progress p { margin: .5rem 0 0; font-size: .8rem; color: var(--text-secondary); }
+.model-loader-bar { height: 4px; border-radius: 999px; background: var(--bg-secondary); overflow: hidden; }
+/* The engine reports healthy or it does not, so the wait has no percentage
+   to show; the bar says "still working" rather than guessing a fraction. */
+.model-loader-bar span { display: block; height: 100%; width: 35%; border-radius: 999px; background: var(--accent-primary); animation: model-loader-slide 1.4s ease-in-out infinite; }
+.storage-budget { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .85rem; }
+.storage-budget label { font-size: .8rem; font-weight: 600; }
+.storage-budget input { width: 6.5rem; }
+.storage-budget__unit { font-size: .8rem; color: var(--text-secondary); margin-left: -.15rem; }
+.storage-budget__msg { font-size: .78rem; color: var(--text-secondary); }
+.storage-budget .btn { padding: .35rem .75rem; font-size: .82rem; }
+@keyframes model-loader-spin { to { transform: rotate(360deg); } }
+@keyframes model-loader-slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(300%); } }
+@media (prefers-reduced-motion: reduce) {
+  .model-loader-spinner, .model-loader-bar span { animation: none; }
+  .model-loader-bar span { width: 100%; opacity: .5; }
+}
+@media (max-width: 800px) {
+  .settings-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .settings-grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .settings-grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+@media (max-width: 520px) {
+  .settings-intro { align-items: flex-start; flex-direction: column; }
+  .settings-tabs { grid-template-columns: 1fr; }
+  .settings-grid-4 { grid-template-columns: 1fr; }
+  .settings-grid-3 { grid-template-columns: 1fr; }
+}
