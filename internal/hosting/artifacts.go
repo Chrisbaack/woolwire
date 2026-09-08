@@ -264,6 +264,19 @@ func (m *ArtifactManager) DownloadArtifact(
 		return nil, errors.New("only .gguf model weights are accepted")
 	}
 
+	// Where the file belongs is settled before the transfer: the repository
+	// and the commit ride on the redirect Hugging Face answers with, not on
+	// the CDN response that carries the bytes.
+	var (
+		hfSrc  hfSource
+		hfMeta hfFileMetadata
+	)
+	if src, ok := m.parseHFSource(sourceURL); ok {
+		if meta, mErr := m.fetchHFMetadata(ctx, sourceURL, policy); mErr == nil {
+			hfSrc, hfMeta = src, meta
+		}
+	}
+
 	transferID := fmt.Sprintf("tr-%d-%s", time.Now().UnixNano(), cleanName)
 	stagingPath := filepath.Join(m.stagingDir, fmt.Sprintf("dl-%d-%s", time.Now().UnixNano(), cleanName))
 
@@ -346,13 +359,13 @@ func (m *ArtifactManager) DownloadArtifact(
 	}
 
 	m.mu.Lock()
-	finalPath := filepath.Join(m.modelsDir, cleanName)
-	renameErr := os.Rename(stagingPath, finalPath)
+	relPath, repoID, moveErr := m.placeDownload(stagingPath, cleanName, hfSrc, hfMeta, actualHash)
 	manifest := &ArtifactManifest{
-		ID:           "art-" + cleanName,
+		ID:           artifactIDFor(relPath, cleanName),
 		Name:         cleanName,
 		Filename:     cleanName,
-		Path:         cleanName,
+		Path:         relPath,
+		RepoID:       repoID,
 		Source:       SourceDownload,
 		SizeBytes:    totalDownloaded,
 		SHA256:       actualHash,
@@ -360,16 +373,47 @@ func (m *ArtifactManager) DownloadArtifact(
 		ContextLimit: 4096,
 		InstalledAt:  time.Now().Unix(),
 	}
-	if renameErr == nil {
+	if moveErr == nil {
 		_ = m.saveManifestLocked(manifest)
 		m.finishTransferLocked(transferID)
 	}
 	m.mu.Unlock()
 
-	if renameErr != nil {
-		return nil, fmt.Errorf("finalize model move: %w", renameErr)
+	if moveErr != nil {
+		return nil, fmt.Errorf("finalize model move: %w", moveErr)
 	}
 	return manifest, nil
+}
+
+// placeDownload moves a finished file to where it will live. Weights from a
+// Hugging Face repository go into the cache, where every other tool sharing
+// the models directory can find them; anything else lands as a flat file in
+// the models directory, which Woolwire itself still lists and loads.
+func (m *ArtifactManager) placeDownload(stagingPath, cleanName string, src hfSource, meta hfFileMetadata, sha256Hex string) (string, string, error) {
+	if placement, ok := planHFPlacement(src, meta, sha256Hex); ok && src.Repo != "" {
+		rel, err := m.commitToCache(stagingPath, placement)
+		if err == nil {
+			return rel, src.Repo, nil
+		}
+		if _, statErr := os.Stat(stagingPath); statErr != nil {
+			// The bytes are already in the cache, so there is nothing left to
+			// fall back with and the error is the whole story.
+			return "", "", err
+		}
+		// A cache that cannot be written — a permission, a filesystem with no
+		// symlinks — costs the layout, not the download.
+	}
+	return cleanName, "", os.Rename(stagingPath, filepath.Join(m.modelsDir, cleanName))
+}
+
+// artifactIDFor names a download. Weights in the cache are identified by their
+// path, the same way discovered weights are, so a model keeps one identity
+// whether or not its manifest outlives it.
+func artifactIDFor(relPath, cleanName string) string {
+	if relPath != cleanName {
+		return discoveredArtifactID(relPath)
+	}
+	return "art-" + cleanName
 }
 
 func (m *ArtifactManager) startTransfer(transferID, stagingPath string, reservation int64) error {
@@ -579,7 +623,11 @@ func (m *ArtifactManager) StartDownloadSet(req DownloadRequest) (string, error) 
 					break
 				}
 				completed += companionManifest.SizeBytes
-				installed = append(installed, ArtifactCompanion{Kind: c.Kind, Filename: c.Filename})
+				installed = append(installed, ArtifactCompanion{
+					Kind:     c.Kind,
+					Path:     companionManifest.Path,
+					Filename: c.Filename,
+				})
 
 				// A companion is not a model. Recording it as one would put a
 				// projector in the list of things to load.
@@ -721,16 +769,37 @@ func (m *ArtifactManager) DeleteArtifact(ref string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	manifestPath := filepath.Join(m.modelsDir, filepath.FromSlash(rel)+".manifest.json")
-	if _, err := os.Stat(manifestPath); err != nil {
+	manifestPath, ok := m.manifestPathLocked(rel)
+	if !ok {
 		return ErrNotManaged
 	}
 
-	if err := os.Remove(filepath.Join(m.modelsDir, filepath.FromSlash(rel))); err != nil && !os.IsNotExist(err) {
+	if strings.HasPrefix(rel, hfCacheDir+"/") {
+		// Inside the cache the weights are a snapshot entry pointing at a
+		// blob, and both go — but only once nothing else references them.
+		if err := m.removeFromCache(rel); err != nil {
+			return err
+		}
+	} else if err := os.Remove(filepath.Join(m.modelsDir, filepath.FromSlash(rel))); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	_ = os.Remove(manifestPath)
 	return nil
+}
+
+// manifestPathLocked finds the manifest recording one model, in either the
+// current location or the one used before models could live in a cache.
+func (m *ArtifactManager) manifestPathLocked(rel string) (string, bool) {
+	candidates := []string{
+		filepath.Join(m.modelsDir, filepath.FromSlash(manifestsDir), manifestNameFor(rel)),
+		filepath.Join(m.modelsDir, legacyManifestName(rel)),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c, true
+		}
+	}
+	return "", false
 }
 
 // ListArtifacts returns every model the runner could be asked to load: the
@@ -766,47 +835,74 @@ func (m *ArtifactManager) ListArtifacts() ([]ArtifactManifest, error) {
 	return manifests, nil
 }
 
-// installedArtifactsLocked reads the sidecar manifests Woolwire writes beside
-// the weights it downloads.
+// installedArtifactsLocked reads Woolwire's record of what it installed:
+// every manifest under .woolwire, and — for an install that predates the
+// cache layout — the sidecar manifests that used to sit beside the weights.
 func (m *ArtifactManager) installedArtifactsLocked() ([]ArtifactManifest, error) {
-	entries, err := os.ReadDir(m.modelsDir)
-	if err != nil {
-		return nil, err
-	}
-
 	manifests := make([]ArtifactManifest, 0)
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".manifest.json") {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(m.modelsDir, e.Name()))
-		if err != nil {
-			continue
-		}
-		var mf ArtifactManifest
-		if json.Unmarshal(b, &mf) != nil {
-			continue
-		}
-		// Manifests written before models could live in subdirectories carry
-		// only a filename.
-		if mf.Path == "" {
-			mf.Path = mf.Filename
-		}
-		if mf.Source == "" {
-			mf.Source = SourceDownload
-		}
+	for _, mf := range m.allManifestsLocked() {
 		// A projector or draft module is installed alongside a model and
 		// listed as part of it, never as something to load.
 		if mf.Role == RoleCompanion {
 			continue
 		}
-		// Check if weight file still exists
-		if _, statErr := os.Stat(filepath.Join(m.modelsDir, filepath.FromSlash(mf.Path))); statErr != nil {
-			continue
-		}
 		manifests = append(manifests, mf)
 	}
 	return manifests, nil
+}
+
+// allManifestsLocked reads every manifest whose weights are still on disk,
+// companions included. A manifest in the current location wins over a
+// leftover sidecar describing the same weights.
+func (m *ArtifactManager) allManifestsLocked() []ArtifactManifest {
+	locations := []struct {
+		dir    string
+		suffix string
+	}{
+		{filepath.Join(m.modelsDir, filepath.FromSlash(manifestsDir)), ".json"},
+		{m.modelsDir, ".manifest.json"},
+	}
+
+	manifests := make([]ArtifactManifest, 0)
+	seen := make(map[string]bool)
+	for _, loc := range locations {
+		entries, err := os.ReadDir(loc.dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), loc.suffix) {
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(loc.dir, e.Name()))
+			if err != nil {
+				continue
+			}
+			var mf ArtifactManifest
+			if json.Unmarshal(b, &mf) != nil || mf.Filename == "" {
+				continue
+			}
+			// Manifests written before models could live in subdirectories
+			// carry only a filename.
+			if mf.Path == "" {
+				mf.Path = mf.Filename
+			}
+			if mf.Source == "" {
+				mf.Source = SourceDownload
+			}
+			if seen[mf.Path] {
+				continue
+			}
+			// Weights that have been deleted out from under the manifest are
+			// not something to offer.
+			if _, statErr := os.Stat(filepath.Join(m.modelsDir, filepath.FromSlash(mf.Path))); statErr != nil {
+				continue
+			}
+			seen[mf.Path] = true
+			manifests = append(manifests, mf)
+		}
+	}
+	return manifests
 }
 
 // getUsedSpaceLocked counts finished weights and partially written staging
@@ -837,29 +933,38 @@ func (m *ArtifactManager) getUsedSpaceLocked() (int64, error) {
 // against it — a shared model cache is routinely larger than any budget worth
 // setting, and counting it would block every download.
 func (m *ArtifactManager) installedSizeLocked() (int64, error) {
-	entries, err := os.ReadDir(m.modelsDir)
-	if err != nil {
-		return 0, err
-	}
-
 	var total int64
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".manifest.json") {
+	// Two manifests can name one blob — a cache stores content once, however
+	// many revisions reference it — and the disk holds it once.
+	counted := make(map[string]bool)
+	for _, mf := range m.allManifestsLocked() {
+		abs := filepath.Join(m.modelsDir, filepath.FromSlash(mf.Path))
+		real, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			real = abs
+		}
+		if counted[real] {
 			continue
 		}
-		weight := strings.TrimSuffix(e.Name(), ".manifest.json")
-		if info, err := os.Stat(filepath.Join(m.modelsDir, weight)); err == nil {
+		counted[real] = true
+		if info, err := os.Stat(abs); err == nil {
 			total += info.Size()
 		}
 	}
 	return total, nil
 }
 
+// saveManifestLocked records what Woolwire installed. The record lives under
+// .woolwire rather than beside the weights, because the weights now live in a
+// cache that is shared with other tools.
 func (m *ArtifactManager) saveManifestLocked(mf *ArtifactManifest) error {
-	path := filepath.Join(m.modelsDir, mf.Filename+".manifest.json")
+	dir := filepath.Join(m.modelsDir, filepath.FromSlash(manifestsDir))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
 	b, err := json.MarshalIndent(mf, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o600)
+	return os.WriteFile(filepath.Join(dir, manifestNameFor(mf.Path)), b, 0o600)
 }

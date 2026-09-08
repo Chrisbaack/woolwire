@@ -1076,7 +1076,8 @@ export const Settings: React.FC = () => {
                 No GGUF language models found in the models directory. Woolwire scans it, including
                 a Hugging Face cache laid out as <code>hub/models--org--repo/snapshots/...</code>, so
                 pointing it at weights you already have is enough. You can also download GGUF models
-                directly via HTTPS below.
+                directly via HTTPS below — those are written into that same cache layout, so other
+                tools on this machine find them too.
               </p>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginBottom: '1.5rem' }}>

@@ -1173,10 +1173,14 @@ func (s *Server) StartBackground() {
 	s.bgCancel = cancel
 	s.mu.Unlock()
 
-	s.bgWG.Add(3)
+	s.bgWG.Add(4)
 	go func() {
 		defer s.bgWG.Done()
 		s.membershipLoop(ctx)
+	}()
+	go func() {
+		defer s.bgWG.Done()
+		s.migrateArtifacts(ctx)
 	}()
 	go func() {
 		defer s.bgWG.Done()

@@ -89,6 +89,12 @@ applicable, SELinux labeling. The managed app reads/writes the models mount;
 the runner reads it only. If you deliberately mount the app's models read-only,
 existing models remain usable but downloading is disabled.
 
+Pointing `WOOLWIRE_MODELS` at an existing `HF_HOME` is the intended case: the
+directory holding `hub/` is read as-is, and downloads are written into it in
+the same layout, under `hub/models--org--repo/`. Woolwire's own bookkeeping
+stays out of the cache, in `.woolwire/`, and it never deletes weights it did
+not install.
+
 ## In-app host limits
 
 `GET` and `POST /api/v1/host-limits` use these **PascalCase** keys, reflecting the

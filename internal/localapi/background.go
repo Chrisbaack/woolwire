@@ -26,6 +26,11 @@ const (
 	// offline to itself while it is running.
 	catalogRefreshInterval = 30 * time.Second
 
+	// artifactMigrationTimeout bounds the one-shot move of flat downloads
+	// into the cache layout. The work is a handful of HEAD requests and a
+	// rename each; anything longer means the network is not answering.
+	artifactMigrationTimeout = 2 * time.Minute
+
 	retentionInterval = time.Hour
 	// retentionWindow and retentionByteCap are the documented community
 	// retention policy: thirty days or 250 MiB, whichever binds first.
@@ -66,6 +71,22 @@ func (s *Server) catalogLoop(ctx context.Context) {
 			s.advertiseLocalModels()
 		}
 	}
+}
+
+// migrateArtifacts files weights an earlier Woolwire downloaded as bare files
+// into the Hugging Face cache layout, so that everything else on the machine
+// can find them. It runs once per start and is idempotent: with nothing left
+// to move it reads a few manifests and stops.
+//
+// It runs in the background rather than at startup because it needs the
+// network — the commit a file was served from is only knowable by asking.
+func (s *Server) migrateArtifacts(ctx context.Context) {
+	if s.artifactMgr == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, artifactMigrationTimeout)
+	defer cancel()
+	_, _ = s.artifactMgr.MigrateFlatDownloads(ctx)
 }
 
 func (s *Server) retentionLoop(ctx context.Context) {

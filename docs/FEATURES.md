@@ -89,6 +89,16 @@ is understood without reorganizing it. Discovery reads GGUF headers, skips
 non-language-model weights, and groups split models by their first shard.
 Nearby projector and draft/MTP companion files are associated with the model.
 
+Downloads are written in the same Hugging Face cache layout they are read from:
+the bytes become `hub/models--org--repo/blobs/<etag>`, the snapshot entry
+`snapshots/<commit>/<file>` is a symlink to them, and `refs/<branch>` records
+the commit. Anything else on the machine built on `huggingface_hub` — Unsloth
+Studio, `llama-cli`, a training script — then finds the same weights without a
+second copy. A download whose URL names no repository, such as a mirror or a
+direct link, lands as a plain file in the models directory instead. Weights an
+earlier version of Woolwire downloaded flat are filed into the layout once, in
+the background, on the next start.
+
 Downloads run as jobs with progress and cancellation. A supplied SHA-256 is
 checked. A digest identifies file content; it does not establish that a model
 is safe or that its license allows your intended use. Discovery does not hash
