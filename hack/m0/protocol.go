@@ -404,4 +404,3 @@ func PeerClientTLSConfig(credential PeerCredential, device DeviceState, authorit
 		},
 	}, nil
 }
-

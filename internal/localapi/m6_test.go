@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cbaack/woolwire/internal/store"
-	"github.com/cbaack/woolwire/internal/transport"
+	"github.com/Chrisbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/transport"
 )
 
 func TestM6MetricsEndpoint(t *testing.T) {

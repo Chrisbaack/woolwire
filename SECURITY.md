@@ -6,16 +6,27 @@ support window. See [validation status](docs/STATUS.md) for outstanding work.
 
 ## Reporting a vulnerability
 
-Do not put an exploit containing real credentials, invitations, private chat
-content, or databases in a public issue. A dedicated private reporting channel
-has not yet been configured. If the repository offers **Security → Report a
-vulnerability**, use it. Otherwise ask the maintainer for a private contact
-channel with a minimal, non-sensitive description before sending details.
+Report privately through GitHub rather than in a public issue or pull request.
+Open the repository's **Security** tab and choose **Report a vulnerability**, or
+go straight to
+[the new advisory form](https://github.com/Chrisbaack/woolwire/security/advisories/new).
+That creates a private draft advisory readable only by you and the maintainer,
+and it keeps the report, the fix, and the eventual disclosure in one thread.
 
-Include the affected commit, deployment mode, steps to reproduce using synthetic
-data, impact, and any suggested fix. No response-time or bounty program is
-currently promised. Enabling and publishing the private reporting route is a
-[publication task](docs/PUBLISHING.md).
+If that form is not available to you, open a public issue stating only that you
+have a security report and asking for a private channel. Put no details, no
+reproduction steps, and no output in that issue.
+
+A useful private report includes the affected commit, the deployment mode (base,
+managed, or native), steps to reproduce using synthetic data, the impact you
+believe it has, and any suggested fix. Do not attach real credentials,
+invitations, private chat content, or database files; see
+[before sharing diagnostics](#before-sharing-diagnostics).
+
+This is a single-maintainer project. There is no response-time commitment, no
+bounty program, and no security support window; reports are handled on a
+best-effort basis. Please leave time for a fix before disclosing publicly. No
+fixed embargo applies, so agree on disclosure timing in the advisory thread.
 
 ## Trust boundaries
 

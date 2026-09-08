@@ -11,12 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/catalog"
-	"github.com/cbaack/woolwire/internal/hosting"
-	"github.com/cbaack/woolwire/internal/identity"
-	"github.com/cbaack/woolwire/internal/peerapi"
-	"github.com/cbaack/woolwire/internal/room"
-	"github.com/cbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/catalog"
+	"github.com/Chrisbaack/woolwire/internal/hosting"
+	"github.com/Chrisbaack/woolwire/internal/identity"
+	"github.com/Chrisbaack/woolwire/internal/peerapi"
+	"github.com/Chrisbaack/woolwire/internal/room"
+	"github.com/Chrisbaack/woolwire/internal/store"
 )
 
 func (s *Server) handleListHostedModels(w http.ResponseWriter, r *http.Request) {

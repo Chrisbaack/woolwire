@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/identity"
+	"github.com/Chrisbaack/woolwire/internal/identity"
 )
 
 type EventType string
@@ -25,14 +25,14 @@ const (
 )
 
 type Event struct {
-	ID             string    `json:"id"`
-	RoomID         string    `json:"room_id"`
-	ChannelID      string    `json:"channel_id"`
-	AuthorMemberID string    `json:"author_member_id"`
-	AuthorSeq      int64     `json:"author_seq"`
-	EventType      EventType `json:"event_type"`
-	TargetEventID  string    `json:"target_event_id,omitempty"`
-	Content        string    `json:"content"`
+	ID               string    `json:"id"`
+	RoomID           string    `json:"room_id"`
+	ChannelID        string    `json:"channel_id"`
+	AuthorMemberID   string    `json:"author_member_id"`
+	AuthorSeq        int64     `json:"author_seq"`
+	EventType        EventType `json:"event_type"`
+	TargetEventID    string    `json:"target_event_id,omitempty"`
+	Content          string    `json:"content"`
 	Timestamp        int64     `json:"timestamp"`
 	Signature        string    `json:"signature"`
 	ReplicatedStatus string    `json:"replicated_status,omitempty"`

@@ -1,0 +1,118 @@
+name: CI
+
+# The checks CONTRIBUTING.md asks contributors to run, on every push to the
+# default branch and every pull request. Real-network acceptance
+# (test/integration) is deliberately excluded: it needs public relay
+# infrastructure and minutes, and is run deliberately, not per commit.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend build and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm --prefix web ci
+
+      - name: Build
+        run: npm --prefix web run build
+
+      - name: Committed web/dist matches the build
+        run: |
+          if ! git diff --quiet -- web/dist; then
+            echo "::error::web/dist is stale. The Go binary embeds it, so rebuilt assets must be committed with frontend changes."
+            git diff --stat -- web/dist
+            exit 1
+          fi
+
+      - name: Tests
+        run: npm --prefix web test
+
+  backend:
+    name: Go vet, format, and race tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Formatting
+        run: |
+          unformatted=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go.mod is tidy
+        run: |
+          cp go.mod go.mod.bak && cp go.sum go.sum.bak
+          go mod tidy
+          if ! diff -q go.mod go.mod.bak >/dev/null || ! diff -q go.sum go.sum.bak >/dev/null; then
+            echo "::error::go mod tidy changes go.mod or go.sum. Commit the tidied files."
+            diff -u go.mod.bak go.mod || true
+            diff -u go.sum.bak go.sum || true
+            exit 1
+          fi
+          rm go.mod.bak go.sum.bak
+
+      - run: go vet ./...
+
+      - name: Build both binaries
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -o /tmp/woolwire ./cmd/woolwire
+          go build -trimpath -o /tmp/woolwire-runner ./cmd/woolwire-runner
+
+      # The race detector needs cgo and the platform's C toolchain.
+      - name: Race tests
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -timeout 15m ./...
+
+  docs:
+    name: Documentation and route inventory
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # No third-party packages: compares Go route registrations against
+      # docs/openapi.yaml, checks the generated inventory, and validates local
+      # Markdown links and headings.
+      - run: python3 scripts/check_docs.py
+
+      - name: OpenAPI 3.1 schema validation
+        run: |
+          python3 -m pip install --quiet openapi-spec-validator pyyaml
+          python3 -c "from openapi_spec_validator import validate; import yaml; validate(yaml.safe_load(open('docs/openapi.yaml')))"
+
+      # Diffing against the empty tree scans the whole checkout, so this works
+      # on the shallow clone actions/checkout makes by default.
+      - name: Whitespace errors
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD

@@ -9,15 +9,15 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/cbaack/woolwire/internal/store"
-	"github.com/cbaack/woolwire/internal/transport"
+	"github.com/Chrisbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/transport"
 )
 
 // TestBackupRoundTripThroughHelper proves the documented recovery procedure
 // works: export encrypted, decrypt with hack/backup-decrypt, open the result.
 func TestBackupRoundTripThroughHelper(t *testing.T) {
 	helper := filepath.Join(t.TempDir(), "backup-decrypt")
-	build := exec.Command("go", "build", "-o", helper, "github.com/cbaack/woolwire/hack/backup-decrypt")
+	build := exec.Command("go", "build", "-o", helper, "github.com/Chrisbaack/woolwire/hack/backup-decrypt")
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
 		t.Fatalf("build helper: %v", err)

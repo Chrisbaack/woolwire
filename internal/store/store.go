@@ -1106,4 +1106,3 @@ func (s *Store) ListReceipts(roomID string) ([]ContributionReceiptRecord, error)
 	}
 	return receipts, rows.Err()
 }
-

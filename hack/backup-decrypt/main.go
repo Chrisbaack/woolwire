@@ -14,7 +14,7 @@ import (
 
 	"golang.org/x/term"
 
-	"github.com/cbaack/woolwire/internal/localapi"
+	"github.com/Chrisbaack/woolwire/internal/localapi"
 )
 
 func main() {

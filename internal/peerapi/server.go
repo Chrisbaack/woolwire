@@ -11,13 +11,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/catalog"
-	"github.com/cbaack/woolwire/internal/hosting"
-	"github.com/cbaack/woolwire/internal/inference"
-	"github.com/cbaack/woolwire/internal/peerauth"
-	"github.com/cbaack/woolwire/internal/room"
-	"github.com/cbaack/woolwire/internal/store"
-	"github.com/cbaack/woolwire/internal/transport"
+	"github.com/Chrisbaack/woolwire/internal/catalog"
+	"github.com/Chrisbaack/woolwire/internal/hosting"
+	"github.com/Chrisbaack/woolwire/internal/inference"
+	"github.com/Chrisbaack/woolwire/internal/peerauth"
+	"github.com/Chrisbaack/woolwire/internal/room"
+	"github.com/Chrisbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/transport"
 )
 
 // BootstrapPortOffset places /bootstrap/v1/join on its own Tailcat port. The
@@ -364,7 +364,7 @@ type SyncRequest struct {
 	// TailcatAddr updates the caller's own address only. There is no member_id
 	// field: the address is bound to the authenticated TLS identity, so a
 	// member cannot rebind anyone else's address to a node it controls.
-	TailcatAddr   string           `json:"tailcat_addr,omitempty"`
+	TailcatAddr string `json:"tailcat_addr,omitempty"`
 }
 
 type SyncResponse struct {

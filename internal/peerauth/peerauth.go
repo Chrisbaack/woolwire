@@ -21,9 +21,9 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/identity"
-	"github.com/cbaack/woolwire/internal/room"
-	"github.com/cbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/identity"
+	"github.com/Chrisbaack/woolwire/internal/room"
+	"github.com/Chrisbaack/woolwire/internal/store"
 )
 
 // RoomCertificateCommonName marks the creator's authority-signed bootstrap

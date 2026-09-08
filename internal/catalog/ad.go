@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/identity"
+	"github.com/Chrisbaack/woolwire/internal/identity"
 )
 
 const StaleAdTimeoutSeconds = 90

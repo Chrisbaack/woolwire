@@ -23,14 +23,14 @@ import (
 // credential. In particular, it never contains the room authority private
 // key.
 type PeerState struct {
-	Version             int             `json:"version"`
-	RoomID              string          `json:"room_id"`
-	TailcatKey          key.NodePrivate `json:"tailcat_key"`
+	Version             int                  `json:"version"`
+	RoomID              string               `json:"room_id"`
+	TailcatKey          key.NodePrivate      `json:"tailcat_key"`
 	TailcatPresharedKey tailcat.PresharedKey `json:"tailcat_preshared_key"`
-	TailcatAddr         tailcat.Addr   `json:"tailcat_addr"`
-	Device              DeviceState     `json:"device"`
-	PeerCertDER         []byte          `json:"peer_certificate_der,omitempty"`
-	Credential          *PeerCredential `json:"credential,omitempty"`
+	TailcatAddr         tailcat.Addr         `json:"tailcat_addr"`
+	Device              DeviceState          `json:"device"`
+	PeerCertDER         []byte               `json:"peer_certificate_der,omitempty"`
+	Credential          *PeerCredential      `json:"credential,omitempty"`
 }
 
 // LoadPeer creates or loads a member's persistent identity. Enrollment fills
@@ -330,4 +330,3 @@ func EnrollPeer(roomState *RoomState, device DeviceState, addr tailcat.Addr) (Pe
 		Credential:          &cred,
 	}, nil
 }
-

@@ -1,4 +1,4 @@
-module github.com/cbaack/woolwire
+module github.com/Chrisbaack/woolwire
 
 go 1.27.1
 

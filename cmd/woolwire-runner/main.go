@@ -8,7 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/cbaack/woolwire/internal/runner"
+	"github.com/Chrisbaack/woolwire/internal/runner"
 )
 
 func getEnv(key, fallback string) string {

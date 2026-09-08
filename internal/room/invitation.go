@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/cbaack/woolwire/internal/identity"
+	"github.com/Chrisbaack/woolwire/internal/identity"
 )
 
 const (

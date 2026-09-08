@@ -70,7 +70,7 @@ func buildBinary(t *testing.T) string {
 	t.Helper()
 
 	binary := filepath.Join(t.TempDir(), "woolwire")
-	cmd := exec.Command("go", "build", "-o", binary, "github.com/cbaack/woolwire/cmd/woolwire")
+	cmd := exec.Command("go", "build", "-o", binary, "github.com/Chrisbaack/woolwire/cmd/woolwire")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

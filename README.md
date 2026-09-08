@@ -1,5 +1,8 @@
 # Woolwire
 
+[![CI](https://github.com/Chrisbaack/woolwire/actions/workflows/ci.yml/badge.svg)](https://github.com/Chrisbaack/woolwire/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **A private room for shared intelligence.**
 
 Woolwire lets a small group of friends share language models running on their
@@ -41,7 +44,7 @@ Docker Desktop with Compose, and outbound access for dependency downloads and
 Tailcat connectivity.
 
 ```sh
-git clone https://github.com/cbaack/woolwire.git
+git clone https://github.com/Chrisbaack/woolwire.git
 cd woolwire
 docker compose -f deploy/base/compose.yaml up -d --build
 docker compose -f deploy/base/compose.yaml logs woolwire
@@ -126,7 +129,10 @@ structure, development workflows, and documentation checks.
 
 ## License
 
-A project license has not yet been selected. See the
-[publication checklist](docs/PUBLISHING.md) for the remaining repository and
-release decisions. Dependency and model licenses are separate from the project's
-license; the [dependency inventory](docs/SBOM.md) links to the manifests.
+Woolwire is released under the [MIT License](LICENSE).
+
+Dependency and model licenses are separate from the project's license. Every
+Go module and npm package linked into a build is under a permissive license
+(MIT, BSD, ISC, or Apache-2.0); the [dependency inventory](docs/SBOM.md) links
+to the manifests and records the check. The weights you choose to run carry
+their own terms, which Woolwire does not evaluate for you.

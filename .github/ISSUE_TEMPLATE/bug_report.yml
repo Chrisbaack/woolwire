@@ -1,0 +1,70 @@
+name: Bug report
+description: Something in Woolwire does not behave as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report a security vulnerability here.** Use
+        [private reporting](https://github.com/Chrisbaack/woolwire/security/advisories/new)
+        instead; see [SECURITY.md](https://github.com/Chrisbaack/woolwire/blob/HEAD/SECURITY.md).
+
+        Before pasting logs or config, remove setup secrets, cookies, bearer
+        tokens, backend API keys, invitation codes, private prompts, and local
+        paths you do not intend to disclose. The first-start log contains a
+        redeemable owner secret.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or release
+      description: Output of `git rev-parse --short HEAD`, or the release tag you installed.
+      placeholder: 3976b90
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How are you running it?
+      options:
+        - Docker/Podman Compose, base
+        - Docker/Podman Compose, managed (GPU or CPU runner)
+        - Single container
+        - Native binary
+        - Native binary plus native runner
+        - Development checkout
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: Fedora 42, x86_64
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps someone else can follow from a fresh state directory.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: Include sanitized error output. Code fences are rendered as-is.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Model and host involved, whether other members were reachable, related issues.
+    validations:
+      required: false

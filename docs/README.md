@@ -23,7 +23,8 @@ Start with [Getting started](GETTING_STARTED.md) to run the app, then the
 | [Contributing](../CONTRIBUTING.md) | Source map, local development, tests, documentation maintenance |
 | [Validation status](STATUS.md) | Implemented capabilities, recorded evidence, remaining acceptance work |
 | [Publishing](PUBLISHING.md) | Repository preparation and release checklist |
-| [Dependency inventory](SBOM.md) | Actual manifest sources, build provenance, advisory checks |
+| [Dependency inventory](SBOM.md) | Actual manifest sources, build provenance, advisory and license checks |
+| [License](../LICENSE) | MIT license text |
 
 ## Design and project history
 

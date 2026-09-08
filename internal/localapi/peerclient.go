@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/peerauth"
-	"github.com/cbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/peerauth"
+	"github.com/Chrisbaack/woolwire/internal/store"
 )
 
 // peerAddress resolves a member to its last known Tailcat address.

@@ -14,11 +14,55 @@ does not mean the repository has been pushed, made public, or tagged.
 - [x] Example environment files containing no real token.
 - [x] Git and container-context exclusions for local environment files, keys,
   databases, model weights, backups, and logs.
-- [ ] Select a project license and add its exact text and attribution.
-- [ ] Configure a private vulnerability reporting channel, then update SECURITY.md.
-- [ ] Review the staged diff and scan the **entire history** for credentials and
+- [x] Select a project license and add its exact text and attribution. The
+  project is [MIT](../LICENSE), copyright Chris Baack. Every Go module and npm
+  package actually linked into a build is permissive (MIT, BSD-2/3-Clause, ISC,
+  or Apache-2.0), so no copyleft obligation attaches; see
+  [the dependency inventory](SBOM.md).
+- [x] Publish the vulnerability reporting process in [SECURITY.md](../SECURITY.md).
+  GitHub private advisory reporting is the documented channel. **Turning the
+  setting on is a post-publication step:** the API rejects it on a private
+  repository. See [after making the repository public](#after-making-the-repository-public).
+- [x] Review the staged diff and scan the **entire history** for credentials and
   private data. Ignore rules do not remove anything already committed.
-- [ ] Review repository metadata, default branch, issue settings, and access.
+- [x] Review repository metadata, default branch, issue settings, and access.
+- [x] Make the Go module path match the repository that will host it. The
+  module is `github.com/Chrisbaack/woolwire`; a mismatch breaks `go install`
+  and points readers at an unrelated account.
+- [x] Community health files: issue forms, a pull request template, and a
+  [CI workflow](../.github/workflows/ci.yml) running the contributor checks on
+  every push and pull request.
+
+What the history scan covered, so the claim above is checkable: every path ever
+added across all refs (only `.env.example` files match the sensitive-name
+patterns, and both contain empty or generated placeholder values); every added
+line across the full patch history for OpenAI, GitHub, AWS, Slack, Google,
+Hugging Face and Tailscale key formats, PEM private key blocks, and quoted
+credential assignments (all hits are documentation snippets that generate a
+random token, or test fixtures such as `runner-token`); long hex strings (all
+synthetic digests in tests); and embedded PNG metadata in the screenshot (no
+text or EXIF chunks). Author identities were rewritten before publication;
+`refs/heads/backup/wrong-author-email` and `refs/original/refs/heads/master`
+still point at the pre-rewrite chain locally. Delete them before any
+`git push --all` or `--mirror`, or push only `master`.
+
+## After making the repository public
+
+These settings do not exist on a private repository, so they can only be turned
+on once the repository is public. Do them in this order.
+
+1. **Private vulnerability reporting.** Settings → Advanced Security → Private
+   vulnerability reporting → Enable, or
+   `gh api -X PUT repos/Chrisbaack/woolwire/private-vulnerability-reporting`.
+   [SECURITY.md](../SECURITY.md) already sends reporters to the advisory form,
+   so this should be enabled at the same time the repository becomes public,
+   not later.
+2. **Dependabot alerts** and **secret scanning with push protection.** Both are
+   free on public repositories and neither runs Actions minutes.
+3. Confirm the default branch. It is currently `master`. Renaming it is fine;
+   the branch filter in [ci.yml](../.github/workflows/ci.yml) is the one place
+   that names it, and the links in `.github/ISSUE_TEMPLATE` use `blob/HEAD` so
+   they follow a rename on their own.
 
 Before committing:
 

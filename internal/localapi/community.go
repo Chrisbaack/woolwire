@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/community"
-	"github.com/cbaack/woolwire/internal/identity"
-	"github.com/cbaack/woolwire/internal/peerapi"
-	"github.com/cbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/community"
+	"github.com/Chrisbaack/woolwire/internal/identity"
+	"github.com/Chrisbaack/woolwire/internal/peerapi"
+	"github.com/Chrisbaack/woolwire/internal/store"
 )
 
 // handleListChannels materializes the channel list from the signed event log

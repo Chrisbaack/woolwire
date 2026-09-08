@@ -14,7 +14,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/cbaack/woolwire/internal/modelpath"
+	"github.com/Chrisbaack/woolwire/internal/modelpath"
 )
 
 // Woolwire is not the only thing that reads the models directory. A Hugging

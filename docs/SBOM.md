@@ -29,8 +29,26 @@ comment describing it as pinned does not make its tag immutable.
 
 Node 20 builds the current container frontend; use Node **22.6+** to run the
 repository's TypeScript-stripping frontend test command outside that builder.
-Model weight and external backend licenses are separate and must be reviewed
-for the models actually used.
+## License review
+
+Woolwire itself is [MIT](../LICENSE). The dependencies actually linked into a
+build were reviewed for license compatibility on 2026-09-07, at the versions
+recorded in `go.mod`/`go.sum` and `web/package-lock.json`:
+
+| Set | How it was enumerated | Result |
+|---|---|---|
+| Go modules | `go list -deps ./...` mapped to modules, then the `LICENSE` file in each module cache directory | 48 modules: BSD-3-Clause, BSD-2-Clause, MIT, ISC (`github.com/coder/websocket`), Apache-2.0 |
+| npm packages | `license` fields in `web/package-lock.json` | 148 packages: MIT, ISC, Apache-2.0, BSD-3-Clause, CC-BY-4.0 |
+
+No copyleft license (GPL, LGPL, AGPL, MPL, SSPL) appears in either set, so MIT
+carries no reciprocal obligation from a dependency. Note that `go list -m all`
+reports the full module *graph* (over 600 modules), most of which are never
+built; the linked set above is the one that matters for distribution.
+
+This is a point-in-time check, not a continuously enforced policy. Re-run it
+when dependencies change. Model weight and external backend licenses are
+separate and must be reviewed for the models actually used; Woolwire does not
+evaluate them for you.
 
 ## Build from a reviewed checkout
 

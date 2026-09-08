@@ -7,11 +7,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/contributions"
-	"github.com/cbaack/woolwire/internal/hosting"
-	"github.com/cbaack/woolwire/internal/inference"
-	"github.com/cbaack/woolwire/internal/peerauth"
-	"github.com/cbaack/woolwire/internal/sse"
+	"github.com/Chrisbaack/woolwire/internal/contributions"
+	"github.com/Chrisbaack/woolwire/internal/hosting"
+	"github.com/Chrisbaack/woolwire/internal/inference"
+	"github.com/Chrisbaack/woolwire/internal/peerauth"
+	"github.com/Chrisbaack/woolwire/internal/sse"
 )
 
 // InferenceRequest carries no member_id: the requester is the authenticated
@@ -157,4 +157,3 @@ func (s *Server) handleCancelInference(w http.ResponseWriter, r *http.Request, c
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"cancelled": true})
 }
-

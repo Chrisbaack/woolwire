@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/hosting"
-	"github.com/cbaack/woolwire/internal/peerapi"
-	"github.com/cbaack/woolwire/internal/sse"
+	"github.com/Chrisbaack/woolwire/internal/hosting"
+	"github.com/Chrisbaack/woolwire/internal/peerapi"
+	"github.com/Chrisbaack/woolwire/internal/sse"
 )
 
 type openAIModelItem struct {

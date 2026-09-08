@@ -21,7 +21,7 @@ background. A host GPU is optional when requesting models from friends.
 Clone once:
 
 ```sh
-git clone https://github.com/cbaack/woolwire.git
+git clone https://github.com/Chrisbaack/woolwire.git
 cd woolwire
 ```
 

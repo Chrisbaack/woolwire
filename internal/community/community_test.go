@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/identity"
+	"github.com/Chrisbaack/woolwire/internal/identity"
 )
 
 func TestCommunityEventSigningAndVerification(t *testing.T) {

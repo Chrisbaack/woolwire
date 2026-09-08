@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/contributions"
-	"github.com/cbaack/woolwire/internal/identity"
-	"github.com/cbaack/woolwire/internal/peerapi"
-	"github.com/cbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/contributions"
+	"github.com/Chrisbaack/woolwire/internal/identity"
+	"github.com/Chrisbaack/woolwire/internal/peerapi"
+	"github.com/Chrisbaack/woolwire/internal/store"
 )
 
 func (s *Server) handleGetLeaderboard(w http.ResponseWriter, r *http.Request) {

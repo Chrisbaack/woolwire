@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/modelpath"
+	"github.com/Chrisbaack/woolwire/internal/modelpath"
 )
 
 // Weights arrive two ways: Woolwire downloads them and writes a manifest

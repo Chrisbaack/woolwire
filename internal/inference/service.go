@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/hosting"
-	"github.com/cbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/hosting"
+	"github.com/Chrisbaack/woolwire/internal/store"
 )
 
 var (

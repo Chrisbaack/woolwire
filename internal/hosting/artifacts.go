@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/modelpath"
+	"github.com/Chrisbaack/woolwire/internal/modelpath"
 )
 
 var (

@@ -6,8 +6,9 @@ For a bug, include the commit, operating system, deployment method, reproduction
 steps, expected result, and sanitized error output. Share security-sensitive
 findings through the process in [SECURITY.md](SECURITY.md).
 
-The project license is still undecided. Resolve that with the maintainer before
-submitting contributions that depend on specific licensing terms.
+Woolwire is under the [MIT License](LICENSE). By submitting a change you agree
+that it may be distributed under those terms. There is no separate contributor
+license agreement to sign.
 
 ## Local setup
 

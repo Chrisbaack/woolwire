@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cbaack/woolwire/internal/hosting"
-	"github.com/cbaack/woolwire/internal/transport"
+	"github.com/Chrisbaack/woolwire/internal/hosting"
+	"github.com/Chrisbaack/woolwire/internal/transport"
 )
 
 func TestManagedModelReplacementAndFailureWithdrawal(t *testing.T) {

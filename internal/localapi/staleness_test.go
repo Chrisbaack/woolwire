@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/catalog"
-	"github.com/cbaack/woolwire/internal/hosting"
-	"github.com/cbaack/woolwire/internal/identity"
-	"github.com/cbaack/woolwire/internal/transport"
+	"github.com/Chrisbaack/woolwire/internal/catalog"
+	"github.com/Chrisbaack/woolwire/internal/hosting"
+	"github.com/Chrisbaack/woolwire/internal/identity"
+	"github.com/Chrisbaack/woolwire/internal/transport"
 )
 
 // ageLocalAd re-signs a node's own advertisement with an old timestamp, which

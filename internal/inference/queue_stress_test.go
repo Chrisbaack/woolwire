@@ -25,7 +25,7 @@ func TestQueueSlotIsNeverLeaked(t *testing.T) {
 	})
 
 	const (
-		members  = 8
+		members   = 8
 		perMember = 250
 	)
 

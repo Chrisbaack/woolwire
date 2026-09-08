@@ -6,12 +6,12 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/community"
-	"github.com/cbaack/woolwire/internal/contributions"
-	"github.com/cbaack/woolwire/internal/identity"
-	"github.com/cbaack/woolwire/internal/peerauth"
-	"github.com/cbaack/woolwire/internal/room"
-	"github.com/cbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/community"
+	"github.com/Chrisbaack/woolwire/internal/contributions"
+	"github.com/Chrisbaack/woolwire/internal/identity"
+	"github.com/Chrisbaack/woolwire/internal/peerauth"
+	"github.com/Chrisbaack/woolwire/internal/room"
+	"github.com/Chrisbaack/woolwire/internal/store"
 )
 
 const (
@@ -220,16 +220,16 @@ func withinRetentionWindow(timestamp int64, now time.Time) bool {
 }
 
 type ContributionsSyncRequest struct {
-	RoomID          string                           `json:"room_id"`
-	Cursors         map[string]int64                 `json:"cursors"`
+	RoomID          string                            `json:"room_id"`
+	Cursors         map[string]int64                  `json:"cursors"`
 	PageCursors     map[string]store.ReceiptCursorKey `json:"page_cursors,omitempty"`
-	KnownReceiptIDs []string                         `json:"known_receipt_ids,omitempty"`
-	PushReceipts    []contributions.Receipt          `json:"push_receipts,omitempty"`
+	KnownReceiptIDs []string                          `json:"known_receipt_ids,omitempty"`
+	PushReceipts    []contributions.Receipt           `json:"push_receipts,omitempty"`
 }
 
 type ContributionsSyncResponse struct {
-	PullReceipts    []contributions.Receipt          `json:"pull_receipts"`
-	NextCursors     map[string]int64                 `json:"next_cursors"`
+	PullReceipts    []contributions.Receipt           `json:"pull_receipts"`
+	NextCursors     map[string]int64                  `json:"next_cursors"`
 	NextPageCursors map[string]store.ReceiptCursorKey `json:"next_page_cursors,omitempty"`
 }
 
@@ -332,4 +332,3 @@ func VerifyReceipt(s *store.Store, rec contributions.Receipt) bool {
 	}
 	return rec.VerifyBoth(ed25519.PublicKey(hostPub), ed25519.PublicKey(reqPub)) == nil
 }
-

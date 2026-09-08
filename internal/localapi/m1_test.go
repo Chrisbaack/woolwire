@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/peerapi"
-	"github.com/cbaack/woolwire/internal/peerauth"
-	"github.com/cbaack/woolwire/internal/room"
-	"github.com/cbaack/woolwire/internal/store"
-	"github.com/cbaack/woolwire/internal/transport"
+	"github.com/Chrisbaack/woolwire/internal/peerapi"
+	"github.com/Chrisbaack/woolwire/internal/peerauth"
+	"github.com/Chrisbaack/woolwire/internal/room"
+	"github.com/Chrisbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/transport"
 )
 
 func TestM1FullOnboardingAndAcceptanceGate(t *testing.T) {

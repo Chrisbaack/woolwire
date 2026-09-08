@@ -7,7 +7,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/identity"
+	"github.com/Chrisbaack/woolwire/internal/identity"
 )
 
 type Receipt struct {
@@ -92,10 +92,10 @@ func (r *Receipt) VerifyBoth(hostPub, requesterPub ed25519.PublicKey) error {
 }
 
 type LeaderboardEntry struct {
-	HostMemberID         string `json:"host_member_id"`
-	DisplayName          string `json:"display_name"`
-	Score                int    `json:"score"`
-	DistinctMembersHelped int   `json:"distinct_members_helped"`
+	HostMemberID          string `json:"host_member_id"`
+	DisplayName           string `json:"display_name"`
+	Score                 int    `json:"score"`
+	DistinctMembersHelped int    `json:"distinct_members_helped"`
 }
 
 // CalculateLeaderboard computes 30-day rankings:
@@ -176,9 +176,9 @@ func CalculateLeaderboard(receipts []Receipt, memberNames map[string]string, opt
 			name = "Member " + hostID
 		}
 		entries = append(entries, LeaderboardEntry{
-			HostMemberID:         hostID,
-			DisplayName:          name,
-			Score:                score,
+			HostMemberID:          hostID,
+			DisplayName:           name,
+			Score:                 score,
 			DistinctMembersHelped: len(hostHelpedRequesters[hostID]),
 		})
 	}

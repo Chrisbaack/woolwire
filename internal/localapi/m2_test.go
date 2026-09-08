@@ -10,10 +10,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/cbaack/woolwire/internal/hosting"
-	"github.com/cbaack/woolwire/internal/peerapi"
-	"github.com/cbaack/woolwire/internal/store"
-	"github.com/cbaack/woolwire/internal/transport"
+	"github.com/Chrisbaack/woolwire/internal/hosting"
+	"github.com/Chrisbaack/woolwire/internal/peerapi"
+	"github.com/Chrisbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/transport"
 )
 
 func TestM2LiveDashboardAndExternalInferenceGate(t *testing.T) {

@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cbaack/woolwire/internal/contributions"
-	"github.com/cbaack/woolwire/internal/hosting"
-	"github.com/cbaack/woolwire/internal/peerapi"
-	"github.com/cbaack/woolwire/internal/sse"
-	"github.com/cbaack/woolwire/internal/store"
+	"github.com/Chrisbaack/woolwire/internal/contributions"
+	"github.com/Chrisbaack/woolwire/internal/hosting"
+	"github.com/Chrisbaack/woolwire/internal/peerapi"
+	"github.com/Chrisbaack/woolwire/internal/sse"
+	"github.com/Chrisbaack/woolwire/internal/store"
 )
 
 // maxNoSaveTurns bounds the in-memory transcript of a privacy-mode chat so a
