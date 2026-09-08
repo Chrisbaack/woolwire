@@ -192,7 +192,11 @@ func (c *RunnerClient) StreamChat(
 		return fmt.Errorf("runner returned status %d", resp.StatusCode)
 	}
 
+	wrapper := newReasoningWrapper(onChunk)
 	scanner := bufio.NewScanner(resp.Body)
+	// A reasoning model can emit a long single-line frame; the default 64 KiB
+	// token limit would end the stream early with ErrTooLong.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "data: ") {
@@ -202,15 +206,23 @@ func (c *RunnerClient) StreamChat(
 			}
 			var chunk chatCompletionChunk
 			if err := json.Unmarshal([]byte(data), &chunk); err == nil {
-				if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
-					if err := onChunk(chunk.Choices[0].Delta.Content); err != nil {
+				if len(chunk.Choices) > 0 {
+					delta := chunk.Choices[0].Delta
+					reasoning := delta.ReasoningContent
+					if reasoning == "" {
+						reasoning = delta.Reasoning
+					}
+					if err := wrapper.emit(delta.Content, reasoning); err != nil {
 						return err
 					}
 				}
 			}
 		}
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return wrapper.closeThink()
 }
 
 func (c *RunnerClient) CancelInference(ctx context.Context) error {

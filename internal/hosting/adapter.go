@@ -175,9 +175,64 @@ type chatCompletionChunk struct {
 	Choices []struct {
 		Delta struct {
 			Content string `json:"content"`
+			// ReasoningContent carries a thinking model's scratchpad. Reasoning
+			// backends (llama.cpp, vLLM, DeepSeek) put it here and leave
+			// Content null until the answer proper starts, so a stream read
+			// for Content alone looks empty for the whole thinking phase --
+			// and entirely empty when the token budget runs out mid-thought.
+			ReasoningContent string `json:"reasoning_content"`
+			Reasoning        string `json:"reasoning"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
+}
+
+// reasoningWrapper folds a two-channel chunk stream back into the single text
+// stream the rest of the app stores and renders, marking the thinking phase
+// with the <think>...</think> tags the UI already collapses.
+type reasoningWrapper struct {
+	onChunk func(string) error
+	open    bool
+}
+
+func newReasoningWrapper(onChunk func(string) error) *reasoningWrapper {
+	return &reasoningWrapper{onChunk: onChunk}
+}
+
+// emit forwards one chunk's deltas in the order the backend produced them.
+func (rw *reasoningWrapper) emit(content, reasoning string) error {
+	if reasoning != "" {
+		if !rw.open {
+			rw.open = true
+			if err := rw.onChunk("<think>"); err != nil {
+				return err
+			}
+		}
+		if err := rw.onChunk(reasoning); err != nil {
+			return err
+		}
+	}
+	if content != "" {
+		if err := rw.closeThink(); err != nil {
+			return err
+		}
+		if err := rw.onChunk(content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// closeThink ends an open thinking block. Calling it when the stream finishes
+// matters for a response that spent its whole budget reasoning: the transcript
+// still closes the tag, so the turn is saved and rendered instead of silently
+// vanishing.
+func (rw *reasoningWrapper) closeThink() error {
+	if !rw.open {
+		return nil
+	}
+	rw.open = false
+	return rw.onChunk("</think>")
 }
 
 func (a *ExternalAdapter) StreamChat(
@@ -231,6 +286,7 @@ func (a *ExternalAdapter) StreamChat(
 		return fmt.Errorf("external endpoint returned HTTP %d: %s", resp.StatusCode, string(errBytes))
 	}
 
+	wrapper := newReasoningWrapper(onChunk)
 	reader := bufio.NewReader(resp.Body)
 	for {
 		line, readErr := reader.ReadString('\n')
@@ -257,13 +313,18 @@ func (a *ExternalAdapter) StreamChat(
 				continue
 			}
 
-			if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
-				if err := onChunk(chunk.Choices[0].Delta.Content); err != nil {
+			if len(chunk.Choices) > 0 {
+				delta := chunk.Choices[0].Delta
+				reasoning := delta.ReasoningContent
+				if reasoning == "" {
+					reasoning = delta.Reasoning
+				}
+				if err := wrapper.emit(delta.Content, reasoning); err != nil {
 					return err
 				}
 			}
 		}
 	}
 
-	return nil
+	return wrapper.closeThink()
 }
