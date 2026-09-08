@@ -16,6 +16,7 @@ import (
 	"github.com/Chrisbaack/woolwire/internal/identity"
 	"github.com/Chrisbaack/woolwire/internal/modelpath"
 	"github.com/Chrisbaack/woolwire/internal/peerapi"
+	"github.com/Chrisbaack/woolwire/internal/runner"
 	"github.com/Chrisbaack/woolwire/internal/store"
 )
 
@@ -252,18 +253,39 @@ func (s *Server) handleRunnerHealth(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	active, queued := 0, 0
+	if s.infer != nil {
+		active, queued = s.infer.Queue().Stats()
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"configured":      true,
-		"status":          health.Status,
-		"loaded_model_id": health.LoadedModelID,
-		"loaded_file":     health.LoadedFile,
-		"engine_pid":      health.EnginePID,
-		"has_gpu":         health.HasGPU,
-		"gpu_name":        health.GPUName,
-		"engine_error":    health.Error,
-		"engine_notice":   health.Notice,
+		"configured":             true,
+		"status":                 health.Status,
+		"loaded_model_id":        health.LoadedModelID,
+		"loaded_file":            health.LoadedFile,
+		"engine_pid":             health.EnginePID,
+		"has_gpu":                health.HasGPU,
+		"gpu_name":               health.GPUName,
+		"engine_error":           health.Error,
+		"engine_notice":          health.Notice,
+		"context_limit":          health.ContextLimit,
+		"threads":                health.Threads,
+		"gpu_layers":             health.GPULayers,
+		"extra_args":             health.ExtraArgs,
+		"processing":             health.Processing,
+		"queued_requests":        health.QueuedRequests,
+		"requests_completed":     health.RequestsCompleted,
+		"requests_failed":        health.RequestsFailed,
+		"prompt_tokens":          health.PromptTokens,
+		"completion_tokens":      health.CompletionTokens,
+		"last_prompt_tokens":     health.LastPromptTokens,
+		"last_completion_tokens": health.LastCompletionTokens,
+		"last_tokens_per_second": health.LastTokensPerSecond,
+		"current_context_tokens": health.CurrentContextTokens,
+		"started_at":             health.StartedAt,
+		"host_active_requests":   active,
+		"host_queued_requests":   queued,
 	})
 }
 
@@ -282,11 +304,16 @@ func (s *Server) handleLoadManagedModel(w http.ResponseWriter, r *http.Request) 
 		Threads      int    `json:"threads"`
 		// GPULayers is optional: omitted, the runner decides, since it is the
 		// container holding the GPU.
-		GPULayers *int  `json:"gpu_layers"`
-		Published *bool `json:"published"`
+		GPULayers *int     `json:"gpu_layers"`
+		ExtraArgs []string `json:"extra_args"`
+		Published *bool    `json:"published"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ModelID == "" || body.Filename == "" {
 		http.Error(w, "model_id and filename required", http.StatusBadRequest)
+		return
+	}
+	if err := runner.ValidateExtraArgs(body.ExtraArgs); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -310,6 +337,7 @@ func (s *Server) handleLoadManagedModel(w http.ResponseWriter, r *http.Request) 
 		ContextLimit: body.ContextLimit,
 		Threads:      body.Threads,
 		GPULayers:    body.GPULayers,
+		ExtraArgs:    body.ExtraArgs,
 	}
 	if s.artifactMgr != nil {
 		for _, c := range s.artifactMgr.CompanionsFor(body.Filename) {
@@ -340,7 +368,13 @@ func (s *Server) handleLoadManagedModel(w http.ResponseWriter, r *http.Request) 
 	}
 	maxTokens := body.MaxTokens
 	if maxTokens <= 0 {
-		maxTokens = 1024
+		maxTokens = contextLimit / 2
+		if maxTokens < 2048 && contextLimit >= 2048 {
+			maxTokens = 2048
+		}
+		if maxTokens > 4096 {
+			maxTokens = 4096
+		}
 	}
 
 	name := strings.TrimSpace(body.Name)

@@ -1058,8 +1058,61 @@ paths:
     get:
       tags: [models]
       summary: Runner companion status
+      description: |
+        Backs the settings Runner status page. Alongside the engine's health it
+        reports the launch settings in force, live queue depth, and token and
+        request counters accumulated since the engine started. Counters reset
+        whenever the engine is (re)launched.
       responses:
-        '200': { description: Runner status. }
+        '200':
+          description: Runner status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configured: { type: boolean }
+                  status: { type: string }
+                  loaded_model_id: { type: string, nullable: true }
+                  loaded_file: { type: string, nullable: true }
+                  engine_pid: { type: integer, nullable: true }
+                  has_gpu: { type: boolean }
+                  gpu_name: { type: string }
+                  engine_error: { type: string }
+                  engine_notice: { type: string }
+                  context_limit:
+                    type: integer
+                    description: Configured context window; 0 while no model is loaded.
+                  threads: { type: integer }
+                  gpu_layers: { type: integer, nullable: true }
+                  extra_args:
+                    type: array
+                    items: { type: string }
+                  processing:
+                    type: boolean
+                    description: True while the engine is generating.
+                  queued_requests:
+                    type: integer
+                    description: Requests waiting on the runner's single engine slot.
+                  requests_completed: { type: integer }
+                  requests_failed: { type: integer }
+                  prompt_tokens: { type: integer }
+                  completion_tokens: { type: integer }
+                  last_prompt_tokens: { type: integer, nullable: true }
+                  last_completion_tokens: { type: integer, nullable: true }
+                  last_tokens_per_second:
+                    type: number
+                    nullable: true
+                    description: |
+                      Generation rate for the last completed request, taken from
+                      the engine's own timings when it reports them.
+                  current_context_tokens:
+                    type: integer
+                    nullable: true
+                    description: Prompt size of the last completed request.
+                  started_at: { type: string, format: date-time, nullable: true }
+                  host_active_requests: { type: integer }
+                  host_queued_requests: { type: integer }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/v1/managed-models/load:
@@ -1089,6 +1142,15 @@ paths:
                 gpu_layers:
                   type: integer
                   description: Omit for runner hardware-based offload; 0 forces CPU.
+                extra_args:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    Additional llama-server tuning flags. Only an allow-list of
+                    documented tuning switches is accepted; path, networking,
+                    authentication, and model-selection flags are rejected with
+                    400. A flag needing a value takes it inline
+                    ("--batch-size=512") or as the next element.
                 published: { type: boolean }
       responses:
         '200':

@@ -66,6 +66,13 @@ func newFakeEngine(t *testing.T, readyAfter time.Duration) *fakeEngine {
 				flusher.Flush()
 			}
 		}
+		// The controller asks for include_usage, so a real engine closes the
+		// stream with a usage frame. llama.cpp attaches its own rate
+		// measurement alongside it in "timings".
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5},\"timings\":{\"predicted_per_second\":42.5}}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		if flusher != nil {
 			flusher.Flush()
@@ -379,6 +386,36 @@ func TestRunnerRequiresToken(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 without a token, got %d", resp.StatusCode)
+	}
+}
+
+func TestValidateExtraArgs(t *testing.T) {
+	for _, args := range [][]string{
+		{"--batch-size", "512", "--flash-attn"},
+		{"--batch-size=512", "--no-mmap"},
+		// llama.cpp spells the toggle both ways across versions; the inline
+		// form is how a value reaches it unambiguously.
+		{"--flash-attn=on"},
+		{"--cache-type-k", "q8_0", "--cache-type-v", "q8_0"},
+	} {
+		if err := ValidateExtraArgs(args); err != nil {
+			t.Errorf("supported tuning flags rejected %#v: %v", args, err)
+		}
+	}
+	for _, args := range [][]string{
+		{"--model", "/tmp/secret"},
+		{"--host", "0.0.0.0"},
+		{"--batch-size"},
+		// A bare value after an optional-value flag is indistinguishable from
+		// a stray positional, so it is refused rather than guessed at.
+		{"--flash-attn", "on"},
+		{"--batch-size", "--host"},
+		{"--no-mmap=true"},
+		{"-ngl", "99"},
+	} {
+		if err := ValidateExtraArgs(args); err == nil {
+			t.Errorf("unsafe or malformed args accepted: %#v", args)
+		}
 	}
 }
 
@@ -850,5 +887,53 @@ func TestDraftModelFallsBackWhenTheEngineRefusesIt(t *testing.T) {
 	}
 	if !strings.Contains(h.Notice, "speculative decoding disabled") {
 		t.Fatalf("the downgrade was not reported: %q", h.Notice)
+	}
+}
+
+// TestHealthReportsInferenceStats covers the data behind the runner status
+// page: the counters and token totals only mean anything if a completed
+// request actually moves them.
+func TestHealthReportsInferenceStats(t *testing.T) {
+	fe := newFakeEngine(t, 0)
+	modelDir := writeDummyModel(t)
+	_, client, base := newTestController(t, fe, modelDir)
+
+	load := do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
+		"model_id": "m1", "filename": "tiny.gguf", "context_limit": 8192, "threads": 6,
+	})
+	load.Body.Close()
+
+	resp := do(t, client, "POST", base+"/runner/v1/inference", map[string]any{
+		"model":    "tiny",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	health := do(t, client, "GET", base+"/runner/v1/health", nil)
+	defer health.Body.Close()
+	var got map[string]any
+	if err := json.NewDecoder(health.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+
+	for field, want := range map[string]float64{
+		"requests_completed": 1,
+		"requests_failed":    0,
+		"queued_requests":    0,
+		"prompt_tokens":      12,
+		"completion_tokens":  5,
+		// The engine's own measurement is preferred over the wall clock.
+		"last_tokens_per_second": 42.5,
+		"current_context_tokens": 12,
+		"context_limit":          8192,
+		"threads":                6,
+	} {
+		if got[field] != want {
+			t.Errorf("health field %q = %v, want %v", field, got[field], want)
+		}
+	}
+	if got["processing"] != false {
+		t.Errorf("processing = %v, want false once the request finished", got["processing"])
 	}
 }

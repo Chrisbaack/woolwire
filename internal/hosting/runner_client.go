@@ -28,7 +28,22 @@ type RunnerHealth struct {
 	// before exiting.
 	Error string `json:"error"`
 	// Notice explains a load that succeeded on different terms than asked.
-	Notice string `json:"notice"`
+	Notice               string     `json:"notice"`
+	ContextLimit         int        `json:"context_limit"`
+	Threads              int        `json:"threads"`
+	GPULayers            *int       `json:"gpu_layers"`
+	ExtraArgs            []string   `json:"extra_args"`
+	Processing           bool       `json:"processing"`
+	QueuedRequests       int        `json:"queued_requests"`
+	RequestsCompleted    int        `json:"requests_completed"`
+	RequestsFailed       int        `json:"requests_failed"`
+	PromptTokens         int        `json:"prompt_tokens"`
+	CompletionTokens     int        `json:"completion_tokens"`
+	LastPromptTokens     *int       `json:"last_prompt_tokens"`
+	LastCompletionTokens *int       `json:"last_completion_tokens"`
+	LastTokensPerSecond  *float64   `json:"last_tokens_per_second"`
+	CurrentContextTokens *int       `json:"current_context_tokens"`
+	StartedAt            *time.Time `json:"started_at"`
 }
 
 type RunnerClient struct {
@@ -115,6 +130,7 @@ type LoadRequest struct {
 	// models directory.
 	Projector  string
 	DraftModel string
+	ExtraArgs  []string
 }
 
 // LoadModel asks the runner to launch an engine.
@@ -133,6 +149,9 @@ func (c *RunnerClient) LoadModel(ctx context.Context, load LoadRequest) error {
 	}
 	if load.DraftModel != "" {
 		req["draft_model"] = load.DraftModel
+	}
+	if load.ExtraArgs != nil {
+		req["extra_args"] = load.ExtraArgs
 	}
 	return c.doJSON(ctx, "POST", "/runner/v1/models/load", req, nil)
 }

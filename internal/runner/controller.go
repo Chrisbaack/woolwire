@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -91,7 +92,75 @@ type EngineArgs struct {
 	// free — better than any number this process could pick, and it degrades
 	// to a partial offload instead of failing when a model does not fit.
 	GPULayers *int
+	// ExtraArgs contains validated llama-server tuning flags supplied by an
+	// advanced user. Paths, networking, authentication, and model-selection
+	// flags are never accepted here.
+	ExtraArgs []string
 	Port      uint16
+}
+
+var supportedExtraFlags = map[string]bool{
+	"--batch-size": true, "--ubatch-size": true,
+	"--threads-batch": true, "--cache-type-k": true, "--cache-type-v": true,
+	"--rope-scaling": true, "--rope-freq-base": true, "--rope-freq-scale": true,
+	"--defrag-thold": true, "--keep": true, "--prio": true, "--poll": true,
+	"--flash-attn": true, "--no-mmap": true, "--mlock": true,
+	"--no-kv-offload": true, "--no-op-offload": true,
+}
+
+// booleanExtraFlags stand alone and never carry a value.
+var booleanExtraFlags = map[string]bool{
+	"--no-mmap": true, "--mlock": true,
+	"--no-kv-offload": true, "--no-op-offload": true,
+}
+
+// optionalValueExtraFlags may stand alone or take an inline value. llama.cpp
+// spells --flash-attn both ways depending on version: a bare toggle in older
+// builds, "[on|off|auto]" in newer ones. Only the inline "--flag=value" form
+// is accepted, because in a flat argument list a following bare token cannot
+// be told apart from the next flag's value.
+var optionalValueExtraFlags = map[string]bool{
+	"--flash-attn": true,
+}
+
+// ValidateExtraArgs accepts only documented llama-server tuning switches.
+// Arguments are passed directly to exec.Command, never through a shell.
+func ValidateExtraArgs(args []string) error {
+	if len(args) > 32 {
+		return errors.New("too many extra runner arguments")
+	}
+	for i := 0; i < len(args); i++ {
+		a := strings.TrimSpace(args[i])
+		if a == "" || !strings.HasPrefix(a, "--") {
+			return fmt.Errorf("unsupported runner argument %q", args[i])
+		}
+		flag := a
+		if j := strings.IndexByte(flag, '='); j >= 0 {
+			flag = flag[:j]
+		}
+		if !supportedExtraFlags[flag] {
+			return fmt.Errorf("runner argument %q is not allowed", flag)
+		}
+		// Boolean flags stand alone. Optional-value flags stand alone or carry
+		// an inline value. Every other supported flag requires one value,
+		// either inline or as the next token.
+		if booleanExtraFlags[flag] {
+			if strings.Contains(a, "=") {
+				return fmt.Errorf("runner flag %q does not take a value", flag)
+			}
+			continue
+		}
+		if optionalValueExtraFlags[flag] {
+			continue
+		}
+		if !strings.Contains(a, "=") {
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" || strings.HasPrefix(strings.TrimSpace(args[i+1]), "--") {
+				return fmt.Errorf("runner flag %q requires a value", flag)
+			}
+			i++
+		}
+	}
+	return nil
 }
 
 type Controller struct {
@@ -107,15 +176,25 @@ type Controller struct {
 	healthCheck   func(ctx context.Context, port uint16) error
 	engineCommand func(ctx context.Context, args EngineArgs) *exec.Cmd
 
-	mu            sync.RWMutex
-	loaded        EngineArgs
-	status        EngineStatus
-	lastError     string
-	engineCmd     *exec.Cmd
-	engineCancel  context.CancelFunc
-	engineDone    chan struct{}
-	cancelActive  context.CancelFunc
-	activeRequest string
+	mu                   sync.RWMutex
+	loaded               EngineArgs
+	status               EngineStatus
+	lastError            string
+	engineCmd            *exec.Cmd
+	engineCancel         context.CancelFunc
+	engineDone           chan struct{}
+	cancelActive         context.CancelFunc
+	activeRequest        string
+	pendingRequests      int
+	requestsCompleted    int
+	requestsFailed       int
+	promptTokens         int
+	completionTokens     int
+	lastPromptTokens     *int
+	lastCompletionTokens *int
+	lastTokensPerSecond  *float64
+	currentContextTokens *int
+	startedAt            time.Time
 	// lastRequester is the member the engine last served. The architecture
 	// requires a restart between different requesting members so one member's
 	// cached state never reaches the next.
@@ -166,6 +245,7 @@ func NewController(cfg Config) (*Controller, error) {
 			if args.GPULayers != nil {
 				argv = append(argv, "-ngl", fmt.Sprintf("%d", *args.GPULayers))
 			}
+			argv = append(argv, args.ExtraArgs...)
 			return exec.CommandContext(ctx, enginePath, argv...)
 		}
 	}
@@ -344,9 +424,29 @@ func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"error":           c.lastError,
 		// The GPU is attached to this container, not to the one asking. The
 		// app has no way to see it, so the runner reports it.
-		"has_gpu":  c.hasGPU,
-		"gpu_name": c.gpuName,
-		"notice":   c.notice,
+		"has_gpu":                c.hasGPU,
+		"gpu_name":               c.gpuName,
+		"notice":                 c.notice,
+		"context_limit":          c.loaded.ContextLimit,
+		"threads":                c.loaded.Threads,
+		"gpu_layers":             c.loaded.GPULayers,
+		"extra_args":             c.loaded.ExtraArgs,
+		"processing":             c.status == StatusBusy,
+		"queued_requests":        c.pendingRequests,
+		"requests_completed":     c.requestsCompleted,
+		"requests_failed":        c.requestsFailed,
+		"prompt_tokens":          c.promptTokens,
+		"completion_tokens":      c.completionTokens,
+		"last_prompt_tokens":     c.lastPromptTokens,
+		"last_completion_tokens": c.lastCompletionTokens,
+		"last_tokens_per_second": c.lastTokensPerSecond,
+		"current_context_tokens": c.currentContextTokens,
+		"started_at": func() any {
+			if c.startedAt.IsZero() {
+				return nil
+			}
+			return c.startedAt
+		}(),
 	})
 }
 
@@ -357,8 +457,9 @@ type LoadModelRequest struct {
 	Threads      int    `json:"threads"`
 	// Projector and DraftModel locate the model's companions, relative to the
 	// models directory and validated the same way the weights are.
-	Projector  string `json:"mmproj"`
-	DraftModel string `json:"draft_model"`
+	Projector  string   `json:"mmproj"`
+	DraftModel string   `json:"draft_model"`
+	ExtraArgs  []string `json:"extra_args"`
 	// GPULayers is how many layers to offload. Omit it to let the runner
 	// decide: it is the process with the GPU attached, and the caller is in
 	// another container that cannot see one. 0 still means "run on the CPU".
@@ -424,6 +525,7 @@ func (c *Controller) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 		ContextLimit:  req.ContextLimit,
 		Threads:       req.Threads,
 		GPULayers:     c.defaultGPULayers(),
+		ExtraArgs:     append([]string(nil), req.ExtraArgs...),
 		Port:          c.enginePort,
 	}
 	if req.GPULayers != nil && *req.GPULayers >= 0 {
@@ -436,9 +538,13 @@ func (c *Controller) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 	if args.Threads <= 0 {
 		args.Threads = 4
 	}
+	if err := ValidateExtraArgs(args.ExtraArgs); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	c.mu.Lock()
-	if c.loaded.ModelID == req.ModelID && c.status == StatusReady && c.engineCmd != nil {
+	if c.loaded.ModelID == req.ModelID && c.status == StatusReady && c.engineCmd != nil && reflect.DeepEqual(c.loaded, args) {
 		c.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ready", "model_id": req.ModelID})
@@ -483,6 +589,11 @@ func (c *Controller) launchEngine(ctx context.Context, args EngineArgs) (int, er
 	c.status = StatusLoading
 	c.lastError = ""
 	c.loaded = args
+	c.startedAt = time.Now().UTC()
+	c.lastPromptTokens = nil
+	c.lastCompletionTokens = nil
+	c.lastTokensPerSecond = nil
+	c.currentContextTokens = nil
 	c.mu.Unlock()
 
 	engineCtx, cancel := context.WithCancel(context.Background())
@@ -688,8 +799,14 @@ func (c *Controller) handleInference(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// One engine, one KV cache, one request at a time.
+	c.mu.Lock()
+	c.pendingRequests++
+	c.mu.Unlock()
 	c.inferenceMu.Lock()
 	defer c.inferenceMu.Unlock()
+	c.mu.Lock()
+	c.pendingRequests--
+	c.mu.Unlock()
 
 	c.mu.RLock()
 	status := c.status
@@ -737,14 +854,21 @@ func (c *Controller) handleInference(w http.ResponseWriter, r *http.Request) {
 	c.cancelActive = reqCancel
 	c.activeRequest = req.Model
 	c.status = StatusBusy
+	c.lastTokensPerSecond = nil
 	c.mu.Unlock()
 
+	completed := false
 	defer func() {
 		c.mu.Lock()
 		c.cancelActive = nil
 		c.activeRequest = ""
 		if c.status == StatusBusy {
 			c.status = StatusReady
+		}
+		if completed {
+			c.requestsCompleted++
+		} else {
+			c.requestsFailed++
 		}
 		c.mu.Unlock()
 	}()
@@ -784,11 +908,52 @@ func (c *Controller) handleInference(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(resp.StatusCode)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return
+	}
 
 	flusher, isFlusher := w.(http.Flusher)
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	// Generation rate is measured here rather than read from the usage object:
+	// the OpenAI usage schema carries token counts only. llama.cpp reports its
+	// own measurement in a sibling "timings" object, which is preferred when
+	// present because it excludes prompt processing.
+	streamStart := time.Now()
 	for scanner.Scan() {
+		var frame struct {
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+			} `json:"usage"`
+			Timings *struct {
+				PredictedPerSecond float64 `json:"predicted_per_second"`
+			} `json:"timings"`
+		}
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			_ = json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &frame)
+		}
+		if frame.Usage != nil {
+			elapsed := time.Since(streamStart).Seconds()
+			c.mu.Lock()
+			c.lastPromptTokens = &frame.Usage.PromptTokens
+			c.lastCompletionTokens = &frame.Usage.CompletionTokens
+			// llama.cpp reports prompt_tokens for the completed request. Keep it
+			// as the latest measured context size; it is nil until the engine
+			// supplies usage rather than an estimate from message text.
+			c.currentContextTokens = &frame.Usage.PromptTokens
+			c.promptTokens += frame.Usage.PromptTokens
+			c.completionTokens += frame.Usage.CompletionTokens
+			if frame.Timings != nil && frame.Timings.PredictedPerSecond > 0 {
+				v := frame.Timings.PredictedPerSecond
+				c.lastTokensPerSecond = &v
+			} else if elapsed > 0 && frame.Usage.CompletionTokens > 0 {
+				v := float64(frame.Usage.CompletionTokens) / elapsed
+				c.lastTokensPerSecond = &v
+			}
+			c.mu.Unlock()
+		}
 		if _, err := fmt.Fprintf(w, "%s\n", scanner.Text()); err != nil {
 			return
 		}
@@ -796,6 +961,10 @@ func (c *Controller) handleInference(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return
+	}
+	completed = true
 }
 
 func (c *Controller) handleCancelInference(w http.ResponseWriter, r *http.Request) {

@@ -241,3 +241,33 @@ func TestLoadFailureReachesTheUI(t *testing.T) {
 		t.Fatalf("the reason never reached the caller: %s", w.Body.String())
 	}
 }
+
+func TestManagedModelMaxTokensDefault(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	node := setupTestNode(t, vNet, "node-1", 4242)
+	node.login(t)
+
+	runnerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "idle"})
+	}))
+	defer runnerSrv.Close()
+	node.localSrv.runnerClient = hosting.NewRunnerClient(runnerSrv.URL, "")
+
+	w := node.doJSON("POST", "/api/v1/managed-models/load", map[string]any{
+		"model_id":      "art-qwen-8k",
+		"filename":      "Qwen-8k.gguf",
+		"context_limit": 8192,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("load returned %d: %s", w.Code, w.Body.String())
+	}
+
+	model, err := node.store.GetHostedModel("art-qwen-8k")
+	if err != nil || model == nil {
+		t.Fatalf("model not found in store: %v", err)
+	}
+	if model.MaxTokens != 4096 {
+		t.Errorf("got MaxTokens %d, want 4096 for 8192 context limit", model.MaxTokens)
+	}
+}
