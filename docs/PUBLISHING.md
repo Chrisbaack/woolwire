@@ -53,8 +53,16 @@ synthetic data for screenshots and fixtures.
 - [ ] Review dependency/model licenses and current vulnerability advisories.
 - [ ] Choose a release version, build immutable artifacts, record checksums and
   provenance, and publish release notes describing tested scope and limitations.
+- [ ] Push a `vX.Y.Z` tag to run [`.github/workflows/release.yml`](../.github/workflows/release.yml),
+  which cross-builds both binaries for linux/darwin/windows on amd64/arm64,
+  attaches them with a combined `SHA256SUMS.txt` to a **draft** GitHub Release
+  for review before publishing, and builds and pushes both container images to
+  `ghcr.io/<owner>/woolwire` and `ghcr.io/<owner>/woolwire-runner`. It only
+  triggers on a version tag, so it costs nothing between releases; on a public
+  repository it costs nothing at all (unlimited Actions minutes and Packages
+  storage). On a private repository it draws from the free plan's 2,000
+  minutes/month and 500MB Packages storage.
 
 [STATUS.md](STATUS.md) is the source for current validation claims.
 [SBOM.md](SBOM.md) is a dependency inventory, not a generated, complete SBOM or
-proof of a reproducible release. No automatic publishing workflow is configured
-by this documentation pass.
+proof of a reproducible release.
