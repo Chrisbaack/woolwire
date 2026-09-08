@@ -371,6 +371,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/managed-models/artifacts", s.authMiddleware(s.handleListArtifacts))
 	s.mux.HandleFunc("GET /api/v1/managed-models/storage", s.authMiddleware(s.handleArtifactStorage))
 	s.mux.HandleFunc("POST /api/v1/managed-models/storage", s.authMiddleware(s.handleSetArtifactStorage))
+	s.mux.HandleFunc("GET /api/v1/managed-models/runner-flags", s.authMiddleware(s.handleRunnerFlags))
 	s.mux.HandleFunc("POST /api/v1/managed-models/download", s.authMiddleware(s.handleDownloadArtifact))
 	s.mux.HandleFunc("GET /api/v1/managed-models/downloads", s.authMiddleware(s.handleDownloadStatus))
 	s.mux.HandleFunc("GET /api/v1/managed-models/huggingface", s.authMiddleware(s.handleResolveHuggingFaceRepo))

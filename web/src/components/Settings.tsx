@@ -104,6 +104,13 @@ interface ArtifactManifest {
   companions?: { kind: 'projector' | 'draft'; path?: string; filename: string }[]
 }
 
+// One llama.cpp tuning switch the runner will accept, as reported by the
+// server so this list cannot drift from what the validator allows.
+interface RunnerExtraFlag {
+  flag: string
+  value: 'none' | 'optional' | 'required'
+}
+
 interface PopularModelDef {
   id: string
   name: string
@@ -296,6 +303,7 @@ export const Settings: React.FC = () => {
   const [managedGpuLayers, setManagedGpuLayers] = useState<'auto' | string>('auto')
   const [managedCustomGpuLayers, setManagedCustomGpuLayers] = useState('0')
   const [managedExtraArgs, setManagedExtraArgs] = useState('[]')
+  const [runnerFlags, setRunnerFlags] = useState<RunnerExtraFlag[]>([])
   const [managedConfigError, setManagedConfigError] = useState('')
   const managedConfigHydrated = useRef(false)
   const [models, setModels] = useState<HostedModel[]>([])
@@ -577,6 +585,12 @@ export const Settings: React.FC = () => {
         setArtifacts(Array.isArray(data) ? data : [])
       }
 
+      const flagRes = await api('/api/v1/managed-models/runner-flags')
+      if (flagRes.ok) {
+        const flags = await flagRes.json()
+        setRunnerFlags(Array.isArray(flags) ? flags : [])
+      }
+
       const sRes = await api('/api/v1/managed-models/storage')
       if (sRes.ok) {
         const storage = await sRes.json()
@@ -625,6 +639,26 @@ export const Settings: React.FC = () => {
     if ((artifact.path || artifact.filename) === runner?.loaded_file && Number(runner?.context_limit) > 0) return
     setManagedContextLimit(artifact.context_limit || 4096)
   }, [selectedArtifactID])
+
+  // The textarea is the source of truth; parsing it is how a click knows what
+  // to append. Null means it does not currently hold a JSON array of strings,
+  // in which case adding to it would throw the contents away.
+  const extraArgsList: string[] | null = (() => {
+    try {
+      const parsed = JSON.parse(managedExtraArgs)
+      return Array.isArray(parsed) && parsed.every((item) => typeof item === 'string') ? parsed : null
+    } catch {
+      return null
+    }
+  })()
+
+  const handleAddExtraFlag = (flag: RunnerExtraFlag) => {
+    if (extraArgsList === null) return
+    const entry = flag.value === 'required' ? `${flag.flag}=` : flag.flag
+    if (extraArgsList.some((item) => item === flag.flag || item.startsWith(`${flag.flag}=`))) return
+    setManagedExtraArgs(JSON.stringify([...extraArgsList, entry], null, 2))
+    setManagedConfigError('')
+  }
 
   const handleSelectArtifact = (id: string) => {
     setSelectedArtifactID(id)
@@ -1424,6 +1458,41 @@ export const Settings: React.FC = () => {
 
             <details className="settings-advanced-panel model-loader-advanced">
               <summary>Advanced llama.cpp arguments</summary>
+              {/* The runner accepts a fixed allow-list of tuning switches, and
+                  a bare text box gave no way to discover it. The list comes
+                  from the server's own validator, so nothing is offered here
+                  that would then be refused. */}
+              {runnerFlags.length > 0 && (
+                <div className="extra-flag-picker">
+                  <div className="extra-flag-picker__label">Accepted flags — click to add</div>
+                  <div className="extra-flag-picker__chips">
+                    {runnerFlags.map((flag) => (
+                      <button
+                        key={flag.flag}
+                        type="button"
+                        className="extra-flag-chip"
+                        disabled={loadingModel || extraArgsList === null}
+                        title={
+                          flag.value === 'none'
+                            ? 'Stands alone; takes no value'
+                            : flag.value === 'optional'
+                              ? 'May stand alone or carry an inline value'
+                              : 'Needs a value, written inline after the ='
+                        }
+                        onClick={() => handleAddExtraFlag(flag)}
+                      >
+                        {flag.flag}
+                        {flag.value === 'required' && <span className="extra-flag-chip__value">=…</span>}
+                      </button>
+                    ))}
+                  </div>
+                  {extraArgsList === null && (
+                    <div className="extra-flag-picker__note">
+                      Fix the JSON below before adding a flag from this list.
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="form-group" style={{ marginTop: '0.75rem' }}>
                 <label htmlFor="managed-extra-args">Extra arguments</label>
                 <textarea
@@ -1436,7 +1505,10 @@ export const Settings: React.FC = () => {
                   aria-describedby="managed-extra-help"
                 />
                 <small id="managed-extra-help">
-                  JSON array of strings, for example <code>[&quot;--no-mmap&quot;]</code>. Woolwire validates each item before sending it to the runner.
+                  JSON array of strings, for example <code>[&quot;--no-mmap&quot;]</code>. A flag that
+                  takes a value carries it inline, as <code>&quot;--batch-size=512&quot;</code>. Anything
+                  outside the list above — paths, networking, authentication, model selection — is
+                  refused by the runner.
                 </small>
               </div>
             </details>

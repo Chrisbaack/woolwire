@@ -893,6 +893,30 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '503': { description: No artifact manager is configured on this node. }
 
+  /api/v1/managed-models/runner-flags:
+    get:
+      tags: [models]
+      summary: List the llama.cpp tuning flags the runner accepts
+      description: |
+        Generated from the same tables the load-time validator reads, so a flag
+        offered here is never refused by a load. value is "none" for a switch
+        that stands alone, "required" for one that must carry a value, and
+        "optional" for one that may.
+      responses:
+        '200':
+          description: The accepted tuning switches, sorted by flag.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [flag, value]
+                  properties:
+                    flag: { type: string }
+                    value: { type: string, enum: [none, optional, required] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   /api/v1/managed-models/artifacts/{filename}:
     delete:
       tags: [models]

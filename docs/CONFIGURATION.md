@@ -133,7 +133,9 @@ restart.
 | Extra arguments | none | Additional `llama-server` tuning flags |
 
 Extra arguments are a JSON array of strings and are passed to `exec` directly,
-never through a shell. Only an allow-list of tuning switches is accepted —
+never through a shell. The Advanced disclosure lists the accepted switches as
+clickable chips, served from `GET /api/v1/managed-models/runner-flags` so the
+list cannot drift from the validator. Only these are accepted —
 `--batch-size`, `--ubatch-size`, `--threads-batch`, `--cache-type-k`,
 `--cache-type-v`, `--rope-scaling`, `--rope-freq-base`, `--rope-freq-scale`,
 `--defrag-thold`, `--keep`, `--prio`, `--poll`, `--flash-attn`, `--no-mmap`,

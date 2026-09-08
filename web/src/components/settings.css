@@ -39,6 +39,16 @@
 /* The engine reports healthy or it does not, so the wait has no percentage
    to show; the bar says "still working" rather than guessing a fraction. */
 .model-loader-bar span { display: block; height: 100%; width: 35%; border-radius: 999px; background: var(--accent-primary); animation: model-loader-slide 1.4s ease-in-out infinite; }
+/* The runner's accepted tuning flags, offered rather than memorized. */
+.extra-flag-picker { margin-top: .75rem; }
+.extra-flag-picker__label { font-size: .78rem; font-weight: 600; color: var(--text-secondary); margin-bottom: .4rem; }
+.extra-flag-picker__chips { display: flex; flex-wrap: wrap; gap: .35rem; }
+.extra-flag-picker__note { font-size: .72rem; color: var(--text-secondary); margin-top: .4rem; }
+.extra-flag-chip { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .72rem; padding: .2rem .45rem; border-radius: 4px; border: 1px solid var(--border-color); background: var(--bg-secondary); color: var(--text-primary); cursor: pointer; }
+.extra-flag-chip:hover:not(:disabled) { border-color: var(--accent-primary); color: var(--accent-primary); }
+.extra-flag-chip:disabled { opacity: .5; cursor: not-allowed; }
+.extra-flag-chip__value { opacity: .6; }
+
 .storage-budget { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .85rem; }
 .storage-budget label { font-size: .8rem; font-weight: 600; }
 .storage-budget input { width: 6.5rem; }

@@ -16,6 +16,7 @@ import (
 	"path"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -123,6 +124,34 @@ var optionalValueExtraFlags = map[string]bool{
 	"--flash-attn": true,
 }
 
+// ExtraFlag describes one accepted tuning switch for a client that wants to
+// offer them rather than make someone memorize the list.
+type ExtraFlag struct {
+	Flag string `json:"flag"`
+	// Value is "none" for a switch that stands alone, "required" for one that
+	// must carry a value, and "optional" for one that may.
+	Value string `json:"value"`
+}
+
+// SupportedExtraFlags lists what ValidateExtraArgs will accept, sorted by
+// flag. It is derived from the same maps the validator reads, so a flag can
+// never be offered by the UI and then refused by the server.
+func SupportedExtraFlags() []ExtraFlag {
+	out := make([]ExtraFlag, 0, len(supportedExtraFlags))
+	for flag := range supportedExtraFlags {
+		kind := "required"
+		switch {
+		case booleanExtraFlags[flag]:
+			kind = "none"
+		case optionalValueExtraFlags[flag]:
+			kind = "optional"
+		}
+		out = append(out, ExtraFlag{Flag: flag, Value: kind})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Flag < out[j].Flag })
+	return out
+}
+
 // ValidateExtraArgs accepts only documented llama-server tuning switches.
 // Arguments are passed directly to exec.Command, never through a shell.
 func ValidateExtraArgs(args []string) error {
@@ -132,7 +161,10 @@ func ValidateExtraArgs(args []string) error {
 	for i := 0; i < len(args); i++ {
 		a := strings.TrimSpace(args[i])
 		if a == "" || !strings.HasPrefix(a, "--") {
-			return fmt.Errorf("unsupported runner argument %q", args[i])
+			// Reached most often by writing a flag and its value as two
+			// entries where the flag takes its value inline, so the message
+			// points at the form that works rather than just refusing.
+			return fmt.Errorf("unsupported runner argument %q: a flag starts with --, and a value for a flag that takes one inline is written as --flag=value", args[i])
 		}
 		flag := a
 		if j := strings.IndexByte(flag, '='); j >= 0 {
@@ -436,6 +468,7 @@ func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"queued_requests":        c.pendingRequests,
 		"requests_completed":     c.requestsCompleted,
 		"requests_failed":        c.requestsFailed,
+		"requests_cancelled":     c.requestsCancelled,
 		"prompt_tokens":          c.promptTokens,
 		"completion_tokens":      c.completionTokens,
 		"last_prompt_tokens":     c.lastPromptTokens,

@@ -183,6 +183,9 @@ manage their own retention explicitly.
 - `GET /api/v1/managed-models/storage` reports configured status, usage, budget,
   and read-only status. Usage is zero if scanning fails; it is not a free-space
   guarantee.
+- `GET /api/v1/managed-models/runner-flags` lists the llama.cpp tuning switches
+  the runner accepts, each with whether it takes a value. It is generated from
+  the validator's own tables, so it cannot drift from what a load will allow.
 - `POST /api/v1/managed-models/storage` sets `budget_bytes`, the ceiling on
   downloaded weights. It is persisted and applied immediately; a budget below
   what is installed blocks new downloads rather than deleting anything. The
@@ -260,6 +263,7 @@ parameters, security overrides, and individual responses.
 | `GET` | `/api/v1/managed-models/artifacts` | List available GGUF models |
 | `GET` | `/api/v1/managed-models/storage` | Read model storage usage, budget, and read-only status |
 | `POST` | `/api/v1/managed-models/storage` | Change the model storage budget |
+| `GET` | `/api/v1/managed-models/runner-flags` | List the llama.cpp tuning flags the runner accepts |
 | `DELETE` | `/api/v1/managed-models/artifacts/{filename}` | Delete a downloaded weight file |
 | `POST` | `/api/v1/managed-models/download` | Start a background weight download |
 | `GET` | `/api/v1/managed-models/huggingface` | List the GGUF weights a Hugging Face repository publishes |

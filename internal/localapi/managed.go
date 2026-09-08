@@ -71,6 +71,15 @@ func (s *Server) handleArtifactStorage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleRunnerFlags lists the llama.cpp tuning switches the runner accepts, so
+// the settings page can offer them instead of expecting them to be memorized.
+// It comes from the validator's own tables, which is what keeps what the UI
+// offers and what the server accepts from drifting apart.
+func (s *Server) handleRunnerFlags(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(runner.SupportedExtraFlags())
+}
+
 // handleSetArtifactStorage changes the ceiling on downloaded weights. The new
 // value is persisted, so it survives a restart, and applied to the running
 // manager, so the next download is measured against it immediately.
