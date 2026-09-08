@@ -224,8 +224,15 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 
 	var assistantContent strings.Builder
 	var streamInterrupted bool
+	start := time.Now()
+	var firstTokenTime time.Time
+	var completionTokens int
 
 	emit := func(delta string) error {
+		if firstTokenTime.IsZero() {
+			firstTokenTime = time.Now()
+		}
+		completionTokens++
 		assistantContent.WriteString(delta)
 		return stream.SendJSON("", map[string]string{
 			"delta":      delta,
@@ -248,6 +255,25 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 			streamInterrupted = true
 			_ = stream.SendJSON("error", map[string]string{"error": err.Error()})
 		} else {
+			var ttftMs int64
+			if !firstTokenTime.IsZero() {
+				ttftMs = firstTokenTime.Sub(start).Milliseconds()
+			}
+			totalMs := time.Since(start).Milliseconds()
+			var tps float64
+			if !firstTokenTime.IsZero() {
+				genDur := time.Since(firstTokenTime).Seconds()
+				if genDur > 0 && completionTokens > 0 {
+					tps = float64(completionTokens) / genDur
+				}
+			}
+			_ = stream.SendJSON("stats", map[string]any{
+				"request_id":        requestID,
+				"ttft_ms":           ttftMs,
+				"total_ms":          totalMs,
+				"completion_tokens": completionTokens,
+				"tokens_per_second": tps,
+			})
 			_ = stream.SendRaw("data: [DONE]\n\n")
 		}
 	} else {
@@ -363,6 +389,12 @@ func (s *Server) relayPeerStream(
 						s.handleInboundReceipt(ctx, rec, hostMemberID, hostAddr)
 					}
 				}
+			}
+
+		case strings.HasPrefix(line, "event: stats"):
+			if scanner.Scan() {
+				statsLine := scanner.Text()
+				_ = stream.SendRaw("event: stats\n" + statsLine + "\n\n")
 			}
 
 		case strings.HasPrefix(line, "event: error"):

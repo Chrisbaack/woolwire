@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
 )
 
 func TestM3RunnerControllerAndArtifactsGate(t *testing.T) {

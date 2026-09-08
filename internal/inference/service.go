@@ -140,7 +140,7 @@ func (s *Service) Execute(
 
 	return s.queue.Submit(ctx, memberID, requestID, func(execCtx context.Context) error {
 		if model.ModelType == "managed" {
-			return s.runner.StreamChat(execCtx, memberID, BackendModelName(model), model.MaxTokens, messages, onDelta)
+			return s.runner.StreamChat(execCtx, memberID, model.ID, BackendModelName(model), model.MaxTokens, messages, onDelta)
 		}
 		return s.adapter.StreamChat(execCtx, hosting.ChatRequest{
 			EndpointURL:         model.EndpointURL,

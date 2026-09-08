@@ -203,7 +203,7 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
   const activeChannel = channels.find((c) => c.id === activeChannelId)
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '240px 1fr', gap: '1.5rem', minHeight: '520px' }}>
+    <div className="conversation-layout">
       {/* Channels Sidebar */}
       <div className="card" style={{ padding: '1rem', display: 'flex', flexDirection: 'column' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
@@ -217,6 +217,9 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
           {channels.map((ch) => (
             <div
               key={ch.id}
+              role="button"
+              tabIndex={0}
+              onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setActiveChannelId(ch.id) } }}
               onClick={() => setActiveChannelId(ch.id)}
               style={{
                 padding: '0.5rem 0.75rem',
@@ -256,7 +259,7 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
             </div>
 
             {/* Messages Feed */}
-            <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.75rem', maxHeight: '420px', paddingRight: '0.5rem', marginBottom: '1rem' }}>
+            <div className="message-feed" style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.75rem', minHeight: 0, paddingRight: '0.5rem', marginBottom: '1rem' }}>
               {messages.length === 0 ? (
                 <div style={{ textAlign: 'center', color: 'var(--text-secondary)', marginTop: '4rem', fontSize: '0.9rem' }}>
                   No messages in #{activeChannel.name} yet. Send the first message!
@@ -276,7 +279,7 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                         <strong style={{ fontSize: '0.9rem' }}>
-                          {m.author_display_name} {currentMemberID && m.author_member_id === currentMemberID && <span style={{ color: 'var(--accent-primary)', fontSize: '0.75rem' }}>(You)</span>}
+                          {m.author_display_name} {currentMemberID && m.author_member_id === currentMemberID && <span style={{ color: 'var(--accent-text)', fontSize: '0.75rem' }}>(You)</span>}
                         </strong>
                         <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
                           {new Date(m.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -292,7 +295,7 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
                       {/* Action buttons */}
                       {!m.deleted && !m.tombstoned && (
                         <div style={{ display: 'flex', gap: '0.5rem' }}>
-                          {(!currentMemberID || m.author_member_id === currentMemberID) && (
+                          {(currentMemberID && m.author_member_id === currentMemberID) && (
                             <>
                               <button
                                 onClick={() => {
@@ -387,7 +390,7 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
             zIndex: 100,
           }}
         >
-          <div className="card" style={{ width: '400px' }}>
+          <div className="card" style={{ width: '400px', maxWidth: 'calc(100vw - 2rem)', maxHeight: '90dvh', overflowY: 'auto' }}>
             <h2>Create Channel</h2>
             <form onSubmit={handleCreateChannel}>
               <div className="form-group">

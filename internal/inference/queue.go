@@ -12,6 +12,7 @@ var (
 	ErrMemberQueueFull  = errors.New("member has reached maximum queued requests")
 	ErrQueueTimeout     = errors.New("request expired while waiting in queue")
 	ErrRequestCancelled = errors.New("request was cancelled")
+	ErrDuplicateRequest = errors.New("duplicate request id for member")
 )
 
 type Limits struct {
@@ -70,6 +71,11 @@ type queueItem struct {
 	removed bool
 }
 
+type requestKey struct {
+	memberID  string
+	requestID string
+}
+
 // FairQueue admits inference work under per-member and host-wide limits and
 // serves waiting members round-robin rather than first-come-first-served, so
 // one member with a deep queue cannot starve the others.
@@ -82,7 +88,7 @@ type FairQueue struct {
 	memberQueued map[string]int
 	queues       map[string][]*queueItem
 	rotation     []string
-	activeItems  map[string]*queueItem
+	activeItems  map[requestKey]*queueItem
 	closed       bool
 }
 
@@ -91,7 +97,7 @@ func NewFairQueue(limits Limits) *FairQueue {
 		limits:       normalizeLimits(limits),
 		memberQueued: make(map[string]int),
 		queues:       make(map[string][]*queueItem),
-		activeItems:  make(map[string]*queueItem),
+		activeItems:  make(map[requestKey]*queueItem),
 	}
 }
 
@@ -115,6 +121,19 @@ func (q *FairQueue) Submit(
 		q.mu.Unlock()
 		return errors.New("queue is closed")
 	}
+
+	key := requestKey{memberID: memberID, requestID: requestID}
+	if _, ok := q.activeItems[key]; ok {
+		q.mu.Unlock()
+		return ErrDuplicateRequest
+	}
+	for _, it := range q.queues[memberID] {
+		if it.requestID == requestID {
+			q.mu.Unlock()
+			return ErrDuplicateRequest
+		}
+	}
+
 	if q.memberQueued[memberID] >= q.limits.MaxQueuedPerMember {
 		q.mu.Unlock()
 		return ErrMemberQueueFull
@@ -136,7 +155,7 @@ func (q *FairQueue) Submit(
 
 	if q.activeCount < q.limits.MaxActive && q.totalQueued == 0 {
 		q.activeCount++
-		q.activeItems[requestID] = item
+		q.activeItems[key] = item
 		item.dispatched = true
 		q.mu.Unlock()
 		return q.execute(item)
@@ -198,12 +217,15 @@ func (q *FairQueue) execute(item *queueItem) error {
 	err := item.runFn(execCtx)
 
 	q.mu.Lock()
-	delete(q.activeItems, item.requestID)
-	q.activeCount--
-	if q.activeCount < 0 {
-		q.activeCount = 0
+	key := requestKey{memberID: item.memberID, requestID: item.requestID}
+	if q.activeItems[key] == item {
+		delete(q.activeItems, key)
+		q.activeCount--
+		if q.activeCount < 0 {
+			q.activeCount = 0
+		}
+		q.dispatchNextLocked()
 	}
-	q.dispatchNextLocked()
 	q.mu.Unlock()
 
 	item.cancel()
@@ -288,7 +310,7 @@ func (q *FairQueue) dispatchNextLocked() {
 		next.removed = true
 		next.dispatched = true
 		q.activeCount++
-		q.activeItems[next.requestID] = next
+		q.activeItems[requestKey{memberID: next.memberID, requestID: next.requestID}] = next
 		close(next.ready)
 	}
 }
@@ -299,22 +321,14 @@ func (q *FairQueue) Cancel(requestID, memberID string) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if item, ok := q.activeItems[requestID]; ok {
-		if item.memberID != memberID {
-			return false
-		}
+	key := requestKey{memberID: memberID, requestID: requestID}
+	if item, ok := q.activeItems[key]; ok {
 		item.cancel()
 		return true
 	}
 
-	for _, items := range q.queues {
-		for _, item := range items {
-			if item.requestID != requestID {
-				continue
-			}
-			if item.memberID != memberID {
-				return false
-			}
+	for _, item := range q.queues[memberID] {
+		if item.requestID == requestID {
 			q.removeLocked(item)
 			item.cancel()
 			q.dispatchNextLocked()
@@ -332,8 +346,8 @@ func (q *FairQueue) CancelMember(memberID string) int {
 	defer q.mu.Unlock()
 
 	cancelled := 0
-	for _, item := range q.activeItems {
-		if item.memberID == memberID {
+	for key, item := range q.activeItems {
+		if key.memberID == memberID {
 			item.cancel()
 			cancelled++
 		}

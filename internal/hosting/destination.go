@@ -251,6 +251,32 @@ func guardedClient(policy DestinationPolicy, responseHeaderTimeout time.Duration
 	}
 }
 
+// guardedDownloadClient builds an HTTP client for downloading artifacts that
+// safely follows HTTPS redirects after re-validating each redirect target
+// against the destination policy and guarded dialer.
+func guardedDownloadClient(policy DestinationPolicy, responseHeaderTimeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: 0, // streaming and large downloads are bounded by context
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			if err := ValidateDestinationWithPolicy(req.URL.String(), policy); err != nil {
+				return fmt.Errorf("redirect blocked: %w", err)
+			}
+			if req.URL.Scheme != "https" {
+				return errors.New("redirect must use HTTPS")
+			}
+			return nil
+		},
+		Transport: &http.Transport{
+			DialContext:           GuardedDialer(policy),
+			ResponseHeaderTimeout: responseHeaderTimeout,
+			ForceAttemptHTTP2:     true,
+		},
+	}
+}
+
 // requirePlainHTTPIsLocal keeps cleartext traffic on the machine. It runs
 // after the URL is parsed and before any request is issued.
 func requirePlainHTTPIsLocal(endpointURL string, policy DestinationPolicy) error {

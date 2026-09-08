@@ -18,3 +18,27 @@ web/.vite/
 # Tool memory
 .codebase-memory/
 
+# Local deployment configuration and credentials
+.env
+.env.*
+!.env.example
+*.local.yaml
+*.local.yml
+*.cookies
+*.pem
+*.key
+
+# Model weights, snapshots, and backups
+/models/
+/backups/
+*.gguf
+*.safetensors
+*.sqlite
+*.sqlite3
+*.db-shm
+*.age
+*.log
+
+# Local editor and Python artifacts
+.DS_Store
+__pycache__/

@@ -8,14 +8,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"path"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cbaack/woolwire/internal/modelpath"
 )
 
 type EngineStatus string
@@ -48,6 +52,25 @@ type Config struct {
 	// llama-server with the flags below; a deployment needing extra engine
 	// flags, or a test using a stand-in engine, replaces it wholesale.
 	EngineCommand func(ctx context.Context, args EngineArgs) *exec.Cmd
+	// DetectGPU reports whether this container can offload to a GPU, and what
+	// it is called. It defaults to looking for the device node.
+	DetectGPU func() (bool, string)
+}
+
+// detectGPU looks for the device the container was given. Only the device node
+// proves the GPU is usable from in here: /proc/driver/nvidia is visible to
+// every container on the host, whether or not it was passed a device.
+func detectGPU() (bool, string) {
+	if _, err := os.Stat("/dev/nvidia0"); err != nil {
+		return false, ""
+	}
+	name := "NVIDIA CUDA Compatible Device"
+	if out, err := exec.Command("nvidia-smi", "--query-gpu=name", "--format=csv,noheader").Output(); err == nil {
+		if first, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n"); first != "" {
+			name = first
+		}
+	}
+	return true, name
 }
 
 // EngineArgs is the resolved launch configuration for one model.
@@ -57,8 +80,18 @@ type EngineArgs struct {
 	ModelPath    string
 	ContextLimit int
 	Threads      int
-	GPULayers    int
-	Port         uint16
+	// ProjectorPath is a multimodal projector to load with the model. Without
+	// it a vision model answers as a text-only one.
+	ProjectorPath string
+	// DraftPath is a multi-token-prediction module run as a speculative
+	// draft. It only ever affects speed.
+	DraftPath string
+	// GPULayers is how many layers to offload. A nil value leaves the choice
+	// to the engine, whose own default sizes the offload to the VRAM actually
+	// free — better than any number this process could pick, and it degrades
+	// to a partial offload instead of failing when a model does not fit.
+	GPULayers *int
+	Port      uint16
 }
 
 type Controller struct {
@@ -66,6 +99,11 @@ type Controller struct {
 	runnerToken string
 	enginePath  string
 	enginePort  uint16
+	hasGPU      bool
+	gpuName     string
+	// notice explains a load that succeeded on different terms than asked,
+	// such as one that had to drop speculative decoding.
+	notice        string
 	healthCheck   func(ctx context.Context, port uint16) error
 	engineCommand func(ctx context.Context, args EngineArgs) *exec.Cmd
 
@@ -101,36 +139,145 @@ func NewController(cfg Config) (*Controller, error) {
 	if cfg.HealthCheck == nil {
 		cfg.HealthCheck = defaultHealthCheck
 	}
+	if cfg.DetectGPU == nil {
+		cfg.DetectGPU = detectGPU
+	}
 	if cfg.EngineCommand == nil {
 		enginePath := cfg.EnginePath
 		if enginePath == "" {
 			enginePath = "llama-server"
 		}
 		cfg.EngineCommand = func(ctx context.Context, args EngineArgs) *exec.Cmd {
-			return exec.CommandContext(ctx, enginePath,
+			argv := []string{
 				"-m", args.ModelPath,
 				"-c", fmt.Sprintf("%d", args.ContextLimit),
 				"-t", fmt.Sprintf("%d", args.Threads),
-				"-ngl", fmt.Sprintf("%d", args.GPULayers),
 				"--port", fmt.Sprintf("%d", args.Port),
 				"--host", "127.0.0.1",
-			)
+			}
+			if args.ProjectorPath != "" {
+				argv = append(argv, "--mmproj", args.ProjectorPath)
+			}
+			if args.DraftPath != "" {
+				argv = append(argv, "-md", args.DraftPath, "--spec-type", "draft-mtp")
+			}
+			// Omitting -ngl entirely is what asks the engine to decide, and it
+			// works on builds that predate the flag's "auto" value.
+			if args.GPULayers != nil {
+				argv = append(argv, "-ngl", fmt.Sprintf("%d", *args.GPULayers))
+			}
+			return exec.CommandContext(ctx, enginePath, argv...)
 		}
 	}
 
+	hasGPU, gpuName := cfg.DetectGPU()
+
 	c := &Controller{
-		modelDir:    cfg.ModelDir,
-		runnerToken: cfg.RunnerToken,
-		enginePath:  cfg.EnginePath,
-		enginePort:  cfg.EnginePort,
+		hasGPU:        hasGPU,
+		gpuName:       gpuName,
+		modelDir:      cfg.ModelDir,
+		runnerToken:   cfg.RunnerToken,
+		enginePath:    cfg.EnginePath,
+		enginePort:    cfg.EnginePort,
 		healthCheck:   cfg.HealthCheck,
 		engineCommand: cfg.EngineCommand,
-		status:      StatusIdle,
-		mux:         http.NewServeMux(),
+		status:        StatusIdle,
+		mux:           http.NewServeMux(),
 	}
 
 	c.routes()
 	return c, nil
+}
+
+// engineTailBytes bounds what we keep of the engine's output. Only the last
+// lines matter: llama-server prints why it is giving up just before it exits.
+const engineTailBytes = 8 << 10
+
+// outputTail keeps the end of the engine's output so a failure can say what
+// the engine said. Without it the only record was the runner container's own
+// stdout, which nobody looking at the UI can see: a model the engine cannot
+// load surfaced as "runner error (500)" and nothing else.
+type outputTail struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (t *outputTail) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > engineTailBytes {
+		t.buf = append([]byte(nil), t.buf[len(t.buf)-engineTailBytes:]...)
+	}
+	return len(p), nil
+}
+
+// causePattern picks out the lines that say what went wrong, as opposed to
+// the several lines an engine prints while giving up afterwards.
+var causePattern = regexp.MustCompile(`(?i)\b(error|failed|cannot|unable|unsupported|unknown|out of memory|no such)\b`)
+
+// summarize returns up to n lines explaining a failure.
+//
+// The first failing lines are the useful ones: llama.cpp names the actual
+// problem ("unknown model architecture: 'k2-horizon'") and then prints
+// several lines of cleanup, so quoting the tail reported only that it was
+// exiting — true, and no help at all. Lines are deduplicated because the
+// engine probes a model twice before giving up, and the diagnosis appears
+// once per attempt.
+func (t *outputTail) summarize(n int) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var lines []string
+	for _, raw := range strings.Split(string(t.buf), "\n") {
+		if line := strings.TrimSpace(raw); line != "" {
+			lines = append(lines, line)
+		}
+	}
+
+	pick := func(candidates []string) []string {
+		seen := make(map[string]bool, len(candidates))
+		var kept []string
+		for _, line := range candidates {
+			if seen[line] {
+				continue
+			}
+			seen[line] = true
+			kept = append(kept, line)
+			if len(kept) == n {
+				break
+			}
+		}
+		return kept
+	}
+
+	var causes []string
+	for _, line := range lines {
+		if causePattern.MatchString(line) {
+			causes = append(causes, line)
+		}
+	}
+	if len(causes) > 0 {
+		return strings.Join(pick(causes), "; ")
+	}
+
+	// Nothing looked like a diagnosis, so the end of the output is the best
+	// available account.
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(pick(lines), "; ")
+}
+
+// withEngineOutput reports an engine failure together with what the engine
+// printed, so the reason reaches whoever asked for the load.
+func withEngineOutput(err error, tail *outputTail) error {
+	detail := tail.summarize(3)
+	if detail == "" {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, detail)
 }
 
 // defaultHealthCheck polls llama-server's /health until it answers.
@@ -195,6 +342,11 @@ func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"engine_pid":      pid,
 		"model_dir":       c.modelDir,
 		"error":           c.lastError,
+		// The GPU is attached to this container, not to the one asking. The
+		// app has no way to see it, so the runner reports it.
+		"has_gpu":  c.hasGPU,
+		"gpu_name": c.gpuName,
+		"notice":   c.notice,
 	})
 }
 
@@ -203,7 +355,25 @@ type LoadModelRequest struct {
 	Filename     string `json:"filename"`
 	ContextLimit int    `json:"context_limit"`
 	Threads      int    `json:"threads"`
-	GPULayers    int    `json:"gpu_layers"`
+	// Projector and DraftModel locate the model's companions, relative to the
+	// models directory and validated the same way the weights are.
+	Projector  string `json:"mmproj"`
+	DraftModel string `json:"draft_model"`
+	// GPULayers is how many layers to offload. Omit it to let the runner
+	// decide: it is the process with the GPU attached, and the caller is in
+	// another container that cannot see one. 0 still means "run on the CPU".
+	GPULayers *int `json:"gpu_layers"`
+}
+
+// defaultGPULayers resolves an omitted gpu_layers. With a GPU attached the
+// engine picks the split itself; without one there is nothing to offload to,
+// and saying so keeps a GPU-less runner off a code path it cannot serve.
+func (c *Controller) defaultGPULayers() *int {
+	if c.hasGPU {
+		return nil
+	}
+	cpuOnly := 0
+	return &cpuOnly
 }
 
 func (c *Controller) handleLoadModel(w http.ResponseWriter, r *http.Request) {
@@ -213,37 +383,58 @@ func (c *Controller) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Filename sanitization: prohibit path traversal, directories, or absolute paths
-	cleanName := filepath.Base(req.Filename)
-	if cleanName != req.Filename || strings.Contains(req.Filename, "..") || strings.Contains(req.Filename, "/") || strings.Contains(req.Filename, "\\") {
-		http.Error(w, "invalid filename: path traversal prohibited", http.StatusBadRequest)
+	// The reference may name a file in a subdirectory — a Hugging Face cache
+	// nests every weight file — but it must stay inside the model volume.
+	cleanName, modelPath, err := modelpath.Resolve(c.modelDir, req.Filename)
+	if err != nil {
+		if errors.Is(err, modelpath.ErrEmpty) || errors.Is(err, modelpath.ErrEscapes) || errors.Is(err, modelpath.ErrTooDeep) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		http.Error(w, fmt.Sprintf("model weight file %q not found in model volume", req.Filename), http.StatusNotFound)
 		return
 	}
 
-	modelPath := filepath.Join(c.modelDir, cleanName)
-	info, err := os.Stat(modelPath)
-	if err != nil || info.IsDir() {
-		http.Error(w, fmt.Sprintf("model weight file %q not found in model volume", cleanName), http.StatusNotFound)
-		return
+	// A companion the runner cannot find is worth reporting: silently serving
+	// a vision model without its projector looks like the model is broken.
+	var projectorPath, draftPath string
+	if req.Projector != "" {
+		if _, resolved, err := modelpath.Resolve(c.modelDir, req.Projector); err != nil {
+			http.Error(w, fmt.Sprintf("projector %q not found in model volume", req.Projector), http.StatusNotFound)
+			return
+		} else {
+			projectorPath = resolved
+		}
+	}
+	if req.DraftModel != "" {
+		if _, resolved, err := modelpath.Resolve(c.modelDir, req.DraftModel); err != nil {
+			http.Error(w, fmt.Sprintf("draft model %q not found in model volume", req.DraftModel), http.StatusNotFound)
+			return
+		} else {
+			draftPath = resolved
+		}
 	}
 
 	args := EngineArgs{
-		ModelID:      req.ModelID,
-		Filename:     cleanName,
-		ModelPath:    modelPath,
-		ContextLimit: req.ContextLimit,
-		Threads:      req.Threads,
-		GPULayers:    req.GPULayers,
-		Port:         c.enginePort,
+		ModelID:       req.ModelID,
+		Filename:      cleanName,
+		ModelPath:     modelPath,
+		ProjectorPath: projectorPath,
+		DraftPath:     draftPath,
+		ContextLimit:  req.ContextLimit,
+		Threads:       req.Threads,
+		GPULayers:     c.defaultGPULayers(),
+		Port:          c.enginePort,
+	}
+	if req.GPULayers != nil && *req.GPULayers >= 0 {
+		layers := *req.GPULayers
+		args.GPULayers = &layers
 	}
 	if args.ContextLimit <= 0 {
 		args.ContextLimit = 4096
 	}
 	if args.Threads <= 0 {
 		args.Threads = 4
-	}
-	if args.GPULayers < 0 {
-		args.GPULayers = 0
 	}
 
 	c.mu.Lock()
@@ -256,6 +447,21 @@ func (c *Controller) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 	c.mu.Unlock()
 
 	pid, err := c.launchEngine(r.Context(), args)
+	if err != nil && args.DraftPath != "" {
+		// Speculative decoding is an optimization, and support for a given
+		// module is newer than the models shipping them. Losing the speed-up
+		// beats refusing to serve the model at all — but say so, rather than
+		// quietly running something other than what was asked for.
+		notice := fmt.Sprintf("speculative decoding disabled: the engine would not start with %s (%v)",
+			path.Base(args.DraftPath), err)
+		args.DraftPath = ""
+		if retryPID, retryErr := c.launchEngine(r.Context(), args); retryErr == nil {
+			pid, err = retryPID, nil
+			c.mu.Lock()
+			c.notice = notice
+			c.mu.Unlock()
+		}
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -281,18 +487,27 @@ func (c *Controller) launchEngine(ctx context.Context, args EngineArgs) (int, er
 
 	engineCtx, cancel := context.WithCancel(context.Background())
 	cmd := c.engineCommand(engineCtx, args)
-	if cmd.Stdout == nil {
-		cmd.Stdout = os.Stdout
+
+	// The engine's output still goes where it went before; it is also kept so
+	// a failed load can quote it.
+	tail := &outputTail{}
+	stdout := io.Writer(os.Stdout)
+	if cmd.Stdout != nil {
+		stdout = cmd.Stdout
 	}
-	if cmd.Stderr == nil {
-		cmd.Stderr = os.Stderr
+	stderr := io.Writer(os.Stderr)
+	if cmd.Stderr != nil {
+		stderr = cmd.Stderr
 	}
+	cmd.Stdout = io.MultiWriter(stdout, tail)
+	cmd.Stderr = io.MultiWriter(stderr, tail)
 
 	if err := cmd.Start(); err != nil {
 		cancel()
 		c.mu.Lock()
 		c.status = StatusError
 		c.lastError = err.Error()
+		c.loaded = EngineArgs{}
 		c.mu.Unlock()
 		return 0, fmt.Errorf("failed to launch engine: %w", err)
 	}
@@ -319,18 +534,20 @@ func (c *Controller) launchEngine(ctx context.Context, args EngineArgs) (int, er
 		c.engineDone = nil
 		if c.status != StatusIdle {
 			c.status = StatusError
+			exit := errors.New("engine exited unexpectedly")
 			if waitErr != nil {
-				c.lastError = waitErr.Error()
-			} else {
-				c.lastError = "engine exited unexpectedly"
+				exit = waitErr
 			}
+			c.lastError = withEngineOutput(exit, tail).Error()
 		}
 	}()
 
 	if err := c.waitForHealthy(ctx, done); err != nil {
+		err = withEngineOutput(err, tail)
 		c.mu.Lock()
 		c.status = StatusError
 		c.lastError = err.Error()
+		c.loaded = EngineArgs{}
 		c.stopEngineLocked()
 		c.mu.Unlock()
 		return 0, err
@@ -338,6 +555,7 @@ func (c *Controller) launchEngine(ctx context.Context, args EngineArgs) (int, er
 
 	c.mu.Lock()
 	c.status = StatusReady
+	c.notice = ""
 	c.lastRequester = ""
 	pid := 0
 	if c.engineCmd != nil && c.engineCmd.Process != nil {
@@ -438,6 +656,7 @@ func (c *Controller) handleRestartEngine(w http.ResponseWriter, r *http.Request)
 // client from injecting arbitrary llama-server parameters.
 type InferenceRequest struct {
 	Model             string        `json:"model"`
+	ModelID           string        `json:"model_id,omitempty"`
 	Messages          []ChatMessage `json:"messages"`
 	Stream            bool          `json:"stream"`
 	MaxTokens         int           `json:"max_tokens,omitempty"`
@@ -475,11 +694,22 @@ func (c *Controller) handleInference(w http.ResponseWriter, r *http.Request) {
 	c.mu.RLock()
 	status := c.status
 	loadedID := c.loaded.ModelID
+	loadedFile := c.loaded.Filename
 	lastRequester := c.lastRequester
 	c.mu.RUnlock()
 
 	if status != StatusReady || loadedID == "" {
 		http.Error(w, "no model is loaded in runner", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Enforce loaded-model identity: reject requests intended for a different model
+	if req.ModelID != "" && req.ModelID != loadedID {
+		http.Error(w, fmt.Sprintf("model %q is not currently loaded in runner (loaded: %q)", req.ModelID, loadedID), http.StatusConflict)
+		return
+	}
+	if req.ModelID == "" && req.Model != "" && req.Model != loadedID && req.Model != loadedFile && req.Model != strings.TrimSuffix(loadedFile, ".gguf") {
+		http.Error(w, fmt.Sprintf("model %q is not currently loaded in runner (loaded: %q)", req.Model, loadedID), http.StatusConflict)
 		return
 	}
 
@@ -523,6 +753,9 @@ func (c *Controller) handleInference(w http.ResponseWriter, r *http.Request) {
 		"model":    req.Model,
 		"messages": req.Messages,
 		"stream":   true,
+		"stream_options": map[string]any{
+			"include_usage": true,
+		},
 	}
 	if req.MaxTokens > 0 {
 		enginePayload["max_tokens"] = req.MaxTokens

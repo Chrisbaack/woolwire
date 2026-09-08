@@ -21,6 +21,11 @@ const (
 	// one burst every thirty seconds.
 	membershipSyncJitter = 10 * time.Second
 
+	// catalogRefreshInterval keeps a node's own advertisements comfortably
+	// inside catalog.StaleAdTimeoutSeconds, so its models never read as
+	// offline to itself while it is running.
+	catalogRefreshInterval = 30 * time.Second
+
 	retentionInterval = time.Hour
 	// retentionWindow and retentionByteCap are the documented community
 	// retention policy: thirty days or 250 MiB, whichever binds first.
@@ -40,6 +45,25 @@ func (s *Server) membershipLoop(ctx context.Context) {
 			return
 		case <-timer.C:
 			s.SyncMembership(ctx)
+		}
+	}
+}
+
+// catalogLoop keeps this node's own model advertisements fresh. Availability
+// of a local model is not something the network tells us, so it must not
+// depend on anything outside this process — least of all on a browser polling
+// the dashboard, which is what it used to depend on.
+func (s *Server) catalogLoop(ctx context.Context) {
+	ticker := time.NewTicker(catalogRefreshInterval)
+	defer ticker.Stop()
+
+	s.advertiseLocalModels()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.advertiseLocalModels()
 		}
 	}
 }
@@ -105,10 +129,17 @@ func (s *Server) syncMembershipWithPeer(
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	members, _ := s.store.ListMembers(roomRec.RoomID)
+	knownVersions := make(map[string]int64, len(members))
+	for _, m := range members {
+		knownVersions[m.MemberID] = m.RosterVersion
+	}
+
 	var resp peerapi.SyncResponse
 	req := peerapi.SyncRequest{
-		KnownVersion: roomRec.RosterVersion,
-		TailcatAddr:  s.trans.Address(),
+		KnownVersion:  roomRec.RosterVersion,
+		KnownVersions: knownVersions,
+		TailcatAddr:   s.trans.Address(),
 	}
 	if err := s.peerJSON(dialCtx, peer.MemberID, peer.TailcatAddr, "POST", "/peer/v1/membership/sync", req, &resp); err != nil {
 		return
@@ -130,8 +161,6 @@ func (s *Server) syncMembershipWithPeer(
 // that verify against the pinned authority and carry a higher roster version
 // than the stored row take effect.
 func (s *Server) applyMembershipUpdates(roomRec *store.RoomRecord, authority ed25519.PublicKey, updates []room.Membership) {
-	highest := roomRec.RosterVersion
-
 	for _, m := range updates {
 		if m.RoomID != roomRec.RoomID {
 			continue
@@ -146,9 +175,6 @@ func (s *Server) applyMembershipUpdates(roomRec *store.RoomRecord, authority ed2
 		}
 
 		saveMembership(s.store, m)
-		if m.RosterVersion > highest {
-			highest = m.RosterVersion
-		}
 
 		if m.Status == room.StatusRemoved {
 			// Stop serving the member now: cancel anything of theirs in the
@@ -158,8 +184,21 @@ func (s *Server) applyMembershipUpdates(roomRec *store.RoomRecord, authority ed2
 		}
 	}
 
-	if highest > roomRec.RosterVersion {
-		roomRec.RosterVersion = highest
+	// Update roster version: advance to highest contiguous version so missing
+	// removals or updates are never permanently excluded from future syncs.
+	allMembers, _ := s.store.ListMembers(roomRec.RoomID)
+	versions := make(map[int64]bool, len(allMembers))
+	for _, m := range allMembers {
+		versions[m.RosterVersion] = true
+	}
+	var contiguous int64 = 1
+	for versions[contiguous] {
+		contiguous++
+	}
+	newRosterVersion := contiguous - 1
+
+	if newRosterVersion > roomRec.RosterVersion {
+		roomRec.RosterVersion = newRosterVersion
 		_ = s.store.SaveRoomState(*roomRec)
 	}
 }

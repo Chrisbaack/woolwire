@@ -735,5 +735,142 @@ func TestRoomStateEdgeCases(t *testing.T) {
 		if err := m.Verify(authority); err != nil {
 			t.Fatalf("approved membership does not verify: %v", err)
 		}
+
+		// Task 34: Approved joiner retries join to complete onboarding
+		retryW := joiner.joinRoom(t, "Bob", invitation)
+		if retryW.Code != http.StatusOK {
+			t.Fatalf("joiner retry after approval failed: %d %s", retryW.Code, retryW.Body.String())
+		}
+		var retryResp struct {
+			Status string `json:"status"`
+			RoomID string `json:"room_id"`
+		}
+		_ = json.NewDecoder(retryW.Body).Decode(&retryResp)
+		if retryResp.Status != string(room.StatusAdmitted) {
+			t.Fatalf("expected admitted on retry, got %q", retryResp.Status)
+		}
+
+		// Verify joiner saved room state and started peer server
+		joinerRoom, err := joiner.store.GetRoomState()
+		if err != nil || joinerRoom == nil {
+			t.Fatalf("joiner room state not saved: %v", err)
+		}
+		if joiner.peerServer() == nil {
+			t.Fatal("joiner peer server was not started after onboarding")
+		}
+
+		// Authenticated peer request from joiner to creator
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var creatorCatalog []any
+		err = joiner.localSrv.peerJSON(ctx, creator.memberID, "approval-creator", "GET", "/peer/v1/catalog", nil, &creatorCatalog)
+		if err != nil {
+			t.Fatalf("authenticated peer request failed: %v", err)
+		}
+
+		// Creator removes joiner
+		removeCode := creator.doJSON("POST", fmt.Sprintf("/api/v1/room-admin/members/%s/remove", joiner.memberID), map[string]any{
+			"rotate_invitation": false,
+		}).Code
+		if removeCode != http.StatusOK {
+			t.Fatalf("remove member failed: %d", removeCode)
+		}
+
+		// Joiner leaves room locally
+		if leaveCode := joiner.doJSON("POST", "/api/v1/room/leave", nil).Code; leaveCode != http.StatusOK {
+			t.Fatalf("joiner leave room failed: %d", leaveCode)
+		}
+
+		// Removed member cannot rejoin: bootstrap response must be rejected
+		rejoinW := joiner.joinRoom(t, "Bob", invitation)
+		var rejoinResp struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		}
+		_ = json.NewDecoder(rejoinW.Body).Decode(&rejoinResp)
+		if rejoinResp.Status != "rejected" {
+			t.Fatalf("rejoin by removed member should be rejected, got %s: %s", rejoinResp.Status, rejoinW.Body.String())
+		}
+		if joinerRoomAfter, _ := joiner.store.GetRoomState(); joinerRoomAfter != nil {
+			t.Fatal("removed member should not have saved room state")
+		}
 	})
+}
+
+// TestPartialRosterUpdateDoesNotHideRemovals covers task 30.
+func TestPartialRosterUpdateDoesNotHideRemovals(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	const peerPort = 4280
+
+	creator := setupTestNode(t, vNet, "roster-creator", peerPort)
+	creator.login(t)
+	_, invitation := creator.hostRoom(t, "Alice", "Roster Room")
+
+	bob := setupTestNode(t, vNet, "roster-bob", peerPort)
+	bob.login(t)
+	if w := bob.joinRoom(t, "Bob", invitation); w.Code != http.StatusOK {
+		t.Fatalf("bob join: %d %s", w.Code, w.Body.String())
+	}
+
+	charlie := setupTestNode(t, vNet, "roster-charlie", peerPort)
+	charlie.login(t)
+	if w := charlie.joinRoom(t, "Charlie", invitation); w.Code != http.StatusOK {
+		t.Fatalf("charlie join: %d %s", w.Code, w.Body.String())
+	}
+
+	// Remove Bob on creator (generates Bob's removal record at higher roster version)
+	if code := creator.doJSON("POST", fmt.Sprintf("/api/v1/room-admin/members/%s/remove", bob.memberID), map[string]any{
+		"rotate_invitation": false,
+	}).Code; code != http.StatusOK {
+		t.Fatalf("remove bob failed: %d", code)
+	}
+
+	// Creator admits Dave (generates Dave's record at even higher roster version)
+	dave := setupTestNode(t, vNet, "roster-dave", peerPort)
+	dave.login(t)
+	if w := dave.joinRoom(t, "Dave", invitation); w.Code != http.StatusOK {
+		t.Fatalf("dave join: %d %s", w.Code, w.Body.String())
+	}
+
+	// Get Dave's signed membership from creator
+	daveMem, err := creator.store.GetMember(dave.memberID)
+	if err != nil || daveMem == nil {
+		t.Fatal(err)
+	}
+
+	// Deliver Dave's newer record to Charlie directly (withholding Bob's removal)
+	daveMembership := room.Membership{
+		MemberID:      daveMem.MemberID,
+		RoomID:        daveMem.RoomID,
+		DevicePublic:  daveMem.DevicePublic,
+		DisplayName:   daveMem.DisplayName,
+		Status:        room.MemberStatus(daveMem.Status),
+		RosterVersion: daveMem.RosterVersion,
+		Signature:     daveMem.Signature,
+		SigVersion:    daveMem.SigVersion,
+	}
+	charlieRoom, _ := charlie.store.GetRoomState()
+	authority, err := creatorAuthority(creator.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	charlie.localSrv.applyMembershipUpdates(charlieRoom, authority, []room.Membership{daveMembership})
+
+	// Charlie now knows Dave, but still thinks Bob is admitted
+	bobOnCharlie, _ := charlie.store.GetMember(bob.memberID)
+	if bobOnCharlie.Status != string(room.StatusAdmitted) {
+		t.Fatalf("expected Bob still admitted before sync, got %s", bobOnCharlie.Status)
+	}
+
+	// Now Charlie syncs membership with honest peers (creator)
+	charlie.localSrv.SyncMembership(context.Background())
+
+	// Charlie must now have learned Bob's removal!
+	bobAfterSync, err := charlie.store.GetMember(bob.memberID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bobAfterSync.Status != string(room.StatusRemoved) {
+		t.Fatalf("expected Bob to be removed on Charlie after sync, got %s", bobAfterSync.Status)
+	}
 }

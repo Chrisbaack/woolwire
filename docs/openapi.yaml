@@ -2,11 +2,12 @@ openapi: 3.1.0
 info:
   title: Woolwire API
   description: |
-    HTTP API for Woolwire's three interfaces.
+    HTTP API for Woolwire's owner, compatible-client, peer, bootstrap, and runner interfaces.
 
-    **Local owner API** (`/api/v1`, `/v1`) is served on loopback. It is
-    protected by a session cookie obtained from the one-time setup secret,
-    and every state-changing request must carry either an `Origin` matching
+    **Local owner API** (`/api/v1`) uses a session cookie obtained from the
+    one-time setup secret. **Compatible-client API** (`/v1`) instead requires
+    the local API bearer token. Both use the app listener, published to
+    loopback by default. Every state-changing request must carry an `Origin` matching
     the request's own host or the `X-Woolwire-Request` header. JSON routes
     reject any content type other than `application/json`. Without this, a
     page served from another port on 127.0.0.1 is same-site to the browser
@@ -16,7 +17,7 @@ info:
     1.3. A connection completes only when the client certificate's Ed25519
     key belongs to an admitted member whose membership verifies against the
     pinned room authority. The caller's identity comes from that certificate,
-    so no request body carries a member id.
+    so a caller-supplied member id is never the authentication authority.
 
     **Bootstrap API** (`/bootstrap/v1`) is served only by the room creator, on
     the peer port plus one, under a certificate signed by the room authority.
@@ -64,6 +65,13 @@ components:
       description: |
         The peer's device certificate. Its Ed25519 key must name an admitted
         member of this room.
+
+    bootstrapCertificate:
+      type: mutualTLS
+      description: |
+        Joining device certificate proving possession of its key. It need not
+        belong to an already admitted member. The invitation supplies the
+        pinned server authority and the admission secret is sent in the body.
 
   parameters:
     csrfHeader:
@@ -126,7 +134,16 @@ components:
         model_type:
           type: string
           enum: [external, managed]
-        endpoint_url: { type: string }
+        endpoint_url:
+          type: string
+          description: |
+            For external models, use the backend server root (for example
+            http://127.0.0.1:8081). The adapter appends /v1/chat/completions
+            unless the URL already ends in /chat/completions; a base ending
+            only in /v1 would be doubled.
+        api_key:
+          type: string
+          description: Optional external backend bearer credential. Owner records may include it.
         context_limit: { type: integer }
         max_tokens: { type: integer }
         enabled: { type: boolean }
@@ -135,8 +152,9 @@ components:
         allow_private_network:
           type: boolean
           description: |
-            Opts this one endpoint out of the private-range and non-standard
-            port blocks. Off by default.
+            Allows this endpoint to use private ranges, private-network HTTP,
+            and non-standard ports. Off by default. Metadata and other
+            prohibited destinations remain blocked.
 
     CommunityEvent:
       type: object
@@ -240,6 +258,7 @@ paths:
       description: The secret itself is never returned.
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -269,6 +288,7 @@ paths:
                   minLength: 12
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -286,6 +306,7 @@ paths:
       summary: Read the bearer token for the OpenAI-compatible routes
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -302,6 +323,7 @@ paths:
         - $ref: '#/components/parameters/csrfHeader'
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -317,6 +339,7 @@ paths:
       summary: Get local installation and room state
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -384,6 +407,7 @@ paths:
                 room_name: { type: string }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -426,7 +450,7 @@ paths:
                     enum: [admitted, pending, rejected]
                   room_id: { type: string }
                   reason: { type: string }
-        '400': { description: Invalid code, or no display name is set yet. }
+        '400': { description: "Invalid code, or no display name is set yet." }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { description: Admission rejected by the creator. }
         '409': { description: Already in a room. }
@@ -455,6 +479,7 @@ paths:
         - $ref: '#/components/parameters/csrfHeader'
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -469,6 +494,7 @@ paths:
       summary: List room members
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -482,6 +508,7 @@ paths:
       summary: List devices waiting for approval
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -530,6 +557,7 @@ paths:
                   default: true
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -557,6 +585,7 @@ paths:
                 approval_mode: { type: boolean }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -573,6 +602,7 @@ paths:
       summary: List locally hosted models
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -582,6 +612,10 @@ paths:
     post:
       tags: [models]
       summary: Create or update a hosted model
+      description: |
+        Whole-record save, not PATCH. Send all desired fields when updating,
+        including id, backend credentials, enabled, and published. Omitted
+        fields may reset to defaults. Use the managed load route for GGUFs.
       parameters:
         - $ref: '#/components/parameters/csrfHeader'
       requestBody:
@@ -591,6 +625,7 @@ paths:
             schema: { $ref: '#/components/schemas/HostedModel' }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/HostedModel' }
@@ -634,6 +669,7 @@ paths:
                 allow_private_network: { type: boolean }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -666,6 +702,7 @@ paths:
                 allow_private_network: { type: boolean }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -684,6 +721,7 @@ paths:
       summary: Read the fair-queue limits
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -698,7 +736,9 @@ paths:
     post:
       tags: [models]
       summary: Update the fair-queue limits
-      description: Applies to the shared queue immediately.
+      description: |
+        Applies to the shared queue immediately. Uses PascalCase record keys.
+        Omitted or non-positive fields reset to defaults; send the whole record.
       parameters:
         - $ref: '#/components/parameters/csrfHeader'
       requestBody:
@@ -729,6 +769,7 @@ paths:
         and only if that member's signature verifies.
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -745,25 +786,102 @@ paths:
   /api/v1/managed-models/artifacts:
     get:
       tags: [models]
-      summary: List downloaded GGUF weights
+      summary: List available GGUF models
+      description: |
+        Returns the weights Woolwire downloaded, which carry a manifest, plus
+        the GGUF language models found by scanning the models directory. The
+        scan understands a Hugging Face cache
+        (`hub/models--org--repo/snapshots/<rev>/model.gguf`), skips GGUF files
+        that are not language models, and lists only the first shard of a split
+        model, with `size_bytes` covering every shard.
       responses:
-        '200': { description: Artifact manifests. }
+        '200':
+          description: Artifact manifests.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      description: Stable identifier, safe in a URL path segment.
+                    name: { type: string }
+                    filename:
+                      type: string
+                      description: Base name of the weight file.
+                    path:
+                      type: string
+                      description: |
+                        Slash-separated location relative to the models
+                        directory. This is what `load` and `delete` take.
+                    size_bytes: { type: integer, format: int64 }
+                    sha256:
+                      type: string
+                      description: Empty for a discovered model, which was never hashed.
+                    context_limit: { type: integer }
+                    installed_at: { type: integer, format: int64 }
+                    source:
+                      type: string
+                      enum: [download, cache]
+                      description: |
+                        `download` for weights Woolwire installed and may
+                        delete; `cache` for weights it only found.
+                    repo_id:
+                      type: string
+                      description: The `org/repo` a Hugging Face cache filed the model under.
+                    architecture:
+                      type: string
+                      description: Model family from the GGUF header.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/managed-models/storage:
+    get:
+      tags: [models]
+      summary: Read model storage usage, budget, and read-only status
+      description: |
+        Returns only configured=false when no artifact manager is available.
+        Otherwise used_bytes is the scanned usage (zero if scanning fails),
+        and budget_bytes is the configured budget, not filesystem free space.
+      responses:
+        '200':
+          description: Artifact storage status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [configured]
+                properties:
+                  configured: { type: boolean }
+                  used_bytes: { type: integer, format: int64 }
+                  budget_bytes: { type: integer, format: int64 }
+                  read_only: { type: boolean }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/v1/managed-models/artifacts/{filename}:
     delete:
       tags: [models]
       summary: Delete a downloaded weight file
+      description: |
+        Only weights Woolwire downloaded can be deleted. A model discovered in
+        the models directory is refused with 403: the directory may be a cache
+        shared with other tools, and removing a file from one corrupts it for
+        all of them.
       parameters:
         - name: filename
           in: path
           required: true
+          description: |
+            The artifact's `path`. May contain `/`, so it is matched as a
+            trailing wildcard; each segment is URL-escaped separately.
           schema: { type: string }
         - $ref: '#/components/parameters/csrfHeader'
       responses:
         '200': { description: Deleted. }
-        '400': { description: Invalid filename. }
+        '400': { description: Invalid path. }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: "Model was discovered, not installed by Woolwire." }
 
   /api/v1/managed-models/download:
     post:
@@ -788,11 +906,30 @@ paths:
                   description: Must be HTTPS and pass the destination policy.
                 filename:
                   type: string
-                  description: Must be a bare `.gguf` name with no path separators.
+                  description: |
+                    Must be a bare `.gguf` name with no path separators.
+                    Downloads are always committed at the top level of the
+                    models directory.
                 expected_sha256: { type: string }
                 max_size_bytes: { type: integer, format: int64 }
+                companions:
+                  type: array
+                  description: |
+                    Supporting files fetched with the model in the same job,
+                    reported as one progress figure. Each is recorded against
+                    the model and marked so it is never listed as a model
+                    itself. Take these from the resolver's `companions`.
+                  items:
+                    type: object
+                    required: [kind, source_url, filename]
+                    properties:
+                      kind: { type: string, enum: [projector, draft] }
+                      source_url: { type: string }
+                      filename: { type: string }
+                      max_size_bytes: { type: integer, format: int64 }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -800,8 +937,77 @@ paths:
                 properties:
                   download_id: { type: string }
                   status: { type: string }
-        '400': { description: Rejected filename, URL, or storage budget. }
+        '400': { description: "Rejected filename, URL, or storage budget." }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/managed-models/huggingface:
+    get:
+      tags: [models]
+      summary: List the GGUF weights a Hugging Face repository publishes
+      description: |
+        Reads the repository's file listing so a download can be filled in from
+        what is actually published. Only public repositories resolve; no
+        credential is sent. Split models are returned once, as their first
+        shard, sized across every shard.
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          description: A repository URL or a bare `org/name`.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repo: { type: string }
+                  files:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        path:
+                          type: string
+                          description: Location within the repository, which may include directories.
+                        filename: { type: string }
+                        size_bytes: { type: integer, format: int64 }
+                        url:
+                          type: string
+                          description: Direct download URL, ready for the download endpoint.
+                        quantization: { type: string }
+                        shard_count:
+                          type: integer
+                          description: |
+                            Above one when the model is split across files. Every
+                            shard must be present before it will load, and the
+                            download endpoint fetches one file at a time.
+                        total_bytes:
+                          type: integer
+                          format: int64
+                          description: The whole download — this model plus its companions.
+                        companions:
+                          type: array
+                          description: |
+                            Files that belong with this model, already chosen for
+                            it: a multimodal projector, and a multi-token-prediction
+                            module used as a speculative draft. Companions are never
+                            listed as models of their own, and which precision to
+                            take follows from the model rather than being a choice.
+                          items:
+                            type: object
+                            properties:
+                              kind: { type: string, enum: [projector, draft] }
+                              path: { type: string }
+                              filename: { type: string }
+                              size_bytes: { type: integer, format: int64 }
+                              url: { type: string }
+        '400': { description: Not a repository reference. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: "No such public repository, or it holds no GGUF files." }
+        '502': { description: Hugging Face could not be reached. }
 
   /api/v1/managed-models/downloads:
     get:
@@ -814,6 +1020,7 @@ paths:
           schema: { type: string }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -879,10 +1086,13 @@ paths:
                 context_limit: { type: integer }
                 max_tokens: { type: integer }
                 threads: { type: integer }
-                gpu_layers: { type: integer }
+                gpu_layers:
+                  type: integer
+                  description: Omit for runner hardware-based offload; 0 forces CPU.
                 published: { type: boolean }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/HostedModel' }
@@ -960,10 +1170,12 @@ paths:
       tags: [chats]
       summary: Send a message and stream the reply
       description: |
-        Responds with Server-Sent Events. Frames are `data: {"delta":...}`,
-        a `: ping` comment every 15 seconds while idle, and a final
-        `data: [DONE]`. Local requests go through the same fair queue as
-        remote ones.
+        Responds with Server-Sent Events. Data frames contain delta and
+        request_id; named stats frames can contain timing/chunk estimates.
+        Ignore keepalive comments and unknown event types. Successful streams
+        end with data: [DONE]; errors can be named error events after HTTP 200.
+        A disconnected stream without DONE is not proof of success. Local
+        requests use the same fair queue as remote ones.
       parameters:
         - name: id
           in: path
@@ -1080,6 +1292,7 @@ paths:
                 content: { type: string }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CommunityEvent' }
@@ -1187,6 +1400,7 @@ paths:
       summary: 30-day social recognition leaderboard
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -1247,6 +1461,7 @@ paths:
       description: Reports the transport's public address, never a private key.
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -1293,6 +1508,7 @@ paths:
                   minLength: 12
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -1320,10 +1536,15 @@ paths:
     post:
       tags: [openai]
       summary: Chat completion (OpenAI-compatible)
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
       description: |
         Requests for a self-hosted model go through the same fair queue as
         peer requests. Requests for a peer's model are forwarded over an
-        authenticated peer connection.
+        authenticated peer connection. Only model, messages with string
+        content, and stream are implemented. Per-request samplers, max_tokens,
+        tools, and image content are not supported. Stream errors may arrive
+        as named error events; non-stream errors are generally plain text.
       security:
         - localAPIToken: []
       requestBody:
@@ -1365,7 +1586,7 @@ paths:
         never from the body, and a device already admitted or previously
         removed is refused.
       security:
-        - peerCertificate: []
+        - bootstrapCertificate: []
       requestBody:
         required: true
         content:
@@ -1381,6 +1602,7 @@ paths:
                 tailcat_addr: { type: string }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -1403,8 +1625,8 @@ paths:
                         MemberID: { type: string }
                         TailcatAddr: { type: string }
                   reason: { type: string }
-        '400': { description: Wrong room, missing display name, or no device certificate. }
-        '403': { description: This node is not the creator, or invitations are disabled. }
+        '400': { description: "Wrong room, missing display name, or no device certificate." }
+        '403': { description: "This node is not the creator, or invitations are disabled." }
         '404': { description: No room on this node. }
 
   # ------------------------------------------------------------------ peer --
@@ -1433,6 +1655,7 @@ paths:
                 tailcat_addr: { type: string }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -1449,6 +1672,12 @@ paths:
         '404': { description: No room on this node. }
 
   /peer/v1/catalog:
+    servers:
+      - url: 'tailcat://{address}:{port}'
+        description: Peer transport stream under TLS; not a host TCP HTTP endpoint.
+        variables:
+          address: { default: '<peer tailcat address>' }
+          port: { default: '4242' }
     get:
       tags: [peer]
       summary: Signed advertisements for this host's models
@@ -1456,6 +1685,7 @@ paths:
         - peerCertificate: []
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -1464,6 +1694,12 @@ paths:
         '403': { description: The caller is not an admitted member. }
 
   /peer/v1/inference:
+    servers:
+      - url: 'tailcat://{address}:{port}'
+        description: Peer transport stream under TLS; not a host TCP HTTP endpoint.
+        variables:
+          address: { default: '<peer tailcat address>' }
+          port: { default: '4242' }
     post:
       tags: [peer]
       summary: Request inference from this host
@@ -1501,6 +1737,12 @@ paths:
         '503': { description: The host queue is full. }
 
   /peer/v1/inference/cancel:
+    servers:
+      - url: 'tailcat://{address}:{port}'
+        description: Peer transport stream under TLS; not a host TCP HTTP endpoint.
+        variables:
+          address: { default: '<peer tailcat address>' }
+          port: { default: '4242' }
     post:
       tags: [peer]
       summary: Cancel one of your own in-flight requests
@@ -1523,6 +1765,12 @@ paths:
         '404': { description: No such request belonging to the caller. }
 
   /peer/v1/community/sync:
+    servers:
+      - url: 'tailcat://{address}:{port}'
+        description: Peer transport stream under TLS; not a host TCP HTTP endpoint.
+        variables:
+          address: { default: '<peer tailcat address>' }
+          port: { default: '4242' }
     post:
       tags: [peer]
       summary: Exchange community events using per-author cursors
@@ -1549,6 +1797,7 @@ paths:
                   items: { $ref: '#/components/schemas/CommunityEvent' }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -1564,6 +1813,12 @@ paths:
         '403': { description: The caller is not an admitted member. }
 
   /peer/v1/contributions/sync:
+    servers:
+      - url: 'tailcat://{address}:{port}'
+        description: Peer transport stream under TLS; not a host TCP HTTP endpoint.
+        variables:
+          address: { default: '<peer tailcat address>' }
+          port: { default: '4242' }
     post:
       tags: [peer]
       summary: Exchange contribution receipts using per-pair cursors
@@ -1586,6 +1841,7 @@ paths:
                   items: { $ref: '#/components/schemas/Receipt' }
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -1601,6 +1857,12 @@ paths:
         '403': { description: The caller is not an admitted member. }
 
   /peer/v1/contributions/ack:
+    servers:
+      - url: 'tailcat://{address}:{port}'
+        description: Peer transport stream under TLS; not a host TCP HTTP endpoint.
+        variables:
+          address: { default: '<peer tailcat address>' }
+          port: { default: '4242' }
     post:
       tags: [peer]
       summary: Return a counter-signed receipt to the host
@@ -1634,6 +1896,7 @@ paths:
         - runnerToken: []
       responses:
         '200':
+          description: Successful response.
           content:
             application/json:
               schema:
@@ -1643,12 +1906,31 @@ paths:
                     type: string
                     enum: [idle, loading, ready, busy, error]
                   loaded_model_id: { type: string }
-                  loaded_file: { type: string }
+                  loaded_file:
+                    type: string
+                    description: The reference the runner was asked to load, relative to the models directory.
+                  has_gpu:
+                    type: boolean
+                    description: Whether the runner container has a GPU device attached.
+                  gpu_name: { type: string }
+                  error:
+                    type: string
+                    description: |
+                      Why the engine is in an error state, including the last
+                      lines it printed before exiting.
+                  notice:
+                    type: string
+                    description: |
+                      Set when a load succeeded on different terms than asked —
+                      currently, when speculative decoding had to be dropped.
                   engine_pid: { type: integer }
                   error: { type: string }
         '401': { description: Missing or wrong runner token. }
 
   /runner/v1/models/load:
+    servers:
+      - url: 'http://woolwire-runner:8080'
+        description: Companion runner on the internal network.
     post:
       tags: [runner]
       summary: Launch the engine and wait for it to become healthy
@@ -1666,18 +1948,53 @@ paths:
               required: [model_id, filename]
               properties:
                 model_id: { type: string }
-                filename: { type: string }
+                filename:
+                  type: string
+                  description: |
+                    Slash-separated location of the weights relative to the
+                    models directory. It may name a file in a subdirectory —
+                    that is where a Hugging Face cache keeps them — but any
+                    reference that leaves the directory is rejected. Symlinks
+                    inside the directory are followed, since a cache stores
+                    every snapshot entry as a link into its blobs directory.
                 context_limit: { type: integer }
                 threads: { type: integer }
-                gpu_layers: { type: integer }
+                mmproj:
+                  type: string
+                  description: |
+                    Multimodal projector to load with the model, relative to the
+                    models directory. Without it a vision model serves as a
+                    text-only one.
+                draft_model:
+                  type: string
+                  description: |
+                    Multi-token-prediction module to run as a speculative draft.
+                    If the engine will not start with it, the model is loaded
+                    without it and `notice` in the health response says so.
+                gpu_layers:
+                  type: integer
+                  description: |
+                    Layers to offload to the GPU. Omit it to let the runner
+                    decide — it is the container the GPU is attached to, and
+                    the caller cannot see one. Omitted, a runner with a GPU
+                    leaves the split to the engine, which sizes it against the
+                    VRAM actually free; a runner without one runs on the CPU.
+                    An explicit `0` also means run on the CPU.
       responses:
         '200': { description: Engine ready. }
-        '400': { description: Invalid filename. }
+        '400': { description: Invalid model reference. }
         '401': { description: Missing or wrong runner token. }
         '404': { description: No such weight file. }
-        '500': { description: The engine failed to launch or become healthy. }
+        '500':
+          description: |
+            The engine failed to launch or become healthy. The body quotes the
+            last lines the engine printed, which is where a model the engine
+            cannot read says so.
 
   /runner/v1/models/unload:
+    servers:
+      - url: 'http://woolwire-runner:8080'
+        description: Companion runner on the internal network.
     post:
       tags: [runner]
       summary: Stop and reap the engine
@@ -1688,17 +2005,23 @@ paths:
         '401': { description: Missing or wrong runner token. }
 
   /runner/v1/engine/restart:
+    servers:
+      - url: 'http://woolwire-runner:8080'
+        description: Companion runner on the internal network.
     post:
       tags: [runner]
       summary: Restart the engine with the same load arguments
       security:
         - runnerToken: []
       responses:
-        '200': { description: Restarted, or nothing was loaded. }
+        '200': { description: "Restarted, or nothing was loaded." }
         '401': { description: Missing or wrong runner token. }
         '500': { description: The restart failed. }
 
   /runner/v1/inference:
+    servers:
+      - url: 'http://woolwire-runner:8080'
+        description: Companion runner on the internal network.
     post:
       tags: [runner]
       summary: Run inference on the loaded model
@@ -1735,6 +2058,9 @@ paths:
         '503': { description: No model is loaded. }
 
   /runner/v1/inference/cancel:
+    servers:
+      - url: 'http://woolwire-runner:8080'
+        description: Companion runner on the internal network.
     post:
       tags: [runner]
       summary: Cancel the active inference

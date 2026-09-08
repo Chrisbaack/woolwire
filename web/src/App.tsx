@@ -71,6 +71,7 @@ export const App: React.FC = () => {
   const [setupToken, setSetupToken] = useState('')
   const [authError, setAuthError] = useState('')
   const [loading, setLoading] = useState(true)
+  const [stateError, setStateError] = useState('')
   const [activeTab, setActiveTab] = useState<Tab>('dashboard')
   const [selectedChatModel, setSelectedChatModel] = useState<any>(null)
 
@@ -83,19 +84,21 @@ export const App: React.FC = () => {
 
   const fetchState = async () => {
     try {
+      setStateError('')
       const res = await api('/api/v1/state')
       if (res.status === 401) {
         setAuthRequired(true)
         setLoading(false)
         return
       }
+      if (!res.ok) throw new Error('Could not reach this installation. Please try again.')
       if (res.ok) {
         const data = await res.json()
         setState(data)
         setAuthRequired(false)
       }
     } catch {
-      // network error
+      setStateError('Could not reach this installation. Check that Woolwire is running, then retry.')
     } finally {
       setLoading(false)
     }
@@ -137,6 +140,7 @@ export const App: React.FC = () => {
   // showing it again would only create another copy to leak.
   const openConnectModal = async () => {
     setShowConnectModal(true)
+    setModalCopiedToken(false)
     setModalToken('')
     setModalError('')
     try {
@@ -192,10 +196,9 @@ export const App: React.FC = () => {
 
   const handleLeaveRoom = async () => {
     const res = await api('/api/v1/room/leave', { method: 'POST' })
-    if (res.ok) {
-      await fetchState()
-      setActiveTab('dashboard')
-    }
+    if (!res.ok) throw new Error('Could not leave the room. Please try again.')
+    await fetchState()
+    setActiveTab('dashboard')
   }
 
   const handleRotateInvitation = async (): Promise<string> => {
@@ -228,11 +231,19 @@ export const App: React.FC = () => {
     return <div className="app-container"><p>Loading Woolwire...</p></div>
   }
 
+  if (stateError) {
+    return <div className="app-container"><div className="card connection-error" role="alert">
+      <span className="eyebrow">WOOLWIRE · CONNECTION</span>
+      <h2>Let’s find your flock.</h2><p>{stateError}</p>
+      <button className="btn btn-primary" onClick={fetchState}>Try again</button>
+    </div></div>
+  }
+
   if (authRequired) {
     return (
       <div className="app-container">
         <div className="card" style={{ maxWidth: '480px', margin: '4rem auto' }}>
-          <h2 style={{ margin: '0 0 0.5rem 0' }}>Owner Setup Authentication</h2>
+          <h2 style={{ margin: '0 0 0.5rem 0' }}>Welcome to your little corner.</h2>
 
           <p style={{ color: 'var(--text-secondary)', marginBottom: '1rem', fontSize: '0.9rem' }}>
             Enter the one-time setup secret printed on this node's first start.
@@ -248,7 +259,7 @@ export const App: React.FC = () => {
                 id="token"
                 type="password"
                 className="form-control"
-                placeholder="Enter setup token or custom PIN"
+                placeholder="Enter your one-time setup secret"
                 value={setupToken}
                 onChange={(e) => setSetupToken(e.target.value)}
                 required
@@ -260,7 +271,7 @@ export const App: React.FC = () => {
           </form>
 
           <div style={{ marginTop: '1.25rem', padding: '0.75rem', backgroundColor: 'var(--bg-primary)', borderRadius: 'var(--radius)', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-            💡 <strong>Tip for multi-device access:</strong> If you are already logged in on your computer, click <strong>📱 Connect Device</strong> in the top header or visit <strong>Settings</strong> to view a Quick Login QR code or customize your PIN.
+            Already signed in on another device? Use <strong>Connect Device</strong> there to create a fresh setup secret for this screen.
           </div>
         </div>
       </div>
@@ -268,11 +279,10 @@ export const App: React.FC = () => {
   }
 
   return (
-    <div className="app-container">
+    <div className={`app-container ${state?.room ? 'has-room' : ''}`}>
       <header className="header">
         <h1>
-          <span>Woolwire</span>
-          <span className="badge">v0.2</span>
+          <span className="brand-mark" aria-hidden="true">♧</span><span>Woolwire<small>A little shared intelligence.</small></span>
         </h1>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
           {state?.display_name && (
@@ -292,7 +302,7 @@ export const App: React.FC = () => {
         </div>
       </header>
 
-      <main>
+      <main id="main-content">
         {!state?.room ? (
           <Welcome
             displayName={state?.display_name || ''}
@@ -301,52 +311,25 @@ export const App: React.FC = () => {
             onJoinRoom={handleJoinRoom}
           />
         ) : (
-          <div>
-            {/* Navigation Tabs */}
-            <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.5rem', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem' }}>
-              <button
-                className={`btn ${activeTab === 'dashboard' ? 'btn-primary' : 'btn-secondary'}`}
-                style={{ padding: '0.5rem 1rem', fontSize: '0.9rem' }}
-                onClick={() => setActiveTab('dashboard')}
-              >
-                Dashboard
-              </button>
-
-              <button
-                className={`btn ${activeTab === 'chats' ? 'btn-primary' : 'btn-secondary'}`}
-                style={{ padding: '0.5rem 1rem', fontSize: '0.9rem' }}
-                onClick={() => setActiveTab('chats')}
-              >
-                My Chats
-              </button>
-
-              <button
-                className={`btn ${activeTab === 'community' ? 'btn-primary' : 'btn-secondary'}`}
-                style={{ padding: '0.5rem 1rem', fontSize: '0.9rem' }}
-                onClick={() => setActiveTab('community')}
-              >
-                Community
-              </button>
-
-              <button
-                className={`btn ${activeTab === 'settings' ? 'btn-primary' : 'btn-secondary'}`}
-                style={{ padding: '0.5rem 1rem', fontSize: '0.9rem' }}
-                onClick={() => setActiveTab('settings')}
-              >
-                Settings
-              </button>
-
-              {state.room.role === 'creator' && (
-                <button
-                  className={`btn ${activeTab === 'admin' ? 'btn-primary' : 'btn-secondary'}`}
-                  style={{ padding: '0.5rem 1rem', fontSize: '0.9rem' }}
-                  onClick={() => setActiveTab('admin')}
-                >
-                  Room Admin
-                </button>
-              )}
-            </div>
-
+          <div className="workspace">
+            <aside className="navigation-rail">
+              <div className="room-label"><span className="eyebrow">YOUR PATCH OF THE INTERNET</span><strong>{state.room.room_name}</strong><span className="badge">{state.room.role}</span></div>
+              <nav aria-label="Main navigation">
+                {([
+                  ['dashboard', '◈', 'The Meadow', 'Models & room overview'],
+                  ['chats', '✧', 'My Chats', 'Your private conversations'],
+                  ['community', '♧', 'Community', 'Around the campfire'],
+                  ['settings', '⚙', 'Settings', 'Make yourself at home'],
+                  ...(state.room.role === 'creator' ? [['admin', '⌂', 'Room Admin', 'Tend to your room']] : []),
+                ] as string[][]).map(([tab, icon, label, description]) => (
+                  <button key={tab} className={`nav-item ${activeTab === tab ? 'active' : ''}`} aria-current={activeTab === tab ? 'page' : undefined} onClick={() => setActiveTab(tab as Tab)}>
+                    <span className="nav-icon" aria-hidden="true">{icon}</span><span>{label}<small>{description}</small></span>
+                  </button>
+                ))}
+              </nav>
+              <div className="rail-note"><span aria-hidden="true">✺</span><p>Good things grow<br />when we share.</p><small>Friends. Models. Possibilities.</small></div>
+            </aside>
+            <div className={`workspace-view view-${activeTab}`}>
             {/* Tab Views */}
             <ErrorBoundary key={activeTab}>
               {activeTab === 'dashboard' && (
@@ -384,6 +367,7 @@ export const App: React.FC = () => {
                 />
               )}
             </ErrorBoundary>
+            </div>
           </div>
         )}
       </main>
@@ -453,10 +437,14 @@ export const App: React.FC = () => {
                 className="btn btn-primary"
                 style={{ fontSize: '0.85rem' }}
                 disabled={!modalToken}
-                onClick={() => {
-                  navigator.clipboard.writeText(modalToken)
-                  setModalCopiedToken(true)
-                  setTimeout(() => setModalCopiedToken(false), 2000)
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(modalToken)
+                    setModalCopiedToken(true)
+                    setModalError('')
+                  } catch {
+                    setModalError('Clipboard unavailable. Select and copy the secret above.')
+                  }
                 }}
               >
                 {modalCopiedToken ? 'Copied!' : '🔑 Copy Setup Secret'}

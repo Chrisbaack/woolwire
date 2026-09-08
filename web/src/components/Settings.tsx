@@ -31,23 +31,248 @@ interface HardwareProfile {
   gpu_name?: string
 }
 
+// One GGUF file a Hugging Face repository publishes.
+interface RepoWeight {
+  path: string
+  filename: string
+  size_bytes: number
+  url: string
+  quantization?: string
+  // Above one when the model is split across files, all of which are needed.
+  shard_count?: number
+  // Files that belong with this model, chosen for it rather than offered as
+  // choices: a projector for vision, an MTP module for speculative decoding.
+  companions?: RepoCompanion[]
+  // The whole download: this model plus its companions.
+  total_bytes: number
+}
+
+interface RepoCompanion {
+  kind: 'projector' | 'draft'
+  path: string
+  filename: string
+  size_bytes: number
+  url: string
+}
+
 interface RunnerHealth {
   configured: boolean
   status: string
   loaded_model_id?: string
   loaded_file?: string
   engine_pid?: number
+  // The runner's own hardware. The app container cannot see the GPU: it is
+  // passed to the runner, so the runner is the one that reports it.
+  has_gpu?: boolean
+  gpu_name?: string
+  // What the engine said when it failed, so a model that cannot be loaded
+  // explains itself instead of leaving the runner silently in "error".
+  engine_error?: string
+  error?: string
 }
 
 interface ArtifactManifest {
   id: string
   name: string
   filename: string
+  // Where the weights sit relative to the models directory. A downloaded
+  // model is at the top level; one found in a Hugging Face cache is nested.
+  path: string
   size_bytes: number
   sha256: string
   source_url?: string
   context_limit: number
   installed_at: number
+  // 'download' for weights Woolwire installed, 'cache' for weights it found.
+  source?: string
+  repo_id?: string
+  architecture?: string
+  // Supporting files loaded with this model, never listed as models.
+  companions?: { kind: 'projector' | 'draft'; path?: string; filename: string }[]
+}
+
+interface PopularModelDef {
+  id: string
+  name: string
+  creator: string
+  category:
+    | 'Edge & Fast'
+    | 'Coding'
+    | 'Reasoning'
+    | 'General'
+    | 'SOTA Flagship'
+    | 'MoE Flagship'
+    | 'Workhorse'
+    | 'Frontier MoE'
+    | 'Frontier Multimodal'
+    | 'Coding & Agents'
+  url: string
+  filename: string
+  sizeMB: number
+  contextLimit: number
+  description: string
+  quant: string
+}
+
+const POPULAR_MODELS: PopularModelDef[] = [
+  {
+    id: 'qwen3.8-27b-instruct',
+    name: 'Qwen3.8 27B Instruct',
+    creator: 'Qwen / Alibaba',
+    category: 'SOTA Flagship',
+    url: 'https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-UD-Q4_K_M.gguf',
+    filename: 'Qwen3.8-27B-UD-Q4_K_M.gguf',
+    sizeMB: 15701,
+    contextLimit: 32768,
+    quant: 'UD-Q4_K_M',
+    description: 'Premier open-weight dense SOTA leader (10M+ downloads) with unsloth dynamic quants; top-tier coding, mathematics, and reasoning.',
+  },
+  {
+    id: 'ornith-1.5-35b-a3b',
+    name: 'Ornith 1.5 35B (A3B)',
+    creator: 'Ornith AI',
+    category: 'MoE Flagship',
+    url: 'https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF/resolve/main/Ornith-1.5-35B-Q4_K_M.gguf',
+    filename: 'Ornith-1.5-35B-Q4_K_M.gguf',
+    sizeMB: 20707,
+    contextLimit: 65536,
+    quant: 'Q4_K_M',
+    description: 'Breakthrough 35B MoE with 3B active parameters (A3B). Delivers extreme generation throughput with deep 35B analytical capabilities.',
+  },
+  {
+    id: 'ornith-1.5-9b',
+    name: 'Ornith 1.5 9B Instruct',
+    creator: 'Ornith AI',
+    category: 'Workhorse',
+    url: 'https://huggingface.co/ornith-ai/Ornith-1.5-9B-GGUF/resolve/main/Ornith-1.5-9B-Q4_K_M.gguf',
+    filename: 'Ornith-1.5-9B-Q4_K_M.gguf',
+    sizeMB: 5512,
+    contextLimit: 32768,
+    quant: 'Q4_K_M',
+    description: 'High-efficiency dense 9B workhorse outperforming previous-gen 14B models with low memory overhead on consumer hardware.',
+  },
+  {
+    id: 'qwen3.8-flash-next',
+    name: 'Qwen3.8 Flash Next',
+    creator: 'Qwen / Alibaba',
+    category: 'Frontier MoE',
+    url: 'https://huggingface.co/Cyronius/Qwen3.8-Flash-Next-131B-A6B-GGUF/resolve/main/qwen38-keep1-Q3KXL.gguf',
+    filename: 'qwen38-keep1-Q3KXL.gguf',
+    sizeMB: 61785,
+    contextLimit: 131072,
+    quant: 'Q3_K_XL',
+    description: 'Next-generation 131B MoE with 6B active parameters (A6B) providing frontier-grade intelligence at rapid inference speeds.',
+  },
+  {
+    id: 'glm-5.3-flash',
+    name: 'GLM 5.3 Flash',
+    creator: 'Zhipu AI / ZAI',
+    category: 'Frontier Multimodal',
+    url: 'https://huggingface.co/patrickbdevaney/GLM-5.3-Flash-REAP50-GGUF/resolve/main/GLM-5.3-Flash-REAP50-IQ3_M.gguf',
+    filename: 'GLM-5.3-Flash-REAP50-IQ3_M.gguf',
+    sizeMB: 68790,
+    contextLimit: 131072,
+    quant: 'REAP50-IQ3_M',
+    description: 'Zhipu premier open-weight flagship multimodal and reasoning architecture with massive 131k context and deep analytical fidelity.',
+  },
+  {
+    id: 'deepseek-v4-flash-0731',
+    name: 'DeepSeek-V4 Flash 0731',
+    creator: 'DeepSeek / Unsloth',
+    category: 'Reasoning',
+    url: 'https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF/resolve/main/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf',
+    filename: 'dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf',
+    sizeMB: 10391,
+    contextLimit: 65536,
+    quant: 'Q8_0',
+    description: 'DeepSeek V4 Flash generation offering extreme speed and native chain-of-thought logic.',
+  },
+  {
+    id: 'ministral-3-14b-instruct',
+    name: 'Ministral 3 14B Instruct',
+    creator: 'Mistral AI',
+    category: 'Coding & Agents',
+    url: 'https://huggingface.co/mistralai/Ministral-3-14B-Instruct-2512-GGUF/resolve/main/Ministral-3-14B-Instruct-2512-Q4_K_M.gguf',
+    filename: 'Ministral-3-14B-Instruct-2512-Q4_K_M.gguf',
+    sizeMB: 7857,
+    contextLimit: 32768,
+    quant: 'Q4_K_M',
+    description: 'Mistral AI cutting-edge 14B model tailored for multi-step agentic workflows and advanced programming.',
+  },
+  {
+    id: 'ministral-3-3b-instruct',
+    name: 'Ministral 3 3B Instruct',
+    creator: 'Mistral AI',
+    category: 'Edge & Fast',
+    url: 'https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512-GGUF/resolve/main/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf',
+    filename: 'Ministral-3-3B-Instruct-2512-Q4_K_M.gguf',
+    sizeMB: 2047,
+    contextLimit: 16384,
+    quant: 'Q4_K_M',
+    description: 'Ultra-efficient edge model optimized for low-latency chat, lightweight mobile/laptop inference, and instant response.',
+  },
+]
+
+function getHardwareFitBadge(modelSizeMB: number, hw: HardwareProfile | null): {
+  label: string
+  color: string
+  tooltip: string
+} {
+  if (!hw) {
+    return { label: 'Unknown Fit', color: 'var(--text-secondary)', tooltip: 'Hardware profile not detected' }
+  }
+
+  const ramMB = hw.total_ram_mb || 0
+  const hasGPU = hw.has_nvidia_gpu
+
+  if (hasGPU) {
+    if (modelSizeMB <= 6000) {
+      return {
+        label: '🟢 Full GPU Offload',
+        color: 'var(--accent-success)',
+        tooltip: 'Model fits comfortably in dedicated GPU VRAM for maximum tokens/sec.',
+      }
+    }
+    if (modelSizeMB <= 16000) {
+      return {
+        label: '🟢 GPU Accelerated',
+        color: 'var(--accent-success)',
+        tooltip: 'Substantial GPU acceleration with partial or full VRAM offload (8-16GB VRAM).',
+      }
+    }
+    if (modelSizeMB <= 24000) {
+      return {
+        label: '🟢 High-VRAM GPU',
+        color: 'var(--accent-success)',
+        tooltip: 'Offloads to high-capacity consumer GPUs (RTX 3090/4090 24GB VRAM).',
+      }
+    }
+  }
+
+  if (ramMB > 0) {
+    const freeBudgetMB = ramMB * 0.8
+    if (modelSizeMB <= freeBudgetMB) {
+      return {
+        label: hasGPU ? '🟡 Hybrid GPU/RAM' : '🟢 Fits in RAM',
+        color: hasGPU ? 'var(--accent-primary)' : 'var(--accent-success)',
+        tooltip: `Fits in system RAM (${(ramMB / 1024).toFixed(1)} GB detected).`,
+      }
+    }
+    if (modelSizeMB <= ramMB) {
+      return {
+        label: '🟡 Tight Memory Fit',
+        color: '#f59e0b',
+        tooltip: `Tight fit for ${(ramMB / 1024).toFixed(1)} GB RAM. May experience swapping or paging under load.`,
+      }
+    }
+    return {
+      label: '🔴 Exceeds System RAM',
+      color: 'var(--accent-danger)',
+      tooltip: `Model (${(modelSizeMB / 1024).toFixed(1)} GB) exceeds system RAM (${(ramMB / 1024).toFixed(1)} GB). High risk of out-of-memory crash.`,
+    }
+  }
+
+  return { label: 'Compatible', color: 'var(--text-secondary)', tooltip: 'Check your available RAM' }
 }
 
 export const Settings: React.FC = () => {
@@ -60,8 +285,16 @@ export const Settings: React.FC = () => {
     ExecutionTimeoutSeconds: 600,
   })
   const [hardware, setHardware] = useState<HardwareProfile | null>(null)
+
   const [runner, setRunner] = useState<RunnerHealth | null>(null)
+
+  // When a runner is configured it is the authority on the GPU: the device is
+  // passed to that container, and the app's own probe can only see the host's
+  // driver, not whether this deployment can actually use it.
+  const gpuAvailable = runner?.configured ? !!runner.has_gpu : !!hardware?.has_nvidia_gpu
+  const gpuLabel = (runner?.configured ? runner.gpu_name : hardware?.gpu_name) || 'NVIDIA GPU'
   const [artifacts, setArtifacts] = useState<ArtifactManifest[]>([])
+  const [loadError, setLoadError] = useState<string>('')
 
   const [name, setName] = useState('')
   const [endpointUrl, setEndpointUrl] = useState('')
@@ -96,6 +329,14 @@ export const Settings: React.FC = () => {
   const [dlError, setDlError] = useState('')
   const [dlSuccess, setDlSuccess] = useState('')
   const [dlProgress, setDlProgress] = useState<number | null>(null)
+
+  // Storage & Popular Models
+  const [storageInfo, setStorageInfo] = useState<{ configured: boolean; used_bytes?: number; budget_bytes?: number; read_only?: boolean } | null>(null)
+  const [popularCategory, setPopularCategory] = useState<string>('All')
+  const [hfResolveInput, setHfResolveInput] = useState<string>('')
+  const [hfResolveMsg, setHfResolveMsg] = useState<string>('')
+  const [hfFiles, setHfFiles] = useState<RepoWeight[]>([])
+  const [hfLoading, setHfLoading] = useState(false)
 
   // Device pairing & setup secret
   // The active setup secret is never fetched back: it is single-use and the
@@ -267,6 +508,11 @@ export const Settings: React.FC = () => {
       if (artRes.ok) {
         const data = await artRes.json()
         setArtifacts(Array.isArray(data) ? data : [])
+      }
+
+      const sRes = await api('/api/v1/managed-models/storage')
+      if (sRes.ok) {
+        setStorageInfo(await sRes.json())
       }
     } catch {
       // ignore
@@ -451,8 +697,12 @@ export const Settings: React.FC = () => {
 
   // Downloads run in the background on the server; this polls the job rather
   // than holding an HTTP request open for a multi-gigabyte transfer.
-  const handleDownloadArtifact = async (e: React.FormEvent) => {
-    e.preventDefault()
+  const startDownloadJob = async (
+    sourceUrl: string,
+    filename: string,
+    sha: string = '',
+    companions: RepoCompanion[] = [],
+  ) => {
     setDlLoading(true)
     setDlError('')
     setDlSuccess('')
@@ -460,10 +710,18 @@ export const Settings: React.FC = () => {
     try {
       const res = await api('/api/v1/managed-models/download', {
         method: 'POST',
-          body: JSON.stringify({
-          source_url: dlUrl.trim(),
-          filename: dlFilename.trim(),
-          expected_sha256: dlSha.trim(),
+        body: JSON.stringify({
+          source_url: sourceUrl.trim(),
+          filename: filename.trim(),
+          expected_sha256: sha.trim(),
+          // The projector and draft module come with the model. Which ones
+          // they are follows from the model, so they are not a choice.
+          companions: companions.map((c) => ({
+            kind: c.kind,
+            source_url: c.url,
+            filename: c.filename,
+            max_size_bytes: c.size_bytes,
+          })),
         }),
       })
       if (!res.ok) {
@@ -492,7 +750,7 @@ export const Settings: React.FC = () => {
         }
       }
 
-      setDlSuccess('GGUF model artifact downloaded and verified successfully!')
+      setDlSuccess(`GGUF model ${filename} downloaded and verified successfully!`)
       setDlUrl('')
       setDlFilename('')
       setDlSha('')
@@ -505,18 +763,71 @@ export const Settings: React.FC = () => {
     }
   }
 
-  const handleLoadArtifactIntoRunner = async (filename: string) => {
+  const handleDownloadArtifact = async (e: React.FormEvent) => {
+    e.preventDefault()
+    await startDownloadJob(dlUrl, dlFilename, dlSha)
+  }
+
+  const handleResolveHfUrl = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setHfResolveMsg('')
+    setHfFiles([])
+    const input = hfResolveInput.trim()
+    if (!input) return
+
+    // A direct link to a file needs no lookup.
+    if (input.endsWith('.gguf')) {
+      const parts = input.split('/')
+      const fname = parts[parts.length - 1]
+      setDlUrl(input)
+      setDlFilename(fname)
+      setHfResolveMsg(`Filled in the form for ${fname}`)
+      return
+    }
+
+    // Otherwise ask Hugging Face what the repository holds. Guessing a
+    // filename from the repo name was wrong for most repositories, and could
+    // never know which quantizations were published.
+    setHfLoading(true)
+    try {
+      const res = await api(`/api/v1/managed-models/huggingface?repo=${encodeURIComponent(input)}`)
+      if (!res.ok) {
+        setHfResolveMsg(await res.text())
+        return
+      }
+      const data: { repo: string; files: RepoWeight[] } = await res.json()
+      setHfFiles(data.files || [])
+      setHfResolveMsg(`${(data.files || []).length} model files in ${data.repo} — pick one`)
+    } catch (err: any) {
+      setHfResolveMsg(err.message || 'lookup failed')
+    } finally {
+      setHfLoading(false)
+    }
+  }
+
+  const handlePickHfFile = (file: RepoWeight) => {
+    setDlUrl(file.url)
+    setDlFilename(file.filename)
+    setHfResolveMsg(`Filled in the form for ${file.filename}`)
+  }
+
+  const handleLoadArtifactIntoRunner = async (artifact: ArtifactManifest) => {
+    setLoadError('')
     try {
       const res = await api('/api/v1/managed-models/load', {
         method: 'POST',
-          body: JSON.stringify({
-          model_id: 'managed-' + filename.replace('.gguf', ''),
-          name: filename.replace('.gguf', ''),
-          filename: filename,
-          context_limit: 4096,
+        body: JSON.stringify({
+          // The artifact id is stable and safe in a URL segment; the path it
+          // was found at is not, and two models in different directories can
+          // share a filename.
+          model_id: artifact.id,
+          name: artifact.name,
+          filename: artifact.path || artifact.filename,
+          context_limit: artifact.context_limit || 4096,
           max_tokens: 1024,
           threads: 4,
-          gpu_layers: hardware?.has_nvidia_gpu ? 33 : 0,
+          // gpu_layers is deliberately omitted: the runner holds the GPU and
+          // offloads every layer when it has one.
           published: true,
         }),
       })
@@ -526,10 +837,10 @@ export const Settings: React.FC = () => {
         await fetchModels()
         await fetchHardwareAndRunner()
       } else {
-        alert(await res.text())
+        setLoadError(await res.text())
       }
     } catch (err: any) {
-      alert(err.message)
+      setLoadError(err.message)
     }
   }
 
@@ -545,15 +856,20 @@ export const Settings: React.FC = () => {
     }
   }
 
-  const handleDeleteArtifact = async (filename: string) => {
-    if (!confirm(`Delete ${filename}?`)) return
+  const handleDeleteArtifact = async (artifact: ArtifactManifest) => {
+    if (!confirm(`Delete ${artifact.filename}?`)) return
     try {
-      const res = await api(`/api/v1/managed-models/artifacts/${encodeURIComponent(filename)}`, {
+      // The path may contain separators, and each segment is escaped
+      // individually so the server still sees a path.
+      const ref = (artifact.path || artifact.filename).split('/').map(encodeURIComponent).join('/')
+      const res = await api(`/api/v1/managed-models/artifacts/${ref}`, {
         method: 'DELETE',
       })
-      if (res.ok) {
-        await fetchHardwareAndRunner()
+      if (!res.ok) {
+        alert(await res.text())
+        return
       }
+      await fetchHardwareAndRunner()
     } catch {
       // ignore
     }
@@ -705,22 +1021,34 @@ export const Settings: React.FC = () => {
 
             <div style={{ padding: '0.75rem', backgroundColor: 'var(--bg-primary)', borderRadius: 'var(--radius)', border: '1px solid var(--border-color)' }}>
               <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>GPU Acceleration</div>
-              <div style={{ fontSize: '1rem', fontWeight: 600, color: hardware.has_nvidia_gpu ? 'var(--accent-success)' : 'inherit' }}>
-                {hardware.has_nvidia_gpu ? hardware.gpu_name || 'NVIDIA GPU' : 'CPU Only'}
+              <div style={{ fontSize: '1rem', fontWeight: 600, color: gpuAvailable ? 'var(--accent-success)' : 'inherit' }}>
+                {gpuAvailable ? gpuLabel : 'CPU Only'}
               </div>
+              {runner?.configured && (
+                <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>
+                  {runner.has_gpu
+                    ? 'reported by the runner, which sizes the offload to free VRAM'
+                    : 'the runner has no GPU attached; models run on the CPU'}
+                </div>
+              )}
             </div>
 
             <div style={{ padding: '0.75rem', backgroundColor: 'var(--bg-primary)', borderRadius: 'var(--radius)', border: '1px solid var(--border-color)' }}>
               <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Managed Runner</div>
               <div style={{ fontSize: '1rem', fontWeight: 600 }}>
                 {runner?.configured ? (
-                  <span style={{ color: runner.status === 'ready' ? 'var(--accent-success)' : 'var(--accent-primary)' }}>
+                  <span style={{ color: runner.status === 'ready' ? 'var(--accent-success)' : runner.status === 'error' ? 'var(--accent-error, #d9534f)' : 'var(--accent-primary)' }}>
                     {runner.status.toUpperCase()} {runner.loaded_file ? `(${runner.loaded_file})` : ''}
                   </span>
                 ) : (
                   <span style={{ color: 'var(--text-secondary)' }}>Not Configured</span>
                 )}
               </div>
+              {(runner?.engine_error || runner?.error) && (
+                <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '0.25rem', overflowWrap: 'anywhere' }}>
+                  {runner.engine_error || runner.error}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -729,7 +1057,7 @@ export const Settings: React.FC = () => {
         {runner?.configured && (
           <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '1.25rem' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-              <h3 style={{ fontSize: '1rem' }}>Installed GGUF Model Artifacts ({(artifacts || []).length})</h3>
+              <h3 style={{ fontSize: '1rem' }}>Available GGUF Models ({(artifacts || []).length})</h3>
               {runner?.loaded_model_id && (
                 <button className="btn btn-secondary" style={{ padding: '0.35rem 0.75rem', fontSize: '0.85rem' }} onClick={handleUnloadRunner}>
                   Unload Current Model
@@ -737,15 +1065,24 @@ export const Settings: React.FC = () => {
               )}
             </div>
 
+            {loadError && (
+              <div className="alert alert-error" style={{ fontSize: '0.8rem', overflowWrap: 'anywhere', marginBottom: '1rem' }}>
+                {loadError}
+              </div>
+            )}
+
             {(artifacts || []).length === 0 ? (
               <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '1.5rem' }}>
-                No GGUF weight files downloaded yet. You can download GGUF models directly via HTTPS below.
+                No GGUF language models found in the models directory. Woolwire scans it, including
+                a Hugging Face cache laid out as <code>hub/models--org--repo/snapshots/...</code>, so
+                pointing it at weights you already have is enough. You can also download GGUF models
+                directly via HTTPS below.
               </p>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', marginBottom: '1.5rem' }}>
                 {(artifacts || []).map((a) => (
                   <div
-                    key={a.filename}
+                    key={a.id}
                     style={{
                       display: 'flex',
                       justifyContent: 'space-between',
@@ -756,46 +1093,297 @@ export const Settings: React.FC = () => {
                       border: '1px solid var(--border-color)',
                     }}
                   >
-                    <div>
-                      <div style={{ fontWeight: 600 }}>{a.filename}</div>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 600 }}>{a.name}</div>
                       <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                        {(a.size_bytes / (1024 * 1024)).toFixed(1)} MB &bull; SHA-256: {a.sha256.slice(0, 16)}...
+                        {a.repo_id && <>{a.repo_id} &bull; </>}
+                        {(a.size_bytes / (1024 * 1024 * 1024)).toFixed(2)} GB
+                        {a.architecture && <> &bull; {a.architecture}</>}
+                        <> &bull; {(a.context_limit / 1024).toFixed(0)}k ctx</>
+                        {a.sha256 && <> &bull; SHA-256: {a.sha256.slice(0, 16)}...</>}
                       </div>
+                      <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', opacity: 0.75, overflowWrap: 'anywhere' }}>
+                        {a.source === 'cache' ? 'found in models directory: ' : ''}{a.path || a.filename}
+                      </div>
+                      {(a.companions || []).length > 0 && (
+                        <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', opacity: 0.85 }}>
+                          loads with{' '}
+                          {(a.companions || [])
+                            .map((c) => (c.kind === 'projector' ? `vision projector (${c.filename})` : `MTP draft module (${c.filename})`))
+                            .join(' and ')}
+                        </div>
+                      )}
                     </div>
 
-                    <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                      {runner?.loaded_file === a.filename ? (
+                    <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexShrink: 0 }}>
+                      {runner?.loaded_file === (a.path || a.filename) ? (
                         <span className="badge" style={{ backgroundColor: 'var(--accent-success)' }}>Loaded Active</span>
                       ) : (
                         <button
                           className="btn btn-primary"
                           style={{ padding: '0.35rem 0.75rem', fontSize: '0.85rem' }}
-                          onClick={() => handleLoadArtifactIntoRunner(a.filename)}
+                          onClick={() => handleLoadArtifactIntoRunner(a)}
                           disabled={!runner?.configured}
                         >
                           Load
                         </button>
                       )}
-                      <button
-                        className="btn btn-secondary"
-                        style={{ padding: '0.35rem 0.75rem', fontSize: '0.85rem' }}
-                        onClick={() => handleDeleteArtifact(a.filename)}
-                      >
-                        Delete
-                      </button>
+                      {a.source !== 'cache' && (
+                        <button
+                          className="btn btn-secondary"
+                          style={{ padding: '0.35rem 0.75rem', fontSize: '0.85rem' }}
+                          onClick={() => handleDeleteArtifact(a)}
+                        >
+                          Delete
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}
               </div>
             )}
 
-            {/* Download Artifact Form */}
-            <h4 style={{ fontSize: '0.9rem', marginBottom: '0.75rem' }}>Download Model Weights (HTTPS)</h4>
+            {/* Storage Usage Meter */}
+            {storageInfo && storageInfo.configured && storageInfo.budget_bytes && (
+              <div style={{ marginBottom: '1.5rem', padding: '0.85rem 1rem', backgroundColor: 'var(--bg-primary)', borderRadius: 'var(--radius)', border: '1px solid var(--border-color)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', marginBottom: '0.4rem' }}>
+                  <span><strong>Model Storage Usage:</strong> {((storageInfo.used_bytes || 0) / (1024 * 1024 * 1024)).toFixed(2)} GB / {((storageInfo.budget_bytes || 0) / (1024 * 1024 * 1024)).toFixed(0)} GB</span>
+                  <span style={{ color: 'var(--text-secondary)' }}>{(((storageInfo.used_bytes || 0) / (storageInfo.budget_bytes || 1)) * 100).toFixed(1)}% used</span>
+                </div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.4rem' }}>
+                  Counts weights Woolwire downloaded. Models found in the directory are served but
+                  not charged against the budget, since Woolwire did not put them there.
+                  {storageInfo.read_only && ' The models directory is read-only, so downloads are disabled.'}
+                </div>
+                <div style={{ height: '8px', backgroundColor: 'var(--bg-secondary)', borderRadius: '4px', overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${Math.min(100, (((storageInfo.used_bytes || 0) / (storageInfo.budget_bytes || 1)) * 100))}%`, backgroundColor: 'var(--accent-primary)', transition: 'width 0.3s ease' }} />
+                </div>
+              </div>
+            )}
+
+            {/* Curated Popular Hugging Face Models Section */}
+            <div style={{ marginBottom: '1.75rem', backgroundColor: 'var(--bg-primary)', padding: '1rem', borderRadius: 'var(--radius)', border: '1px solid var(--border-color)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                <div>
+                  <h4 style={{ fontSize: '0.95rem', margin: 0, fontWeight: 600 }}>🌟 Popular Hugging Face Models (1-Click Download)</h4>
+                  <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', margin: '0.2rem 0 0 0' }}>
+                    Verified GGUF weights with automatic hardware fit indicators based on your detected CPU, RAM, and GPU.
+                  </p>
+                </div>
+                <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
+                  {['All', 'Edge & Fast', 'Coding', 'Reasoning', 'General'].map((cat) => (
+                    <button
+                      key={cat}
+                      type="button"
+                      className={`btn ${popularCategory === cat ? 'btn-primary' : 'btn-secondary'}`}
+                      style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }}
+                      onClick={() => setPopularCategory(cat)}
+                    >
+                      {cat}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 280px), 1fr))', gap: '0.75rem' }}>
+                {POPULAR_MODELS.filter((m) => popularCategory === 'All' || m.category === popularCategory).map((m) => {
+                  const installed = (artifacts || []).find((a) => a.filename === m.filename)
+                  const isInstalled = installed !== undefined
+                  const isLoaded = runner?.loaded_file === (installed?.path || m.filename)
+                  const fit = getHardwareFitBadge(m.sizeMB, hardware)
+
+                  return (
+                    <div
+                      key={m.id}
+                      style={{
+                        padding: '0.85rem',
+                        borderRadius: 'var(--radius)',
+                        border: '1px solid var(--border-color)',
+                        backgroundColor: 'var(--bg-secondary)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        justifyContent: 'space-between',
+                        gap: '0.6rem',
+                      }}
+                    >
+                      <div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.25rem' }}>
+                          <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>{m.name}</div>
+                          <span className="badge" style={{ fontSize: '0.65rem', backgroundColor: 'var(--bg-primary)' }}>{m.creator}</span>
+                        </div>
+                        <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.4rem', lineHeight: '1.3' }}>
+                          {m.description}
+                        </div>
+                        <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                          <span style={{ fontSize: '0.7rem', backgroundColor: 'var(--bg-primary)', padding: '0.15rem 0.4rem', borderRadius: '4px' }}>
+                            {(m.sizeMB / 1024).toFixed(1)} GB &bull; {m.quant}
+                          </span>
+                          <span style={{ fontSize: '0.7rem', backgroundColor: 'var(--bg-primary)', padding: '0.15rem 0.4rem', borderRadius: '4px' }}>
+                            {m.contextLimit / 1024}k Ctx
+                          </span>
+                          <span
+                            style={{ fontSize: '0.7rem', color: fit.color, fontWeight: 500 }}
+                            title={fit.tooltip}
+                          >
+                            {fit.label}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.2rem' }}>
+                        {isLoaded ? (
+                          <span className="badge" style={{ backgroundColor: 'var(--accent-success)', width: '100%', textAlign: 'center', padding: '0.4rem' }}>
+                            Loaded Active
+                          </span>
+                        ) : isInstalled ? (
+                          <button
+                            type="button"
+                            className="btn btn-primary"
+                            style={{ flex: 1, padding: '0.35rem', fontSize: '0.8rem' }}
+                            onClick={() => installed && handleLoadArtifactIntoRunner(installed)}
+                            disabled={!runner?.configured}
+                          >
+                            Load Model
+                          </button>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              className="btn btn-primary"
+                              style={{ flex: 1, padding: '0.35rem', fontSize: '0.8rem' }}
+                              onClick={() => startDownloadJob(m.url, m.filename)}
+                              disabled={dlLoading}
+                            >
+                              {dlLoading ? 'Downloading...' : '1-Click Download'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-secondary"
+                              style={{ padding: '0.35rem 0.5rem', fontSize: '0.8rem' }}
+                              title="Copy details to form below"
+                              onClick={() => {
+                                setDlUrl(m.url)
+                                setDlFilename(m.filename)
+                                setDlSha('')
+                              }}
+                              disabled={dlLoading}
+                            >
+                              Fill
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+
+            {/* Hugging Face Quick Resolver Helper */}
+            <div style={{ marginBottom: '1.5rem', padding: '1rem', backgroundColor: 'var(--bg-primary)', borderRadius: 'var(--radius)', border: '1px solid var(--border-color)' }}>
+              <h4 style={{ fontSize: '0.9rem', margin: '0 0 0.35rem 0' }}>🤗 Hugging Face Quick Resolver</h4>
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', margin: '0 0 0.75rem 0' }}>
+                Paste a Hugging Face model URL or repo ID (e.g. <code>unsloth/DeepSeek-R1-Distill-Qwen-8B-GGUF</code>)
+                to list the weight files it publishes, then pick the quantization you want. A direct
+                <code>.gguf</code> link fills the form straight in.
+              </p>
+              <form onSubmit={handleResolveHfUrl} style={{ display: 'flex', gap: '0.5rem' }}>
+                <input
+                  type="text"
+                  className="form-control"
+                  placeholder="https://huggingface.co/org/repo or org/repo"
+                  value={hfResolveInput}
+                  onChange={(e) => setHfResolveInput(e.target.value)}
+                  style={{ fontSize: '0.85rem' }}
+                  disabled={dlLoading}
+                />
+                <button type="submit" className="btn btn-secondary" style={{ whiteSpace: 'nowrap', fontSize: '0.85rem' }} disabled={dlLoading || hfLoading}>
+                  {hfLoading ? 'Looking up...' : 'List Models'}
+                </button>
+              </form>
+              {hfResolveMsg && <div style={{ fontSize: '0.8rem', color: 'var(--accent-text)', marginTop: '0.4rem' }}>{hfResolveMsg}</div>}
+
+              {hfFiles.length > 0 && (
+                <div style={{ marginTop: '0.75rem', maxHeight: '18rem', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+                  {hfFiles.map((f) => {
+                    const fit = getHardwareFitBadge((f.total_bytes || f.size_bytes) / (1024 * 1024), hardware)
+                    const isSplit = (f.shard_count || 0) > 1
+                    return (
+                      <div
+                        key={f.path}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          gap: '0.75rem',
+                          padding: '0.4rem 0.6rem',
+                          backgroundColor: 'var(--bg-secondary)',
+                          borderRadius: 'var(--radius)',
+                          border: '1px solid var(--border-color)',
+                        }}
+                      >
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: '0.8rem', fontWeight: 600, overflowWrap: 'anywhere' }}>{f.filename}</div>
+                          <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)' }}>
+                            {(f.size_bytes / (1024 * 1024 * 1024)).toFixed(2)} GB
+                            {f.quantization && <> &bull; {f.quantization}</>}
+                            {!isSplit && <> &bull; <span style={{ color: fit.color }} title={fit.tooltip}>{fit.label}</span></>}
+                            {isSplit && <> &bull; split across {f.shard_count} files</>}
+                          </div>
+                          {(f.companions || []).length > 0 && (
+                            <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', opacity: 0.85 }}>
+                              includes{' '}
+                              {(f.companions || [])
+                                .map((c) => (c.kind === 'projector' ? `vision projector (${c.filename})` : `MTP draft module (${c.filename})`))
+                                .join(' and ')}
+                              {' '}&bull; {(f.total_bytes / (1024 * 1024 * 1024)).toFixed(2)} GB total
+                            </div>
+                          )}
+                        </div>
+                        {isSplit ? (
+                          <span
+                            style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}
+                            title="Every shard has to be present before the model will load, and the downloader fetches one file at a time. Fetch it with huggingface-cli into your models directory instead."
+                          >
+                            multi-part
+                          </span>
+                        ) : (
+                          <div style={{ display: 'flex', gap: '0.35rem' }}>
+                            <button
+                              type="button"
+                              className="btn btn-primary"
+                              style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem', whiteSpace: 'nowrap' }}
+                              onClick={() => startDownloadJob(f.url, f.filename, '', f.companions || [])}
+                              disabled={dlLoading}
+                            >
+                              Download
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-secondary"
+                              style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem', whiteSpace: 'nowrap' }}
+                              onClick={() => handlePickHfFile(f)}
+                              disabled={dlLoading}
+                              title="Fill the form below instead of downloading now"
+                            >
+                              Use
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Custom Download Artifact Form */}
+            <h4 style={{ fontSize: '0.9rem', marginBottom: '0.75rem' }}>Custom Model Download (HTTPS GGUF)</h4>
             {dlError && <div className="alert alert-error">{dlError}</div>}
             {dlSuccess && <div className="alert alert-success">{dlSuccess}</div>}
 
             <form onSubmit={handleDownloadArtifact}>
-              <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: '0.75rem' }}>
+              <div className="settings-fields" style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: '0.75rem' }}>
                 <input
                   type="url"
                   className="form-control"
@@ -1005,7 +1593,7 @@ export const Settings: React.FC = () => {
                 </div>
               )}
 
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div className="settings-fields" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
                 <div className="form-group">
                   <label>Model Display Name</label>
                   <input
@@ -1036,7 +1624,7 @@ export const Settings: React.FC = () => {
                 </div>
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div className="settings-fields" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
                 <div className="form-group">
                   <label>Context Limit</label>
                   <input
@@ -1122,7 +1710,7 @@ export const Settings: React.FC = () => {
         {limitSuccess && <div className="alert alert-success">{limitSuccess}</div>}
 
         <form onSubmit={handleSaveLimits}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }}>
+          <div className="settings-fields" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }}>
             <div className="form-group">
               <label>Max Active Concurrent</label>
               <input

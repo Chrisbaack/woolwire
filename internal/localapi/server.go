@@ -348,10 +348,12 @@ func (s *Server) routes() {
 	// Hardware & Managed Models
 	s.mux.HandleFunc("GET /api/v1/hardware", s.authMiddleware(s.handleGetHardware))
 	s.mux.HandleFunc("GET /api/v1/managed-models/artifacts", s.authMiddleware(s.handleListArtifacts))
+	s.mux.HandleFunc("GET /api/v1/managed-models/storage", s.authMiddleware(s.handleArtifactStorage))
 	s.mux.HandleFunc("POST /api/v1/managed-models/download", s.authMiddleware(s.handleDownloadArtifact))
 	s.mux.HandleFunc("GET /api/v1/managed-models/downloads", s.authMiddleware(s.handleDownloadStatus))
+	s.mux.HandleFunc("GET /api/v1/managed-models/huggingface", s.authMiddleware(s.handleResolveHuggingFaceRepo))
 	s.mux.HandleFunc("POST /api/v1/managed-models/downloads/{id}/cancel", s.authMiddleware(s.handleCancelDownload))
-	s.mux.HandleFunc("DELETE /api/v1/managed-models/artifacts/{filename}", s.authMiddleware(s.handleDeleteArtifact))
+	s.mux.HandleFunc("DELETE /api/v1/managed-models/artifacts/{filename...}", s.authMiddleware(s.handleDeleteArtifact))
 	s.mux.HandleFunc("GET /api/v1/managed-models/runner-health", s.authMiddleware(s.handleRunnerHealth))
 	s.mux.HandleFunc("POST /api/v1/managed-models/load", s.authMiddleware(s.handleLoadManagedModel))
 	s.mux.HandleFunc("POST /api/v1/managed-models/unload", s.authMiddleware(s.handleUnloadManagedModel))
@@ -1157,7 +1159,8 @@ func (s *Server) Serve(listener net.Listener) error {
 	return s.server.Serve(listener)
 }
 
-// StartBackground launches the membership, retention, and storage-cap jobs.
+// StartBackground launches the membership, retention, and model-advertisement
+// jobs.
 func (s *Server) StartBackground() {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -1170,7 +1173,7 @@ func (s *Server) StartBackground() {
 	s.bgCancel = cancel
 	s.mu.Unlock()
 
-	s.bgWG.Add(2)
+	s.bgWG.Add(3)
 	go func() {
 		defer s.bgWG.Done()
 		s.membershipLoop(ctx)
@@ -1178,6 +1181,10 @@ func (s *Server) StartBackground() {
 	go func() {
 		defer s.bgWG.Done()
 		s.retentionLoop(ctx)
+	}()
+	go func() {
+		defer s.bgWG.Done()
+		s.catalogLoop(ctx)
 	}()
 }
 

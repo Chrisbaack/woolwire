@@ -161,7 +161,6 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(ch)
 }
 
-
 type EnrichedMaterializedMessage struct {
 	community.MaterializedMessage
 	AuthorDisplayName string `json:"author_display_name"`
@@ -575,9 +574,16 @@ func (s *Server) syncEventsWithPeer(
 		dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 
 		cursors, _ := s.store.AuthorCursors(roomID)
+		gaps, _ := s.store.AuthorGaps(roomID)
+		knownIDs, _ := s.store.ListEventIDs(roomID)
+		if len(knownIDs) > 500 {
+			knownIDs = nil
+		}
 		req := peerapi.CommunitySyncRequest{
-			RoomID:  roomID,
-			Cursors: cursors,
+			RoomID:        roomID,
+			Cursors:       cursors,
+			MissingRanges: gaps,
+			KnownIDs:      knownIDs,
 		}
 		if page == 0 {
 			req.PushEvents = pushEvents

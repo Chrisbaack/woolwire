@@ -127,8 +127,8 @@ Read [ARCHITECTURE.md](ARCHITECTURE.md) for product decisions and trust boundari
 
 - Added local metrics endpoint (`GET /api/v1/metrics`) reporting connectivity (Tailcat address, known peer count), storage metrics (SQLite database size, GGUF artifact size and count), runner engine health, denial counters, and guaranteeing `telemetry_enabled: false`.
 - Built hot SQLite backup snapshot (`POST /api/v1/backup/export` and `Store.Backup()`) using SQLite `VACUUM INTO` for crash-consistent single-file exports without service downtime.
-- Authored comprehensive Software Bill of Materials ([docs/SBOM.md](docs/SBOM.md)) documenting pinned components (Tailcat v0.6.0, Go 1.27.1, SQLite v1.58.0, llama.cpp runner, React 18, Vite), pure-Go reproducible build flags (`CGO_ENABLED=0 -trimpath`), and vulnerability scanning procedures.
-- Authored complete Backup and Disaster Recovery Guide ([docs/BACKUP_RESTORE.md](docs/BACKUP_RESTORE.md)) detailing live exports, cold backups, integrity checks, and recovery scenarios for creator offline, corrupted databases, and lost model weights.
+- Authored comprehensive Software Bill of Materials ([docs/SBOM.md](SBOM.md)) documenting pinned components (Tailcat v0.6.0, Go 1.27.1, SQLite v1.58.0, llama.cpp runner, React 18, Vite), pure-Go reproducible build flags (`CGO_ENABLED=0 -trimpath`), and vulnerability scanning procedures.
+- Authored complete Backup and Disaster Recovery Guide ([docs/BACKUP_RESTORE.md](BACKUP_RESTORE.md)) detailing live exports, cold backups, integrity checks, and recovery scenarios for creator offline, corrupted databases, and lost model weights.
 - Verified all security and trust boundaries across all packages:
   - Separate loopback-only local UI and authenticated peer listeners.
   - No Docker socket mounted; containers run as non-root UID:GID 1000:1000.

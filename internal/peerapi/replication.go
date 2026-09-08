@@ -103,9 +103,11 @@ func ReceiptRecord(rec contributions.Receipt, status string) store.ContributionR
 // author. The old shape grew without bound and made sync fail permanently
 // once the room passed roughly fifteen thousand events.
 type CommunitySyncRequest struct {
-	RoomID     string            `json:"room_id"`
-	Cursors    map[string]int64  `json:"cursors"`
-	PushEvents []community.Event `json:"push_events,omitempty"`
+	RoomID        string                `json:"room_id"`
+	Cursors       map[string]int64      `json:"cursors"`
+	MissingRanges map[string][][2]int64 `json:"missing_ranges,omitempty"`
+	KnownIDs      []string              `json:"known_ids,omitempty"`
+	PushEvents    []community.Event     `json:"push_events,omitempty"`
 }
 
 type CommunitySyncResponse struct {
@@ -140,7 +142,15 @@ func (s *Server) handleCommunitySync(w http.ResponseWriter, r *http.Request, cal
 		_ = s.store.SaveEvent(EventRecord(e, "replicated"))
 	}
 
-	records, _ := s.store.ListEventsAfterCursor(roomRec.RoomID, req.Cursors, syncPageSize)
+	var knownMap map[string]bool
+	if len(req.KnownIDs) > 0 {
+		knownMap = make(map[string]bool, len(req.KnownIDs))
+		for _, id := range req.KnownIDs {
+			knownMap[id] = true
+		}
+	}
+
+	records, _ := s.store.ListEventsAfterCursor(roomRec.RoomID, req.Cursors, req.MissingRanges, knownMap, syncPageSize)
 	pullEvents := make([]community.Event, 0, len(records))
 	nextCursors := make(map[string]int64, len(records))
 	for _, rec := range records {
@@ -210,14 +220,17 @@ func withinRetentionWindow(timestamp int64, now time.Time) bool {
 }
 
 type ContributionsSyncRequest struct {
-	RoomID       string                  `json:"room_id"`
-	Cursors      map[string]int64        `json:"cursors"`
-	PushReceipts []contributions.Receipt `json:"push_receipts,omitempty"`
+	RoomID          string                           `json:"room_id"`
+	Cursors         map[string]int64                 `json:"cursors"`
+	PageCursors     map[string]store.ReceiptCursorKey `json:"page_cursors,omitempty"`
+	KnownReceiptIDs []string                         `json:"known_receipt_ids,omitempty"`
+	PushReceipts    []contributions.Receipt          `json:"push_receipts,omitempty"`
 }
 
 type ContributionsSyncResponse struct {
-	PullReceipts []contributions.Receipt `json:"pull_receipts"`
-	NextCursors  map[string]int64        `json:"next_cursors"`
+	PullReceipts    []contributions.Receipt          `json:"pull_receipts"`
+	NextCursors     map[string]int64                 `json:"next_cursors"`
+	NextPageCursors map[string]store.ReceiptCursorKey `json:"next_page_cursors,omitempty"`
 }
 
 func (s *Server) handleContributionsAck(w http.ResponseWriter, r *http.Request, caller peerauth.Identity) {
@@ -266,21 +279,32 @@ func (s *Server) handleContributionsSync(w http.ResponseWriter, r *http.Request,
 		_ = s.store.SaveReceipt(ReceiptRecord(rec, "replicated"))
 	}
 
-	records, _ := s.store.ListReceiptsAfterCursor(roomRec.RoomID, req.Cursors, syncPageSize)
+	var knownMap map[string]bool
+	if len(req.KnownReceiptIDs) > 0 {
+		knownMap = make(map[string]bool, len(req.KnownReceiptIDs))
+		for _, id := range req.KnownReceiptIDs {
+			knownMap[id] = true
+		}
+	}
+
+	records, _ := s.store.ListReceiptsAfterCursor(roomRec.RoomID, req.Cursors, req.PageCursors, knownMap, syncPageSize)
 	pullReceipts := make([]contributions.Receipt, 0, len(records))
 	nextCursors := make(map[string]int64, len(records))
+	nextPageCursors := make(map[string]store.ReceiptCursorKey, len(records))
 	for _, rec := range records {
 		pullReceipts = append(pullReceipts, ReceiptFromRecord(rec))
 		key := rec.HostMemberID + "/" + rec.RequesterMemberID
 		if rec.Timestamp > nextCursors[key] {
 			nextCursors[key] = rec.Timestamp
 		}
+		nextPageCursors[key] = store.ReceiptCursorKey{Timestamp: rec.Timestamp, RequestID: rec.RequestID}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(ContributionsSyncResponse{
-		PullReceipts: pullReceipts,
-		NextCursors:  nextCursors,
+		PullReceipts:    pullReceipts,
+		NextCursors:     nextCursors,
+		NextPageCursors: nextPageCursors,
 	})
 }
 

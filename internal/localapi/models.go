@@ -295,40 +295,12 @@ func (s *Server) handleGetCatalog(w http.ResponseWriter, r *http.Request) {
 
 	device, _ := s.store.GetDeviceIdentity()
 	var myMemberID string
-	var myPubKey ed25519.PublicKey
-	var myPrivKey ed25519.PrivateKey
 	if device != nil {
 		myMemberID, _ = peerapi.MemberIDForDevicePublic(device.DevicePublic)
-		if pubBytes, err := identity.DecodeToken(device.DevicePublic, ed25519.PublicKeySize); err == nil {
-			myPubKey = ed25519.PublicKey(pubBytes)
-		}
-		if len(device.DevicePrivate) == ed25519.PrivateKeySize {
-			myPrivKey = ed25519.PrivateKey(device.DevicePrivate)
-		}
 	}
 
 	// 1. Ingest local published models
-	if myPubKey != nil && myPrivKey != nil {
-		localModels, _ := s.store.ListHostedModels()
-		for _, m := range localModels {
-			if !m.Enabled || !m.Published {
-				continue
-			}
-			ad := catalog.ModelAd{
-				RoomID:        roomRec.RoomID,
-				HostMemberID:  myMemberID,
-				ModelID:       m.ID,
-				Revision:      m.Revision,
-				Name:          m.Name,
-				ContextLimit:  m.ContextLimit,
-				Availability:  "ready",
-				QueueEstimate: 0,
-				IsManaged:     m.ModelType == "managed",
-			}
-			_ = ad.Sign(myPrivKey)
-			_ = s.catalog.Upsert(ad, myPubKey)
-		}
-	}
+	s.advertiseLocalModels()
 
 	// 2. Query all known peer addresses for their catalogs over authenticated
 	//    connections, and accept an advertisement only from the member whose
@@ -385,4 +357,86 @@ func (s *Server) handleGetCatalog(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(items)
+}
+
+// advertiseLocalModels re-signs an advertisement for every published local
+// model.
+//
+// Advertisements carry a timestamp and expire after
+// catalog.StaleAdTimeoutSeconds, which is what lets a node notice a peer that
+// went away. A node's own models are different: nothing about their
+// availability depends on the network, and this node is the authority on them.
+// Refreshing them only inside the catalog handler tied their availability to a
+// browser polling the dashboard — leave the chat page open for ninety seconds
+// and sending a message answered "selected model is offline or host is
+// unreachable" for a model the runner was still serving. The refresh therefore
+// runs on a timer as well; see catalogLoop.
+func (s *Server) advertiseLocalModels() {
+	if s.catalog == nil {
+		return
+	}
+
+	roomRec, err := s.store.GetRoomState()
+	if err != nil || roomRec == nil {
+		// Outside a room there is no one to advertise to.
+		return
+	}
+	device, err := s.store.GetDeviceIdentity()
+	if err != nil || device == nil {
+		return
+	}
+	myMemberID, err := peerapi.MemberIDForDevicePublic(device.DevicePublic)
+	if err != nil {
+		return
+	}
+	pubBytes, err := identity.DecodeToken(device.DevicePublic, ed25519.PublicKeySize)
+	if err != nil || len(device.DevicePrivate) != ed25519.PrivateKeySize {
+		return
+	}
+	myPubKey := ed25519.PublicKey(pubBytes)
+	myPrivKey := ed25519.PrivateKey(device.DevicePrivate)
+
+	localModels, err := s.store.ListHostedModels()
+	if err != nil {
+		return
+	}
+
+	// A managed model is only being served while the runner actually holds its
+	// weights. The hosted_models row survives a runner restart, so without
+	// asking, a refresh would keep advertising a model the runner dropped —
+	// and the refresh now runs on a timer, so it would say so indefinitely.
+	loadedModelID := ""
+	if s.runnerClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if health, err := s.runnerClient.Health(ctx); err == nil {
+			loadedModelID = health.LoadedModelID
+		}
+		cancel()
+	}
+
+	for _, m := range localModels {
+		if !m.Enabled || !m.Published {
+			continue
+		}
+		managed := m.ModelType == "managed"
+		availability := "ready"
+		if managed && m.ID != loadedModelID {
+			availability = "offline"
+		}
+		ad := catalog.ModelAd{
+			RoomID:        roomRec.RoomID,
+			HostMemberID:  myMemberID,
+			ModelID:       m.ID,
+			Revision:      m.Revision,
+			Name:          m.Name,
+			ContextLimit:  m.ContextLimit,
+			Availability:  availability,
+			QueueEstimate: 0,
+			IsManaged:     managed,
+		}
+		if err := ad.Sign(myPrivKey); err != nil {
+			continue
+		}
+		_ = s.catalog.Upsert(ad, myPubKey)
+	}
 }

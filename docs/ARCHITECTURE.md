@@ -1,5 +1,10 @@
 # Woolwire architecture
 
+> Design reference: this document includes intended controls and deferred work.
+> It is not a claim that every requirement has shipped. See [Features](FEATURES.md),
+> [Configuration](CONFIGURATION.md), and [Validation status](STATUS.md) for the
+> implemented interface and remaining verification.
+
 Status: proposed design, September 5, 2026. Product decisions reflect the latest agreed room-based experience; earlier proposals requiring Tailscale accounts, expiring invitations, or daily membership renewal are superseded.
 
 ## 1. Product and trust model

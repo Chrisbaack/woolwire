@@ -75,16 +75,113 @@ func (s *Store) AuthorCursors(roomID string) (map[string]int64, error) {
 	return cursors, rows.Err()
 }
 
+// AuthorGaps returns sequence ranges that are missing for each author.
+// A range [start, end] means sequences start..end are missing locally.
+func (s *Store) AuthorGaps(roomID string) (map[string][][2]int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT author_member_id, author_seq
+		FROM community_events WHERE room_id = ?
+		ORDER BY author_member_id ASC, author_seq ASC
+	`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	gaps := make(map[string][][2]int64)
+	var currentAuthor string
+	var expectedSeq int64 = 1
+
+	for rows.Next() {
+		var author string
+		var seq int64
+		if err := rows.Scan(&author, &seq); err != nil {
+			return nil, err
+		}
+		if author != currentAuthor {
+			currentAuthor = author
+			expectedSeq = 1
+		}
+		if seq > expectedSeq {
+			gaps[author] = append(gaps[author], [2]int64{expectedSeq, seq - 1})
+		}
+		if seq >= expectedSeq {
+			expectedSeq = seq + 1
+		}
+	}
+	return gaps, rows.Err()
+}
+
+// ListEventIDs returns all community event IDs held for the room.
+func (s *Store) ListEventIDs(roomID string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`SELECT id FROM community_events WHERE room_id = ?`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func inGaps(seq int64, ranges [][2]int64) bool {
+	for _, r := range ranges {
+		if seq >= r[0] && seq <= r[1] {
+			return true
+		}
+	}
+	return false
+}
+
 // ListEventsAfterCursor returns events the requester is missing, ordered by
-// (author, seq) so paging with the returned high-water marks converges. An
-// author absent from cursors is served from the beginning.
-func (s *Store) ListEventsAfterCursor(roomID string, cursors map[string]int64, limit int) ([]EventRecord, error) {
+// (author, seq) so paging with the returned high-water marks converges.
+// It includes events in missing ranges (gaps) and conflicting events at
+// sequences already seen by the requester.
+func (s *Store) ListEventsAfterCursor(
+	roomID string,
+	cursors map[string]int64,
+	gaps map[string][][2]int64,
+	knownIDs map[string]bool,
+	limit int,
+) ([]EventRecord, error) {
 	if limit <= 0 {
 		limit = 500
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// Find sequences where the local store holds multiple events (known conflicts).
+	multiEvents := make(map[string]map[int64]bool)
+	if multiRows, err := s.db.Query(`
+		SELECT author_member_id, author_seq
+		FROM community_events
+		WHERE room_id = ?
+		GROUP BY author_member_id, author_seq
+		HAVING COUNT(*) > 1
+	`, roomID); err == nil {
+		for multiRows.Next() {
+			var author string
+			var seq int64
+			if multiRows.Scan(&author, &seq) == nil {
+				if multiEvents[author] == nil {
+					multiEvents[author] = make(map[int64]bool)
+				}
+				multiEvents[author][seq] = true
+			}
+		}
+		multiRows.Close()
+	}
 
 	rows, err := s.db.Query(`
 		SELECT id, room_id, channel_id, author_member_id, author_seq,
@@ -109,7 +206,21 @@ func (s *Store) ListEventsAfterCursor(roomID string, cursors map[string]int64, l
 		); err != nil {
 			return nil, err
 		}
-		if cursor, ok := cursors[e.AuthorMemberID]; ok && e.AuthorSeq <= cursor {
+		if knownIDs != nil && knownIDs[e.ID] {
+			continue
+		}
+		cursor, hasCursor := cursors[e.AuthorMemberID]
+		isNewSeq := !hasCursor || e.AuthorSeq > cursor
+		isGap := inGaps(e.AuthorSeq, gaps[e.AuthorMemberID])
+		isConflict := multiEvents[e.AuthorMemberID] != nil && multiEvents[e.AuthorMemberID][e.AuthorSeq]
+
+		if !isNewSeq && !isGap && !isConflict {
+			if knownIDs != nil && len(knownIDs) <= 500 && !knownIDs[e.ID] {
+				isConflict = true
+			}
+		}
+
+		if !isNewSeq && !isGap && !isConflict {
 			continue
 		}
 		events = append(events, e)
@@ -237,9 +348,43 @@ func (s *Store) ReceiptCursors(roomID string) (map[string]int64, error) {
 	return cursors, rows.Err()
 }
 
+type ReceiptCursorKey struct {
+	Timestamp int64  `json:"timestamp"`
+	RequestID string `json:"request_id"`
+}
+
+// ListReceiptIDs returns all receipt request IDs stored in the room.
+func (s *Store) ListReceiptIDs(roomID string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`SELECT request_id FROM contribution_receipts WHERE room_id = ?`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ListReceiptsAfterCursor returns receipts the requester is missing for each
-// (host, requester) pair, bounded by limit.
-func (s *Store) ListReceiptsAfterCursor(roomID string, cursors map[string]int64, limit int) ([]ContributionReceiptRecord, error) {
+// (host, requester) pair, bounded by limit. Uses unique tie-breaker (timestamp, request_id)
+// for pagination and checks known receipt IDs to recover receipts learned out of order.
+func (s *Store) ListReceiptsAfterCursor(
+	roomID string,
+	cursors map[string]int64,
+	pageCursors map[string]ReceiptCursorKey,
+	knownIDs map[string]bool,
+	limit int,
+) ([]ContributionReceiptRecord, error) {
 	if limit <= 0 {
 		limit = 500
 	}
@@ -270,9 +415,22 @@ func (s *Store) ListReceiptsAfterCursor(roomID string, cursors map[string]int64,
 			return nil, err
 		}
 		r.Completed = completedInt != 0
-		if cursor, ok := cursors[r.HostMemberID+"/"+r.RequesterMemberID]; ok && r.Timestamp <= cursor {
+
+		if knownIDs != nil && knownIDs[r.RequestID] {
 			continue
 		}
+
+		pair := r.HostMemberID + "/" + r.RequesterMemberID
+		if pageCursors != nil {
+			if pc, ok := pageCursors[pair]; ok {
+				if r.Timestamp < pc.Timestamp || (r.Timestamp == pc.Timestamp && r.RequestID <= pc.RequestID) {
+					continue
+				}
+			}
+		} else if cursor, ok := cursors[pair]; ok && (knownIDs == nil || len(knownIDs) == 0) && r.Timestamp <= cursor {
+			continue
+		}
+
 		receipts = append(receipts, r)
 		if len(receipts) >= limit {
 			break

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cbaack/woolwire/internal/community"
+	"github.com/cbaack/woolwire/internal/contributions"
 	"github.com/cbaack/woolwire/internal/peerapi"
 	"github.com/cbaack/woolwire/internal/store"
 	"github.com/cbaack/woolwire/internal/transport"
@@ -305,4 +306,196 @@ func creatorAuthority(s *store.Store) (ed25519.PublicKey, error) {
 	}
 	priv := ed25519.PrivateKey(roomRec.AuthorityPrivate)
 	return priv.Public().(ed25519.PublicKey), nil
+}
+
+// TestCommunityReplicationPreservesGapsAndConflicts covers task 35:
+// Sync nodes holding different subsets of an author's log (gaps) and different events
+// at the same sequence (conflicts). Both must converge and quarantine consistently.
+func TestCommunityReplicationPreservesGapsAndConflicts(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	const peerPort = 4275
+
+	nodeA := setupTestNode(t, vNet, "rep-gap-a", peerPort)
+	nodeA.login(t)
+	roomID, invitation := nodeA.hostRoom(t, "Alice", "Gap Room")
+
+	nodeB := setupTestNode(t, vNet, "rep-gap-b", peerPort)
+	nodeB.login(t)
+	if w := nodeB.joinRoom(t, "Bob", invitation); w.Code != http.StatusOK {
+		t.Fatalf("nodeB join failed: %d %s", w.Code, w.Body.String())
+	}
+
+	devA, _ := nodeA.store.GetDeviceIdentity()
+	privA := ed25519.PrivateKey(devA.DevicePrivate)
+	now := time.Now().Unix()
+
+	makeEvent := func(seq int64, content string) community.Event {
+		e := community.Event{
+			RoomID:         roomID,
+			ChannelID:      "chan-general",
+			AuthorMemberID: nodeA.memberID,
+			AuthorSeq:      seq,
+			EventType:      community.EventMessage,
+			Content:        content,
+			Timestamp:      now + seq,
+		}
+		if err := e.Sign(privA); err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+
+	// Create events:
+	// seq 1
+	e1 := makeEvent(1, "message 1")
+	// seq 2 (missing on nodeA initially)
+	e2 := makeEvent(2, "message 2")
+	// seq 3 (missing on nodeA initially)
+	e3 := makeEvent(3, "message 3")
+	// seq 4 conflict: two distinct events signed by the author at seq 4
+	e4a := makeEvent(4, "conflict branch A")
+	e4b := makeEvent(4, "conflict branch B")
+	// seq 5
+	e5 := makeEvent(5, "message 5")
+
+	// Node A holds seq 1, 4a, 5 (missing 2 and 3; holds 4a)
+	for _, e := range []community.Event{e1, e4a, e5} {
+		_ = nodeA.store.SaveEvent(peerapi.EventRecord(e, "local"))
+	}
+
+	// Node B holds seq 1, 2, 3, 4b, 5 (missing 4a; holds 4b)
+	for _, e := range []community.Event{e1, e2, e3, e4b, e5} {
+		_ = nodeB.store.SaveEvent(peerapi.EventRecord(e, "local"))
+	}
+
+	// Exchange sync between Node A and Node B
+	nodeA.localSrv.SyncCommunityEvents(context.Background())
+	nodeB.localSrv.SyncCommunityEvents(context.Background())
+	nodeA.localSrv.SyncCommunityEvents(context.Background())
+
+	// Both nodes must now have all 6 events: e1, e2, e3, e4a, e4b, e5
+	eventsA, _ := nodeA.store.ListAllEvents(roomID)
+	eventsB, _ := nodeB.store.ListAllEvents(roomID)
+
+	if len(eventsA) != 6 {
+		t.Fatalf("expected Node A to converge on 6 events (recovering gaps and conflict), got %d", len(eventsA))
+	}
+	if len(eventsB) != 6 {
+		t.Fatalf("expected Node B to converge on 6 events, got %d", len(eventsB))
+	}
+
+	// Assert specific missing events exist on Node A
+	if !nodeA.store.HasEvent(e2.ID) || !nodeA.store.HasEvent(e3.ID) {
+		t.Fatal("Node A failed to recover missing gap events e2 or e3")
+	}
+	if !nodeA.store.HasEvent(e4b.ID) {
+		t.Fatal("Node A failed to discover conflicting event e4b at sequence 4")
+	}
+	if !nodeB.store.HasEvent(e4a.ID) {
+		t.Fatal("Node B failed to discover conflicting event e4a at sequence 4")
+	}
+
+	// Verify consistent conflict resolution across both nodes
+	evListA := make([]community.Event, 0, len(eventsA))
+	for _, r := range eventsA {
+		evListA = append(evListA, peerapi.EventFromRecord(r))
+	}
+	evListB := make([]community.Event, 0, len(eventsB))
+	for _, r := range eventsB {
+		evListB = append(evListB, peerapi.EventFromRecord(r))
+	}
+	resA := community.Materialize(evListA)
+	resB := community.Materialize(evListB)
+
+	if len(resA.ConflictedAuthors) == 0 || len(resB.ConflictedAuthors) == 0 {
+		t.Fatal("expected conflicting events at sequence 4 to surface conflicted author")
+	}
+	if len(resA.Messages) != len(resB.Messages) || len(resA.ConflictedAuthors) != len(resB.ConflictedAuthors) {
+		t.Fatalf("conflict resolution mismatch between nodes: msgsA=%d msgsB=%d confA=%d confB=%d", len(resA.Messages), len(resB.Messages), len(resA.ConflictedAuthors), len(resB.ConflictedAuthors))
+	}
+}
+
+// TestContributionsSyncSameTimestampAcrossPageAndOutOfOrder covers task 35:
+// Sync distinct same-second receipts across a page boundary and receipts arriving out of order;
+// every valid receipt must reach both nodes.
+func TestContributionsSyncSameTimestampAcrossPageAndOutOfOrder(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	const peerPort = 4276
+
+	nodeA := setupTestNode(t, vNet, "rep-rcpt-a", peerPort)
+	nodeA.login(t)
+	roomID, invitation := nodeA.hostRoom(t, "Alice", "Receipt Room")
+
+	nodeB := setupTestNode(t, vNet, "rep-rcpt-b", peerPort)
+	nodeB.login(t)
+	if w := nodeB.joinRoom(t, "Bob", invitation); w.Code != http.StatusOK {
+		t.Fatalf("nodeB join failed: %d %s", w.Code, w.Body.String())
+	}
+
+	devA, _ := nodeA.store.GetDeviceIdentity()
+	privA := ed25519.PrivateKey(devA.DevicePrivate)
+	devB, _ := nodeB.store.GetDeviceIdentity()
+	privB := ed25519.PrivateKey(devB.DevicePrivate)
+
+	now := time.Now().Unix()
+
+	makeReceipt := func(reqID string, ts int64) contributions.Receipt {
+		r := contributions.Receipt{
+			RoomID:            roomID,
+			RequestID:         reqID,
+			HostMemberID:      nodeA.memberID,
+			RequesterMemberID: nodeB.memberID,
+			Timestamp:         ts,
+			Completed:         true,
+		}
+		_ = r.SignHost(privA)
+		_ = r.SignRequester(privB)
+		return r
+	}
+
+	// 1. Generate 15 distinct receipts sharing the EXACT same second on Node A
+	const sameTsCount = 15
+	for i := 0; i < sameTsCount; i++ {
+		r := makeReceipt(fmt.Sprintf("req-same-%02d", i), now)
+		_ = nodeA.store.SaveReceipt(peerapi.ReceiptRecord(r, "local"))
+	}
+
+	// 2. Generate 3 receipts with EARLIER timestamps on Node B arriving out of order
+	for i := 0; i < 3; i++ {
+		r := makeReceipt(fmt.Sprintf("req-earlier-%02d", i), now-int64(100+i))
+		_ = nodeB.store.SaveReceipt(peerapi.ReceiptRecord(r, "local"))
+	}
+
+	// Sync in both directions
+	nodeA.localSrv.SyncContributions(context.Background())
+	nodeB.localSrv.SyncContributions(context.Background())
+	nodeA.localSrv.SyncContributions(context.Background())
+
+	// Total receipts created: 15 + 3 = 18. Both nodes must have all 18 receipts!
+	rcptsA, _ := nodeA.store.ListReceipts(roomID)
+	rcptsB, _ := nodeB.store.ListReceipts(roomID)
+
+	const expectedTotal = 18
+	if len(rcptsA) != expectedTotal {
+		t.Fatalf("Node A holds %d receipts, want %d", len(rcptsA), expectedTotal)
+	}
+	if len(rcptsB) != expectedTotal {
+		t.Fatalf("Node B holds %d receipts, want %d", len(rcptsB), expectedTotal)
+	}
+
+	// Verify all same-timestamp receipts reached Node B
+	for i := 0; i < sameTsCount; i++ {
+		id := fmt.Sprintf("req-same-%02d", i)
+		if r, err := nodeB.store.GetReceipt(id); err != nil || r == nil {
+			t.Fatalf("Node B missing same-timestamp receipt %s", id)
+		}
+	}
+
+	// Verify all earlier out-of-order receipts reached Node A
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("req-earlier-%02d", i)
+		if r, err := nodeA.store.GetReceipt(id); err != nil || r == nil {
+			t.Fatalf("Node A missing out-of-order earlier receipt %s", id)
+		}
+	}
 }

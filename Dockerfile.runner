@@ -6,8 +6,15 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/bin/woolwire-runner ./cmd/woolwire-runner
 
-# Pinned llama.cpp server runtime image
-FROM ghcr.io/ggml-org/llama.cpp:server
+# Pinned llama.cpp server runtime image.
+#
+# The CUDA variant. The plain :server tag is a CPU-only build — it ships only
+# libggml-cpu-*.so — so the compose profile's GPU reservation bought nothing
+# and offloading was silently ignored. This image carries libggml-cuda.so and
+# a CUDA 12.8 runtime; the container still needs the GPU passed to it
+# (`--device nvidia.com/gpu=all`, or the deploy.resources block in the compose
+# profile), and falls back to the CPU when it has none.
+FROM ghcr.io/ggml-org/llama.cpp:server-cuda
 WORKDIR /app
 
 COPY --from=runner-builder /app/bin/woolwire-runner /usr/local/bin/woolwire-runner

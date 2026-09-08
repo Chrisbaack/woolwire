@@ -176,6 +176,7 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 	if req.Stream {
 		if runErr != nil {
 			_ = stream.SendJSON("error", map[string]string{"error": runErr.Error()})
+			return
 		}
 		_ = stream.SendRaw("data: [DONE]\n\n")
 		return

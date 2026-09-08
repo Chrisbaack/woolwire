@@ -14,6 +14,16 @@
 #   printf 'WOOLWIRE_RUNNER_TOKEN=%s\n' "$(openssl rand -hex 32)" >> .env
 #
 # `docker compose` and `podman-compose` both load ./.env automatically.
+#
+# Weights live in a named volume by default. To serve models you already have,
+# point WOOLWIRE_MODELS at the directory holding them — a Hugging Face cache
+# (the directory containing `hub/`, i.e. HF_HOME) works as-is, and so does any
+# tree of .gguf files:
+#
+#   echo 'WOOLWIRE_MODELS=/path/to/huggingface' >> .env
+#
+# Woolwire scans that directory, ignores GGUF files that are not language
+# models, and will not delete anything it did not download itself.
 
 services:
   woolwire:
@@ -27,7 +37,7 @@ services:
       - "${WOOLWIRE_HOST_PORT:-127.0.0.1:7070}:7070"
     volumes:
       - woolwire_state:/state
-      - woolwire_models:/models
+      - ${WOOLWIRE_MODELS:-woolwire_models}:/models
     environment:
       - WOOLWIRE_STATE_DIR=/state
       - WOOLWIRE_LISTEN=0.0.0.0:7070
@@ -62,7 +72,7 @@ services:
     # No ports exposed to host or internet - private internal network only!
     volumes:
       # Read-only mount of model weights
-      - woolwire_models:/models:ro
+      - ${WOOLWIRE_MODELS:-woolwire_models}:/models:ro
     environment:
       - RUNNER_TOKEN=${WOOLWIRE_RUNNER_TOKEN:?set WOOLWIRE_RUNNER_TOKEN in .env, e.g. openssl rand -hex 32}
       - MODELS_DIR=/models

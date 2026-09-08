@@ -2,11 +2,13 @@
 
 Source: code review of the initial commit (`3645338`) against `docs/ARCHITECTURE.md` and `docs/IMPLEMENTATION_PLAN.md`, September 5, 2026.
 
-**Status: all 29 tasks are addressed.** Each fix carries a regression test that
-would have caught the original defect. `go vet ./...` and `go test -race ./...`
-are green.
+**Status: all 39 tasks (the original 29 plus follow-up tasks 30–39) are addressed.**
+The follow-up security, logic, and edge-case defects identified in the
+September 6, 2026 review have all been fixed with dedicated regression tests,
+passing `go vet ./...`, `go test -race ./...`, and the frontend build. The fixes
+and historical context for all tasks are detailed below.
 
-Two things remain outside what the tasks asked for, and are recorded in the
+Two things remain outside what the original tasks asked for, and are recorded in the
 README's status section rather than here:
 
 - The multi-process gate over real Tailcat
@@ -18,8 +20,174 @@ README's status section rather than here:
   setup secret was refused on replay, and a cross-origin POST was refused.
 - The runner is covered against a fake engine, not a real `llama-server`.
 
-Where the fix diverged from the task's suggested approach, the divergence is
+Where a fix diverged from the task's suggested approach, the divergence is
 noted under that task below.
+
+---
+
+## Follow-up tasks — September 6, 2026 (Tasks 30–39)
+
+Source: follow-up code review of the current implementation. Tasks 30–38 were
+reproduced with focused probes; task 39 was verified via source analysis and
+runner controller tests. Each fix added lasting regression coverage for its
+acceptance criteria.
+
+Priorities below match the follow-up review: P1 = security boundary or core-flow
+failure; P2 = correctness or robustness. All ten follow-up tasks have been addressed.
+
+### 30. [P1] Prevent partial roster updates from permanently hiding removals
+
+- **Status:** Addressed; verified by `TestPartialRosterUpdateDoesNotHideRemovals` in `internal/localapi/m1_test.go`.
+- **Problem:** `applyMembershipUpdates` in `internal/localapi/background.go:148`
+  advances the global roster cursor to the highest signed membership received,
+  even if an earlier removal was omitted. Subsequent honest sync responses
+  exclude that removal, leaving the removed member authorized indefinitely.
+- **Fix:** Carried `KnownVersions` in `SyncRequest` (`internal/peerapi/server.go`) so
+  the responding peer serves all missing versions. Enforced contiguous roster
+  version progression in `internal/localapi/background.go` so missing earlier
+  updates prevent premature advancement of the cursor.
+- **Verify:** Tested withholding an earlier removal while receiving a newer update,
+  verifying that syncing with an honest peer retrieves the omitted removal,
+  cancels queued/active work, and revokes access.
+
+### 31. [P1] Reject peer inference against unpublished models
+
+- **Status:** Addressed; verified by `TestM2LiveDashboardAndExternalInferenceGate/Criterion_2b` in `internal/localapi/m2_test.go`.
+- **Problem:** `handleInference` in `internal/peerapi/inference.go:45` checks
+  `Enabled` but ignores `Published`. An admitted peer retaining a previously
+  advertised model ID can continue invoking it after the owner unpublishes it.
+- **Fix:** Enforce `!model.Published` check directly in `internal/peerapi/inference.go:45`
+  before queueing or contacting the runner backend.
+- **Verify:** Verified that an admitted peer invoking a previously retained model ID
+  after unpublishing receives an immediate 404/rejection over authenticated TLS
+  without touching the runner backend.
+
+### 32. [P1] Bind peer connection I/O to cancellation and deadlines
+
+- **Status:** Addressed; verified by `TestPeerRoundTripContextDeadlinesAndCancellation` in `internal/localapi/peerclient_test.go`.
+- **Problem:** `peerRoundTrip` in `internal/localapi/peerclient.go:101` uses raw
+  request writes and response reads without binding the connection to the
+  request context. After TLS setup, a stalled peer can block membership polling
+  or inference indefinitely despite the configured context timeout.
+- **Fix:** Introduced `contextConnBody` with `context.AfterFunc` deadline enforcement
+  in `internal/localapi/peerclient.go`, binding request context deadlines and
+  cancellations across the entire roundtrip including streaming body reads, with
+  automatic cleanup on stream close.
+- **Verify:** Tested stalled writes, withheld response headers, mid-body hangs,
+  context cancellations, and timeouts; all abort connections promptly while
+  permitting healthy long streams.
+
+### 33. [P1] Prevent duplicate request IDs from escaping removal cancellation
+
+- **Status:** Addressed; verified by `TestDuplicateRequestIDsAndCancelMember` in `internal/inference/queue_test.go`.
+- **Problem:** `FairQueue.Submit` in `internal/inference/queue.go:139` indexes
+  active work only by caller-supplied request ID. Concurrent requests sharing an
+  ID overwrite the same entry, so `CancelMember` cancels only the tracked request
+  while another request from the removed member continues running.
+- **Fix:** Scoped active request tracking in `internal/inference/queue.go` by composite
+  `requestKey{memberID, requestID}` and rejected duplicate request IDs from the
+  same member with 409 Conflict in `internal/peerapi/inference.go`. Scoped cancellation
+  and completion cleanup strictly to the originating member.
+- **Verify:** Submitted duplicate IDs across multiple active slots and members;
+  verified duplicate rejections, independent cross-member tracking, cancellation of
+  all member slots on removal, and proper return of queue accounting to zero.
+
+### 34. [P1] Let approved joiners complete onboarding
+
+- **Status:** Addressed; verified by extended onboarding and removal tests in `internal/localapi/m1_test.go`.
+- **Problem:** A pending join response leaves the joining device without room
+  state. After creator approval, `handleJoin` in `internal/peerapi/server.go:252`
+  rejects its retry as already admitted. The existing approval test checks only
+  the creator's record, not whether the joiner completes onboarding.
+- **Fix:** In `internal/peerapi/server.go:252`, return the existing admitted
+  membership record to retrying authenticated joiners so onboarding completes
+  without issuing new admissions, while strictly continuing to reject removed devices.
+- **Verify:** Tested pending join, creator approval, joiner retry, local room-state
+  persistence, peer startup, authenticated peer request, and verified that removed
+  devices remain forbidden.
+
+### 35. [P1] Make replication cursors preserve gaps and conflicting records
+
+- **Status:** Addressed; verified by `TestCommunityReplicationPreservesGapsAndConflicts`, `TestContributionsSyncSameTimestampAcrossPageAndOutOfOrder`, and `TestSyncConvergesAtScale` in `internal/localapi/replication_test.go`.
+- **Problem:** `ListEventsAfterCursor` in `internal/store/queries.go:112` treats
+  the highest sequence seen as complete history, suppressing earlier missing
+  events and conflicting events at that sequence. `ListReceiptsAfterCursor` at
+  `:273` similarly suppresses distinct receipts sharing a timestamp. Nodes can
+  permanently diverge and never discover conflicts that should be quarantined.
+- **Fix:** Track missing ranges via `AuthorGaps` and reconcile divergent events in
+  `internal/store/queries.go` and `internal/localapi/community.go` while keeping
+  request bodies bounded. Added `ReceiptCursorKey{Timestamp, RequestID}` tie-breakers
+  and out-of-order receipt reconciliation in `internal/store/queries.go` and
+  `internal/localapi/contributions.go`.
+- **Verify:** Verified convergence and consistent conflict quarantine across nodes
+  holding different event subsets and conflicting same-sequence events; verified
+  same-timestamp receipt pagination and out-of-order receipt sync; verified 20,000-event
+  scale convergence.
+
+### 36. [P2] Buffer incomplete browser SSE frames across network chunks
+
+- **Status:** Addressed; verified by `web/src/sse.test.ts`.
+- **Problem:** `handleSendMessage` in `web/src/components/MyChats.tsx:256` parses
+  each `reader.read()` result independently and discards incomplete lines. A
+  JSON event split across chunks loses its text and request ID. No-save chats
+  cannot recover the displayed response from persisted messages.
+- **Fix:** Implemented `SSEParser` and `readSSEStream` in `web/src/sse.ts` with
+  streaming text decoding and line buffering, processing complete SSE frames
+  across arbitrary chunk boundaries. Integrated into `MyChats.tsx`.
+- **Verify:** Split SSE events at every 1-byte boundary, across multi-byte UTF-8
+  code points, and tested multi-event chunk coalescing; verified identical text,
+  request ID preservation, error handling, and no-save state.
+
+### 37. [P2] Propagate peer stream failures through OpenAI compatibility
+
+- **Status:** Addressed; verified by `TestReadPeerDeltasErrorHandlingAndPrematureEOF` and `TestOpenAICompatibilityStreamErrorPropagation` in `internal/localapi/peerclient_test.go`.
+- **Problem:** `readPeerDeltas` in `internal/localapi/peerclient.go:138` ignores
+  `event: error` and accepts EOF without `[DONE]`. A peer timeout can become an
+  empty or partial successful OpenAI completion with `finish_reason: "stop"`.
+- **Fix:** Updated `readPeerDeltas` in `internal/localapi/peerclient.go` to parse
+  `event: error`, extract error message payloads, and require an explicit `[DONE]`
+  terminal marker, returning `io.ErrUnexpectedEOF` on premature close. Updated
+  `internal/localapi/openai.go` to omit `[DONE]` and propagate stream errors.
+- **Verify:** Tested explicit stream errors, partial output followed by errors,
+  and premature EOF without `[DONE]` across streaming and non-streaming OpenAI routes,
+  verifying error propagation and non-emission of `[DONE]`.
+
+### 38. [P2] Enforce the shared disk budget for unknown-size downloads
+
+- **Status:** Addressed; verified by `TestArtifactManagerSharedDiskBudgetConcurrentUnknownSize` and `TestArtifactManagerSharedDiskBudgetMixedAndCancellation` in `internal/hosting/artifacts_test.go`.
+- **Problem:** `DownloadArtifact` in `internal/hosting/artifacts.go:134` reserves
+  zero bytes when size is omitted. Each download then captures an independent
+  remaining-space snapshot, allowing concurrent transfers to spend the same
+  space and exceed the configured budget.
+- **Fix:** Implemented atomic incremental budget accounting in `internal/hosting/artifacts.go`
+  under `manager.mu` via `activeTransfers`, `transferState`, `startTransfer`,
+  `chargeTransfer`, and `finishTransferLocked`, accounting for installed weights,
+  active staging bytes, and outstanding reservations without double-counting. Excluded
+  `.manifest.json` metadata from consuming the weight budget.
+- **Verify:** Tested overlapping unknown-size downloads that collectively exceed
+  the allowance, mixed known/unknown size downloads, and cancellation budget recovery.
+
+### 39. [P2] Withdraw replaced managed models and enforce loaded-model identity
+
+- **Status:** Addressed; verified by `TestLoadedModelIdentityEnforced` in `internal/runner/controller_test.go` and `TestManagedModelReplacementAndFailureWithdrawal` in `internal/localapi/managed_test.go`.
+- **Problem:** `handleLoadManagedModel` in `internal/localapi/managed.go:184`
+  replaces the runner's model A with B but leaves A's hosted-model row enabled
+  and published. `handleInference` in `internal/runner/controller.go:481` checks
+  only that some model is loaded, not that the requested identity matches it.
+  Requests for A reach B's engine; the result depends on backend validation.
+- **Fix:** In `internal/localapi/managed.go`, automatically withdraw replaced managed
+  models by unpublishing and disabling them upon replacement. Carried `model_id` through
+  `internal/hosting/runner_client.go` and `internal/inference/service.go`, and enforced
+  model identity matching (`req.ModelID != loadedID`) in `internal/runner/controller.go:481`.
+- **Verify:** Tested loading A, replacing with B, asserting A is withdrawn from the
+  catalog, and verifying that runner rejects requests for A with 400 Bad Request while B succeeds.
+  Verified load failure state preservation.
+
+### Follow-up validation limits
+
+The existing race tests, `go vet`, and frontend build passed during the review.
+Live multi-process relay integration, real-model execution, and dependency
+advisory scanning were not verified by this review.
 
 ---
 
@@ -56,6 +224,16 @@ noted under that task below.
 | 27 | Room-state edge cases | `internal/localapi/server.go` |
 | 28 | Restart-safety of `startPeer` and shutdown | `cmd/woolwire/main.go` |
 | 29 | Docs and README drift | `README.md`, `docs/`, `hack/` |
+| 30 | Roster sync ignores omitted removals | `peerapi.SyncRequest`, `localapi.background.go` |
+| 31 | Reject peer inference against unpublished models | `internal/peerapi/inference.go` |
+| 32 | Bind peer connection I/O to cancellation and deadlines | `internal/localapi/peerclient.go` |
+| 33 | Prevent duplicate request IDs from escaping cancellation | `internal/inference/queue.go`, `internal/peerapi/inference.go` |
+| 34 | Let approved joiners complete onboarding | `internal/peerapi/server.go` |
+| 35 | Preserve gaps and conflicting records across replication | `store/queries.go`, `localapi/community.go`, `localapi/contributions.go` |
+| 36 | Buffer incomplete browser SSE frames across network chunks | `web/src/sse.ts`, `web/src/components/MyChats.tsx` |
+| 37 | Propagate peer stream failures through OpenAI compatibility | `internal/localapi/peerclient.go`, `internal/localapi/openai.go` |
+| 38 | Enforce shared disk budget for unknown-size downloads | `internal/hosting/artifacts.go` |
+| 39 | Withdraw replaced managed models and enforce loaded identity | `internal/localapi/managed.go`, `internal/runner/controller.go` |
 
 ### Divergences worth knowing about
 
@@ -84,6 +262,30 @@ noted under that task below.
 - The in-memory transport was switched from `net.Pipe` to loopback sockets.
   `net.Pipe` is unbuffered, so a TLS peer writing its post-handshake records
   while the other side wrote a request deadlocked both.
+- **Task 30** uses contiguous roster version progression on the client and
+  transmits `known_versions` in `SyncRequest` so that a peer missing intermediate
+  updates cannot advance its cursor past an omitted removal.
+- **Task 32** uses `contextConnBody` with `context.AfterFunc` to bind deadline and
+  cancellation enforcement to the underlying TLS net.Conn across both the
+  request write and streaming body reads, ensuring stalled peers release resources
+  promptly without dangling goroutines.
+- **Task 33** scopes active request tracking to `requestKey{memberID, requestID}`
+  and returns HTTP 409 Conflict when a member attempts to submit a duplicate request
+  ID while an existing request is active or queued.
+- **Task 34** makes join retry idempotent by returning the existing admitted
+  membership record to the authenticated joiner device, allowing it to complete
+  local room state initialization and start its peer service, while continuing to
+  refuse removed devices.
+- **Task 35** tracks missing ranges via `AuthorGaps` and reconciles divergent events
+  using local multi-event queries and bounded known IDs (omitted when exceeding
+  500 events), preventing request payloads from growing with history. Contribution
+  receipt pagination uses `(timestamp, request_id)` tie-breakers.
+- **Task 38** implements incremental space reservation under `manager.mu` for
+  unknown-size downloads and excludes `.manifest.json` metadata from the model
+  weight disk allowance.
+- **Task 39** carries `model_id` in runner inference requests and checks identity
+  against the loaded model before starting execution, automatically disabling and
+  unpublishing superseded managed models.
 
 ---
 

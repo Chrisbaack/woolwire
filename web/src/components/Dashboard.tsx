@@ -38,16 +38,23 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const [catalog, setCatalog] = useState<ModelAd[]>([])
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([])
   const [loading, setLoading] = useState(true)
+  const [catalogError, setCatalogError] = useState('')
+  const [leaderboardError, setLeaderboardError] = useState('')
+  const [leaveError, setLeaveError] = useState('')
+  const [search, setSearch] = useState('')
+  const [readyOnly, setReadyOnly] = useState(false)
 
   const fetchCatalog = async () => {
     try {
       const res = await api('/api/v1/catalog')
+      if (!res.ok) throw new Error('Catalog unavailable')
+      setCatalogError('')
       if (res.ok) {
         const data = await res.json()
         setCatalog(data || [])
       }
     } catch {
-      // ignore
+      setCatalogError('Could not refresh models. The list may be out of date.')
     } finally {
       setLoading(false)
     }
@@ -56,12 +63,14 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const fetchLeaderboard = async () => {
     try {
       const res = await api('/api/v1/contributions/leaderboard')
+      if (!res.ok) throw new Error('Leaderboard unavailable')
+      setLeaderboardError('')
       if (res.ok) {
         const data = await res.json()
         setLeaderboard(data.leaderboard || [])
       }
     } catch {
-      // ignore
+      setLeaderboardError('Could not refresh contributions. Please try again.')
     }
   }
 
@@ -75,44 +84,33 @@ export const Dashboard: React.FC<DashboardProps> = ({
     return () => clearInterval(interval)
   }, [])
 
+  const visibleModels = catalog.filter(m => (!readyOnly || m.availability === 'ready') && `${m.name} ${m.host_display_name}`.toLowerCase().includes(search.toLowerCase()))
+
   return (
-    <div>
-      <div className="card">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-          <div>
-            <h2>{roomName}</h2>
-            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-              <span className="badge">{role.toUpperCase()}</span>
-              <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                Signed in as <strong>{displayName}</strong>
-              </span>
-            </div>
-          </div>
-          <button
-            className="btn btn-secondary"
-            onClick={() => {
-              if (confirm('Are you sure you want to leave this room?')) {
-                onLeaveRoom()
-              }
-            }}
-          >
-            Leave Room
-          </button>
+    <div className="dashboard-layout">
+      <section className="meadow-hero">
+        <div><span className="eyebrow">THE MEADOW / {role.toUpperCase()}</span>
+          <h2>A place for bright ideas.</h2>
+          <p>Welcome back, {displayName || 'friend'}. Pull up a chair in <strong>{roomName}</strong>.<br />Explore a model, start a conversation, and see what grows.</p>
+          <span className="hero-caption">Private room · Shared compute · A little curiosity</span>
         </div>
-
-        <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
-          Direct peer-to-peer encrypted mesh connected. Models advertised below are hosted directly on member hardware.
-        </p>
+        <div className="meadow-art" aria-hidden="true"><span className="moon">✦</span><span className="hill hill-back" /><span className="hill hill-front" /><span className="sheep">🐑</span><span className="flower">✿</span></div>
+      </section>
+      <div className="room-stats" aria-label="Room overview">
+        <div><strong>{catalog.length}</strong><span>Models in the meadow</span></div>
+        <div><strong>{catalog.filter(m => m.availability === 'ready').length}</strong><span>Ready to chat</span></div>
+        <div><strong>{new Set(catalog.map(m => m.host_member_id)).size}</strong><span>Hosts sharing models</span></div>
       </div>
-
-      <div className="card">
+      <div className="card model-catalog">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-          <h2>Available Models ({catalog.length})</h2>
+          <div><span className="eyebrow">PICK A THINKING PARTNER</span><h2>Models in your room <span className="badge">{catalog.length}</span></h2></div>
           <button className="btn btn-secondary" style={{ padding: '0.35rem 0.75rem', fontSize: '0.85rem' }} onClick={fetchCatalog}>
             Refresh
           </button>
         </div>
 
+        <div className="catalog-tools"><input className="form-control" aria-label="Search models or hosts" placeholder="Find a model or a friend…" value={search} onChange={e => setSearch(e.target.value)} /><label><input type="checkbox" checked={readyOnly} onChange={e => setReadyOnly(e.target.checked)} /> Ready only</label></div>
+        {catalogError && <div role="alert" className="alert alert-error">{catalogError}</div>}
         {loading ? (
           <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>Discovering models from peers...</p>
         ) : catalog.length === 0 ? (
@@ -123,9 +121,11 @@ export const Dashboard: React.FC<DashboardProps> = ({
             </p>
           </div>
         ) : (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '1rem' }}>
-            {catalog.map((m) => (
+          <div className="model-grid">
+            {visibleModels.length === 0 && <p className="empty-state">No models match. Try another search or turn off “Ready only”.</p>}
+            {visibleModels.map((m) => (
               <div
+                className="model-tile"
                 key={`${m.host_member_id}/${m.model_id}`}
                 style={{
                   padding: '1.25rem',
@@ -157,14 +157,14 @@ export const Dashboard: React.FC<DashboardProps> = ({
 
                   <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '1rem' }}>
                     <span style={{ fontSize: '0.75rem', backgroundColor: 'var(--bg-secondary)', padding: '0.2rem 0.5rem', borderRadius: '4px' }}>
-                      Context: {m.context_limit.toLocaleString()}
+                      Context: {m.context_limit >= 1024 ? `${(m.context_limit / 1024).toFixed(0)}k` : m.context_limit.toLocaleString()}
                     </span>
                     <span style={{ fontSize: '0.75rem', backgroundColor: 'var(--bg-secondary)', padding: '0.2rem 0.5rem', borderRadius: '4px' }}>
-                      Queue: {m.queue_estimate}
+                      Queue: {m.queue_estimate === 0 ? 'Clear' : m.queue_estimate}
                     </span>
                     {m.is_managed && (
-                      <span style={{ fontSize: '0.75rem', backgroundColor: 'var(--accent-primary)', padding: '0.2rem 0.5rem', borderRadius: '4px' }}>
-                        Managed
+                      <span style={{ fontSize: '0.75rem', backgroundColor: 'var(--accent-primary)', padding: '0.2rem 0.5rem', borderRadius: '4px', color: 'white' }}>
+                        🚀 Managed Runner
                       </span>
                     )}
                   </div>
@@ -175,7 +175,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                   style={{ width: '100%', fontSize: '0.9rem', padding: '0.5rem' }}
                   onClick={() => onSelectModelForChat(m)}
                 >
-                  Chat with Model
+                  Start a conversation ↗
                 </button>
               </div>
             ))}
@@ -184,10 +184,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
       </div>
 
       {/* Hosting Leaderboard (30-day leaderboard) */}
-      <div className="card">
+      <div className="card contribution-panel">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
           <div>
-            <h2>Hosting Leaderboard</h2>
+            <span className="eyebrow">A LITTLE APPRECIATION</span><h2>The helping herd</h2>
             <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
               Rolling 30-day leaderboard of members hosting local compute for the room.
             </p>
@@ -197,6 +197,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
           </button>
         </div>
 
+        {leaderboardError && <div className="alert alert-error" role="alert">{leaderboardError}</div>}
         {leaderboard.length === 0 ? (
           <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', fontStyle: 'italic' }}>
             No hosted requests in the last 30 days yet. Complete inference requests between peers to populate the leaderboard!
@@ -208,7 +209,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                 <tr style={{ borderBottom: '1px solid var(--border-color)', color: 'var(--text-secondary)' }}>
                   <th style={{ padding: '0.6rem 0.5rem' }}>Rank</th>
                   <th style={{ padding: '0.6rem 0.5rem' }}>Host Member</th>
-                  <th style={{ padding: '0.6rem 0.5rem' }}>Requests Served</th>
+                  <th style={{ padding: '0.6rem 0.5rem' }}>Points</th>
                   <th style={{ padding: '0.6rem 0.5rem' }}>Members Helped</th>
                 </tr>
               </thead>
@@ -221,8 +222,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
                     <td style={{ padding: '0.6rem 0.5rem' }}>
                       <strong>{entry.display_name}</strong>
                     </td>
-                    <td style={{ padding: '0.6rem 0.5rem', color: 'var(--accent-primary)', fontWeight: 600 }}>
-                      {entry.score} {entry.score === 1 ? 'request' : 'requests'}
+                    <td style={{ padding: '0.6rem 0.5rem', color: 'var(--accent-text)', fontWeight: 600 }}>
+                      {entry.score}
                     </td>
                     <td style={{ padding: '0.6rem 0.5rem' }}>
                       {entry.distinct_members_helped} {entry.distinct_members_helped === 1 ? 'member' : 'members'}
@@ -233,6 +234,13 @@ export const Dashboard: React.FC<DashboardProps> = ({
             </table>
           </div>
         )}
+      </div>
+      <div className="room-footer"><p>Models run on your friends’ hardware. Your chats stay in your installation.</p>
+        <button className="btn btn-secondary" onClick={async () => {
+          if (!confirm('Are you sure you want to leave this room?')) return
+          try { await onLeaveRoom() } catch (err) { setLeaveError(err instanceof Error ? err.message : 'Could not leave room') }
+        }}>Leave room</button>
+        {leaveError && <div role="alert" className="alert alert-error">{leaveError}</div>}
       </div>
     </div>
   )

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -107,6 +108,9 @@ func newTestController(t *testing.T, fe *fakeEngine, modelDir string) (*Controll
 		HealthCheck: func(ctx context.Context, port uint16) error {
 			return defaultHealthCheck(ctx, port)
 		},
+		// Pinned so engine arguments do not depend on whether the machine
+		// running the tests happens to have a GPU.
+		DetectGPU: func() (bool, string) { return false, "" },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +200,7 @@ func TestRestartReusesLoadArguments(t *testing.T) {
 	resp.Body.Close()
 
 	loadArgs := fe.lastArgs.Load()
-	if loadArgs == nil || loadArgs.ContextLimit != 8192 || loadArgs.Threads != 3 || loadArgs.GPULayers != 7 {
+	if loadArgs == nil || loadArgs.ContextLimit != 8192 || loadArgs.Threads != 3 || loadArgs.GPULayers == nil || *loadArgs.GPULayers != 7 {
 		t.Fatalf("load used unexpected arguments: %#v", loadArgs)
 	}
 
@@ -207,7 +211,7 @@ func TestRestartReusesLoadArguments(t *testing.T) {
 	if restartArgs == nil {
 		t.Fatal("restart launched no engine")
 	}
-	if restartArgs.ContextLimit != 8192 || restartArgs.Threads != 3 || restartArgs.GPULayers != 7 {
+	if restartArgs.ContextLimit != 8192 || restartArgs.Threads != 3 || restartArgs.GPULayers == nil || *restartArgs.GPULayers != 7 {
 		t.Fatalf("restart dropped load arguments: %#v", restartArgs)
 	}
 	if fe.launches.Load() != 2 {
@@ -383,7 +387,7 @@ func TestLoadRejectsPathTraversal(t *testing.T) {
 	modelDir := writeDummyModel(t)
 	_, client, base := newTestController(t, fe, modelDir)
 
-	for _, name := range []string{"../etc/passwd", "sub/tiny.gguf", "..\\windows"} {
+	for _, name := range []string{"../etc/passwd", "sub/../../etc/passwd", "/etc/passwd", "..\\windows", ""} {
 		resp := do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
 			"model_id": "m1", "filename": name,
 		})
@@ -401,6 +405,61 @@ func TestLoadRejectsPathTraversal(t *testing.T) {
 	resp.Body.Close()
 	if status != http.StatusNotFound {
 		t.Fatalf("missing weight file returned %d, want 404", status)
+	}
+
+	// A subdirectory is in bounds: it is where a Hugging Face cache keeps
+	// every weight file. Only a reference that leaves the volume is refused.
+	resp = do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
+		"model_id": "m1", "filename": "sub/missing.gguf",
+	})
+	status = resp.StatusCode
+	resp.Body.Close()
+	if status != http.StatusNotFound {
+		t.Fatalf("missing nested weight file returned %d, want 404", status)
+	}
+}
+
+// TestLoadAcceptsNestedModelPath covers pointing the runner straight at a
+// Hugging Face cache, where no weight file sits at the top level.
+func TestLoadAcceptsNestedModelPath(t *testing.T) {
+	fe := newFakeEngine(t, 0)
+	modelDir := t.TempDir()
+
+	blobDir := filepath.Join(modelDir, "models--org--repo", "blobs")
+	snapshotDir := filepath.Join(modelDir, "models--org--repo", "snapshots", "rev1")
+	for _, dir := range []string{blobDir, snapshotDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blob := filepath.Join(blobDir, "abcdef")
+	if err := os.WriteFile(blob, []byte("weights"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The cache stores the snapshot entry as a symlink into blobs.
+	if err := os.Symlink(blob, filepath.Join(snapshotDir, "tiny.gguf")); err != nil {
+		t.Fatal(err)
+	}
+
+	ctrl, client, base := newTestController(t, fe, modelDir)
+	ref := "models--org--repo/snapshots/rev1/tiny.gguf"
+
+	resp := do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
+		"model_id": "m1", "filename": ref,
+	})
+	status := resp.StatusCode
+	resp.Body.Close()
+	if status != http.StatusOK {
+		t.Fatalf("nested load returned %d, want 200", status)
+	}
+
+	if got := ctrl.loaded.ModelPath; got != filepath.Join(snapshotDir, "tiny.gguf") {
+		t.Fatalf("engine was given %q", got)
+	}
+	// The runner reports the reference it was given, so the app can match the
+	// loaded model against the one it listed.
+	if got := ctrl.loaded.Filename; got != ref {
+		t.Fatalf("loaded file = %q, want %q", got, ref)
 	}
 }
 
@@ -440,5 +499,356 @@ func TestConcurrentInferenceIsSerialized(t *testing.T) {
 		case <-time.After(20 * time.Second):
 			t.Fatal("concurrent inference deadlocked")
 		}
+	}
+}
+
+func TestLoadedModelIdentityEnforced(t *testing.T) {
+	fe := newFakeEngine(t, 0)
+	modelDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modelDir, "model-a.gguf"), []byte("weights-a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modelDir, "model-b.gguf"), []byte("weights-b"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, client, base := newTestController(t, fe, modelDir)
+
+	// 1. Load model A
+	loadA := do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
+		"model_id": "id-a", "filename": "model-a.gguf",
+	})
+	if loadA.StatusCode != http.StatusOK {
+		t.Fatalf("load A failed: %d", loadA.StatusCode)
+	}
+	loadA.Body.Close()
+
+	// Inference for A should succeed
+	infA := do(t, client, "POST", base+"/runner/v1/inference", map[string]any{
+		"model_id": "id-a",
+		"model":    "model-a",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	if infA.StatusCode != http.StatusOK {
+		t.Fatalf("inference for A failed: %d", infA.StatusCode)
+	}
+	infA.Body.Close()
+
+	// 2. Replace with model B
+	loadB := do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
+		"model_id": "id-b", "filename": "model-b.gguf",
+	})
+	if loadB.StatusCode != http.StatusOK {
+		t.Fatalf("load B failed: %d", loadB.StatusCode)
+	}
+	loadB.Body.Close()
+
+	// 3. Request for A (by model_id) must be rejected with 409 Conflict
+	infAOld := do(t, client, "POST", base+"/runner/v1/inference", map[string]any{
+		"model_id": "id-a",
+		"model":    "model-a",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	if infAOld.StatusCode != http.StatusConflict {
+		t.Fatalf("inference for replaced model A should return 409 Conflict, got %d", infAOld.StatusCode)
+	}
+	infAOld.Body.Close()
+
+	// Request for A (by model name only) must also be rejected
+	infAOldName := do(t, client, "POST", base+"/runner/v1/inference", map[string]any{
+		"model":    "model-a",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	if infAOldName.StatusCode != http.StatusConflict {
+		t.Fatalf("inference for replaced model A by name should return 409 Conflict, got %d", infAOldName.StatusCode)
+	}
+	infAOldName.Body.Close()
+
+	// 4. Request for B must succeed
+	infB := do(t, client, "POST", base+"/runner/v1/inference", map[string]any{
+		"model_id": "id-b",
+		"model":    "model-b",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	if infB.StatusCode != http.StatusOK {
+		t.Fatalf("inference for B failed: %d", infB.StatusCode)
+	}
+	infB.Body.Close()
+
+	// 5. Failed load (missing file)
+	loadFail := do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
+		"model_id": "id-c", "filename": "nonexistent.gguf",
+	})
+	if loadFail.StatusCode != http.StatusNotFound {
+		t.Fatalf("load nonexistent should return 404, got %d", loadFail.StatusCode)
+	}
+	loadFail.Body.Close()
+}
+
+// TestGPUOffloadIsTheRunnersDecision covers the split the managed profile
+// creates: the GPU is passed to the runner container, so the app asking for a
+// layer count would be guessing about hardware it cannot see.
+func TestGPUOffloadIsTheRunnersDecision(t *testing.T) {
+	newCtrl := func(t *testing.T, hasGPU bool) (*Controller, *http.Client, string) {
+		t.Helper()
+		fe := newFakeEngine(t, 0)
+		ctrl, err := NewController(Config{
+			ModelDir:      writeDummyModel(t),
+			RunnerToken:   "runner-token",
+			EnginePort:    fe.port,
+			EngineCommand: fe.command,
+			HealthCheck: func(ctx context.Context, port uint16) error {
+				return defaultHealthCheck(ctx, port)
+			},
+			DetectGPU: func() (bool, string) { return hasGPU, "Test GPU" },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ctrl.Close() })
+		srv := httptest.NewServer(ctrl.Handler())
+		t.Cleanup(srv.Close)
+		return ctrl, srv.Client(), srv.URL
+	}
+
+	load := func(t *testing.T, client *http.Client, base string, body map[string]any) {
+		t.Helper()
+		resp := do(t, client, "POST", base+"/runner/v1/models/load", body)
+		status := resp.StatusCode
+		resp.Body.Close()
+		if status != http.StatusOK {
+			t.Fatalf("load returned %d", status)
+		}
+	}
+
+	// With a GPU and no preference expressed, the engine is left to size the
+	// offload against the VRAM that is actually free.
+	ctrl, client, base := newCtrl(t, true)
+	load(t, client, base, map[string]any{"model_id": "m1", "filename": "tiny.gguf"})
+	if got := ctrl.loaded.GPULayers; got != nil {
+		t.Fatalf("gpu layers = %d, want the engine's own choice", *got)
+	}
+
+	// An explicit 0 still means the CPU: it is a choice, not an omission.
+	load(t, client, base, map[string]any{"model_id": "m2", "filename": "tiny.gguf", "gpu_layers": 0})
+	if got := ctrl.loaded.GPULayers; got == nil || *got != 0 {
+		t.Fatalf("explicit gpu_layers 0 became %v", got)
+	}
+
+	// An explicit count is honoured.
+	load(t, client, base, map[string]any{"model_id": "m3", "filename": "tiny.gguf", "gpu_layers": 12})
+	if got := ctrl.loaded.GPULayers; got == nil || *got != 12 {
+		t.Fatalf("explicit gpu_layers 12 became %v", got)
+	}
+
+	// Without a GPU there is nothing to offload to, and the runner says so
+	// rather than leaving it to an engine that would probe for one.
+	ctrlNoGPU, clientNoGPU, baseNoGPU := newCtrl(t, false)
+	load(t, clientNoGPU, baseNoGPU, map[string]any{"model_id": "m1", "filename": "tiny.gguf"})
+	if got := ctrlNoGPU.loaded.GPULayers; got == nil || *got != 0 {
+		t.Fatalf("gpu layers without a GPU = %v, want 0", got)
+	}
+
+	// Health reports the runner's hardware, since the app cannot see it.
+	resp := do(t, client, "GET", base+"/runner/v1/health", nil)
+	var health struct {
+		HasGPU  bool   `json:"has_gpu"`
+		GPUName string `json:"gpu_name"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&health)
+	resp.Body.Close()
+	if !health.HasGPU || health.GPUName != "Test GPU" {
+		t.Fatalf("health reported has_gpu=%v gpu_name=%q", health.HasGPU, health.GPUName)
+	}
+}
+
+// TestLoadFailureQuotesTheEngine is the regression for an unloadable model
+// surfacing as nothing but "runner error (500)". llama-server explains itself
+// before exiting — "unknown model architecture", a missing file, an
+// out-of-memory — and that explanation only existed in the runner container's
+// own stdout, where nobody using the UI can see it.
+func TestLoadFailureQuotesTheEngine(t *testing.T) {
+	modelDir := writeDummyModel(t)
+
+	// An engine that prints why it is giving up, then exits without ever
+	// serving health, exactly as llama-server does for a model it cannot read.
+	ctrl, err := NewController(Config{
+		ModelDir:    modelDir,
+		RunnerToken: "runner-token",
+		EnginePort:  1, // nothing listens here
+		EngineCommand: func(ctx context.Context, args EngineArgs) *exec.Cmd {
+			// The real shape of the failure: the diagnosis comes first, is
+			// repeated because the engine probes the model twice, and is then
+			// buried under the lines it prints while giving up.
+			return exec.CommandContext(ctx, "sh", "-c",
+				`echo "loading model '/models/tiny.gguf'";`+
+					`echo "error loading model: unknown model architecture: 'k2-horizon'" >&2;`+
+					`echo "error loading model: unknown model architecture: 'k2-horizon'" >&2;`+
+					`echo "cleaning up before exit..." >&2;`+
+					`echo "exiting due to model loading error" >&2; exit 1`)
+		},
+		HealthCheck: func(ctx context.Context, port uint16) error {
+			return errors.New("connection refused")
+		},
+		DetectGPU: func() (bool, string) { return false, "" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ctrl.Close() })
+
+	srv := httptest.NewServer(ctrl.Handler())
+	t.Cleanup(srv.Close)
+
+	resp := do(t, srv.Client(), "POST", srv.URL+"/runner/v1/models/load", map[string]any{
+		"model_id": "m1", "filename": "tiny.gguf",
+	})
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("load returned %d, want 500", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "unknown model architecture") {
+		t.Fatalf("the load failure did not say why:\n%s", body)
+	}
+	// The diagnosis appears once, not once per probe.
+	if n := strings.Count(string(body), "unknown model architecture"); n != 1 {
+		t.Fatalf("the diagnosis was repeated %d times:\n%s", n, body)
+	}
+
+	// Health carries the same reason, so the reason survives the request that
+	// triggered it.
+	health := do(t, srv.Client(), "GET", srv.URL+"/runner/v1/health", nil)
+	var h struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	_ = json.NewDecoder(health.Body).Decode(&h)
+	health.Body.Close()
+
+	if h.Status != string(StatusError) {
+		t.Fatalf("status = %q, want %q", h.Status, StatusError)
+	}
+	if !strings.Contains(h.Error, "unknown model architecture") {
+		t.Fatalf("health error does not say why: %q", h.Error)
+	}
+}
+
+// TestLoadPassesCompanionsToTheEngine covers a vision model arriving with its
+// projector: without --mmproj the engine loads it as text-only, which looks
+// like the model is broken rather than like it is missing a file.
+func TestLoadPassesCompanionsToTheEngine(t *testing.T) {
+	fe := newFakeEngine(t, 0)
+	modelDir := writeDummyModel(t)
+	for _, name := range []string{"mmproj-F16.gguf", "mtp-tiny.gguf"} {
+		if err := os.WriteFile(filepath.Join(modelDir, name), []byte("companion"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctrl, client, base := newTestController(t, fe, modelDir)
+	resp := do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
+		"model_id": "m1", "filename": "tiny.gguf",
+		"mmproj": "mmproj-F16.gguf", "draft_model": "mtp-tiny.gguf",
+	})
+	status := resp.StatusCode
+	resp.Body.Close()
+	if status != http.StatusOK {
+		t.Fatalf("load returned %d", status)
+	}
+
+	if got := ctrl.loaded.ProjectorPath; got != filepath.Join(modelDir, "mmproj-F16.gguf") {
+		t.Fatalf("projector path = %q", got)
+	}
+	if got := ctrl.loaded.DraftPath; got != filepath.Join(modelDir, "mtp-tiny.gguf") {
+		t.Fatalf("draft path = %q", got)
+	}
+
+	// A companion that is not there is reported, not ignored.
+	resp = do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
+		"model_id": "m2", "filename": "tiny.gguf", "mmproj": "mmproj-missing.gguf",
+	})
+	status = resp.StatusCode
+	resp.Body.Close()
+	if status != http.StatusNotFound {
+		t.Fatalf("missing projector returned %d, want 404", status)
+	}
+
+	// And a companion cannot be used to reach outside the model volume.
+	resp = do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
+		"model_id": "m3", "filename": "tiny.gguf", "mmproj": "../../etc/passwd",
+	})
+	status = resp.StatusCode
+	resp.Body.Close()
+	if status != http.StatusNotFound && status != http.StatusBadRequest {
+		t.Fatalf("traversing projector path returned %d", status)
+	}
+}
+
+// TestDraftModelFallsBackWhenTheEngineRefusesIt covers speculative decoding
+// being an optimization: support for a given module is newer than the models
+// shipping them, and losing the speed-up beats refusing to serve the model.
+func TestDraftModelFallsBackWhenTheEngineRefusesIt(t *testing.T) {
+	fe := newFakeEngine(t, 0)
+	modelDir := writeDummyModel(t)
+	if err := os.WriteFile(filepath.Join(modelDir, "mtp-tiny.gguf"), []byte("companion"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The fake engine's health endpoint stays up across launches, so the
+	// probe has to follow the process that was actually started.
+	var draftAttempt atomic.Bool
+	ctrl, err := NewController(Config{
+		ModelDir:    modelDir,
+		RunnerToken: "runner-token",
+		EnginePort:  fe.port,
+		EngineCommand: func(ctx context.Context, args EngineArgs) *exec.Cmd {
+			draftAttempt.Store(args.DraftPath != "")
+			if args.DraftPath != "" {
+				// An engine that does not know this speculation type.
+				return exec.CommandContext(ctx, "sh", "-c",
+					`echo "error: unknown spec type draft-mtp" >&2; exit 1`)
+			}
+			return fe.command(ctx, args)
+		},
+		HealthCheck: func(ctx context.Context, port uint16) error {
+			if draftAttempt.Load() {
+				return errors.New("engine is not listening")
+			}
+			return defaultHealthCheck(ctx, port)
+		},
+		DetectGPU: func() (bool, string) { return false, "" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ctrl.Close() })
+
+	srv := httptest.NewServer(ctrl.Handler())
+	t.Cleanup(srv.Close)
+
+	resp := do(t, srv.Client(), "POST", srv.URL+"/runner/v1/models/load", map[string]any{
+		"model_id": "m1", "filename": "tiny.gguf", "draft_model": "mtp-tiny.gguf",
+	})
+	status := resp.StatusCode
+	resp.Body.Close()
+	if status != http.StatusOK {
+		t.Fatalf("load returned %d, want the model served without the draft module", status)
+	}
+
+	health := do(t, srv.Client(), "GET", srv.URL+"/runner/v1/health", nil)
+	var h struct {
+		Status string `json:"status"`
+		Notice string `json:"notice"`
+	}
+	_ = json.NewDecoder(health.Body).Decode(&h)
+	health.Body.Close()
+
+	if h.Status != string(StatusReady) {
+		t.Fatalf("status = %q, want ready", h.Status)
+	}
+	if !strings.Contains(h.Notice, "speculative decoding disabled") {
+		t.Fatalf("the downgrade was not reported: %q", h.Notice)
 	}
 }

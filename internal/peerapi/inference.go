@@ -42,7 +42,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request, caller 
 	}
 
 	model, err := s.store.GetHostedModel(req.ModelID)
-	if err != nil || !model.Enabled {
+	if err != nil || !model.Enabled || !model.Published {
 		http.Error(w, "model not found or unavailable", http.StatusNotFound)
 		return
 	}
@@ -61,7 +61,15 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request, caller 
 	}
 	defer stream.Stop()
 
+	start := time.Now()
+	var firstTokenTime time.Time
+	var completionTokens int
+
 	err = s.infer.Execute(r.Context(), caller.MemberID, req.RequestID, model, req.Messages, func(delta string) error {
+		if firstTokenTime.IsZero() {
+			firstTokenTime = time.Now()
+		}
+		completionTokens++
 		return stream.SendJSON("", map[string]string{"delta": delta})
 	})
 
@@ -74,9 +82,34 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request, caller 
 			http.Error(w, "host queue is full", http.StatusServiceUnavailable)
 			return
 		}
+		if errors.Is(err, inference.ErrDuplicateRequest) {
+			http.Error(w, "duplicate request id", http.StatusConflict)
+			return
+		}
 		_ = stream.SendJSON("error", map[string]string{"error": err.Error()})
 		return
 	}
+
+	var ttftMs int64
+	if !firstTokenTime.IsZero() {
+		ttftMs = firstTokenTime.Sub(start).Milliseconds()
+	}
+	totalMs := time.Since(start).Milliseconds()
+	var tps float64
+	if !firstTokenTime.IsZero() {
+		genDur := time.Since(firstTokenTime).Seconds()
+		if genDur > 0 && completionTokens > 0 {
+			tps = float64(completionTokens) / genDur
+		}
+	}
+	_ = stream.SendJSON("stats", map[string]any{
+		"request_id":        req.RequestID,
+		"ttft_ms":           ttftMs,
+		"total_ms":          totalMs,
+		"completion_tokens": completionTokens,
+		"prompt_tokens_est": inference.EstimateTokens(req.Messages),
+		"tokens_per_second": tps,
+	})
 
 	// The host signs a contribution receipt unless it has opted out. The
 	// requester counter-signs and acknowledges it out of band.

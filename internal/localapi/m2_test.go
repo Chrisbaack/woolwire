@@ -1,6 +1,7 @@
 package localapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cbaack/woolwire/internal/hosting"
+	"github.com/cbaack/woolwire/internal/peerapi"
 	"github.com/cbaack/woolwire/internal/store"
 	"github.com/cbaack/woolwire/internal/transport"
 )
@@ -212,6 +215,72 @@ func TestM2LiveDashboardAndExternalInferenceGate(t *testing.T) {
 			if got != "Llama-3-8B" {
 				t.Fatalf("backend received model %q, want the configured name %q", got, "Llama-3-8B")
 			}
+		}
+	})
+
+	t.Run("Criterion 2b: Unpublished model rejects peer inference and never touches backend", func(t *testing.T) {
+		// Unpublish Bob's model
+		w := node2.doJSON("POST", "/api/v1/hosted-models", map[string]any{
+			"id":                    bobModel.ID,
+			"name":                  "Llama-3-8B",
+			"endpoint_url":          mockServer.URL + "/v1",
+			"context_limit":         8192,
+			"max_tokens":            2048,
+			"published":             false,
+			"enabled":               true,
+			"allow_private_network": true,
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("Bob unpublish model failed: %d, %s", w.Code, w.Body.String())
+		}
+
+		backendModelMu.Lock()
+		countBefore := len(backendModelSeen)
+		backendModelMu.Unlock()
+
+		// Charlie directly requests inference over authenticated TLS for the unpublished model
+		conn, err := node3.localSrv.dialPeer(context.Background(), bobMemberID, "node-2")
+		if err != nil {
+			t.Fatalf("Charlie dial Bob failed: %v", err)
+		}
+		defer conn.Close()
+
+		inferReq := peerapi.InferenceRequest{
+			RequestID: "req-unpub-test",
+			ModelID:   bobModel.ID,
+			Messages:  []hosting.ChatMessage{{Role: "user", Content: "Hello?"}},
+		}
+		resp, err := peerRoundTrip(context.Background(), conn, "POST", "/peer/v1/inference", inferReq)
+		if err != nil {
+			t.Fatalf("peer roundtrip failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("expected 404 Not Found for unpublished model, got: %d", resp.StatusCode)
+		}
+
+		backendModelMu.Lock()
+		countAfter := len(backendModelSeen)
+		backendModelMu.Unlock()
+
+		if countAfter != countBefore {
+			t.Fatalf("backend received request for unpublished model: before=%d, after=%d", countBefore, countAfter)
+		}
+
+		// Re-publish Bob's model so subsequent tests pass
+		w = node2.doJSON("POST", "/api/v1/hosted-models", map[string]any{
+			"id":                    bobModel.ID,
+			"name":                  "Llama-3-8B",
+			"endpoint_url":          mockServer.URL + "/v1",
+			"context_limit":         8192,
+			"max_tokens":            2048,
+			"published":             true,
+			"enabled":               true,
+			"allow_private_network": true,
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("Bob re-publish model failed: %d, %s", w.Code, w.Body.String())
 		}
 	})
 

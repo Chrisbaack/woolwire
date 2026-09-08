@@ -185,13 +185,20 @@ func (s *Server) syncReceiptsWithPeer(
 ) {
 	const maxPages = 200
 
+	var pageCursors map[string]store.ReceiptCursorKey
 	for page := 0; page < maxPages; page++ {
 		dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 
 		cursors, _ := s.store.ReceiptCursors(roomID)
+		knownIDs, _ := s.store.ListReceiptIDs(roomID)
+		if len(knownIDs) > 500 {
+			knownIDs = nil
+		}
 		req := peerapi.ContributionsSyncRequest{
-			RoomID:  roomID,
-			Cursors: cursors,
+			RoomID:          roomID,
+			Cursors:         cursors,
+			PageCursors:     pageCursors,
+			KnownReceiptIDs: knownIDs,
 		}
 		if page == 0 {
 			req.PushReceipts = pushReceipts
@@ -213,6 +220,7 @@ func (s *Server) syncReceiptsWithPeer(
 			applied++
 		}
 
+		pageCursors = resp.NextPageCursors
 		if len(resp.PullReceipts) == 0 || applied == 0 {
 			return
 		}

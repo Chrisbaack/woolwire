@@ -6,16 +6,29 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 )
+
+// maxRunnerErrorBytes bounds how much of a runner error body is quoted back.
+const maxRunnerErrorBytes = 4 << 10
 
 type RunnerHealth struct {
 	Status        string `json:"status"`
 	LoadedModelID string `json:"loaded_model_id"`
 	LoadedFile    string `json:"loaded_file"`
 	EnginePID     int    `json:"engine_pid"`
+	// HasGPU and GPUName describe the runner's hardware. The app cannot detect
+	// it: the GPU is passed to the runner container, not to this one.
+	HasGPU  bool   `json:"has_gpu"`
+	GPUName string `json:"gpu_name"`
+	// Error is why the engine is in an error state, including what it printed
+	// before exiting.
+	Error string `json:"error"`
+	// Notice explains a load that succeeded on different terms than asked.
+	Notice string `json:"notice"`
 }
 
 type RunnerClient struct {
@@ -62,6 +75,13 @@ func (c *RunnerClient) doJSON(ctx context.Context, method, path string, in any, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// The runner explains itself in the body — which model file it could
+		// not find, what the engine printed before giving up. Reporting only
+		// the status code turned every one of those into "runner error (500)".
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxRunnerErrorBytes))
+		if msg := strings.TrimSpace(string(detail)); msg != "" {
+			return fmt.Errorf("runner error (%d): %s", resp.StatusCode, msg)
+		}
 		return fmt.Errorf("runner error (%d)", resp.StatusCode)
 	}
 
@@ -82,13 +102,37 @@ func (c *RunnerClient) Health(ctx context.Context) (*RunnerHealth, error) {
 	return &h, nil
 }
 
-func (c *RunnerClient) LoadModel(ctx context.Context, modelID, filename string, ctxLimit, threads, gpuLayers int) error {
+// LoadRequest is one model to launch, with the companions that belong to it.
+type LoadRequest struct {
+	ModelID      string
+	Filename     string
+	ContextLimit int
+	Threads      int
+	// GPULayers nil leaves the offload decision to the runner, which is the
+	// container the GPU is attached to.
+	GPULayers *int
+	// Projector and DraftModel are the model's companions, relative to the
+	// models directory.
+	Projector  string
+	DraftModel string
+}
+
+// LoadModel asks the runner to launch an engine.
+func (c *RunnerClient) LoadModel(ctx context.Context, load LoadRequest) error {
 	req := map[string]any{
-		"model_id":      modelID,
-		"filename":      filename,
-		"context_limit": ctxLimit,
-		"threads":       threads,
-		"gpu_layers":    gpuLayers,
+		"model_id":      load.ModelID,
+		"filename":      load.Filename,
+		"context_limit": load.ContextLimit,
+		"threads":       load.Threads,
+	}
+	if load.GPULayers != nil {
+		req["gpu_layers"] = *load.GPULayers
+	}
+	if load.Projector != "" {
+		req["mmproj"] = load.Projector
+	}
+	if load.DraftModel != "" {
+		req["draft_model"] = load.DraftModel
 	}
 	return c.doJSON(ctx, "POST", "/runner/v1/models/load", req, nil)
 }
@@ -108,6 +152,7 @@ func (c *RunnerClient) RestartEngine(ctx context.Context) error {
 func (c *RunnerClient) StreamChat(
 	ctx context.Context,
 	requesterMemberID string,
+	modelID string,
 	modelName string,
 	maxTokens int,
 	messages []ChatMessage,
@@ -115,6 +160,7 @@ func (c *RunnerClient) StreamChat(
 ) error {
 	payload := map[string]any{
 		"model":               modelName,
+		"model_id":            modelID,
 		"messages":            messages,
 		"stream":              true,
 		"requester_member_id": requesterMemberID,

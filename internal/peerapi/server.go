@@ -247,7 +247,32 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	if existing, err := s.store.GetMember(memberID); err == nil && existing != nil {
 		switch room.MemberStatus(existing.Status) {
 		case room.StatusAdmitted:
-			writeJoinRejection(w, "device is already an admitted member")
+			if req.TailcatAddr != "" {
+				_ = s.store.SavePeerAddress(existing.MemberID, req.TailcatAddr)
+			}
+			creatorMemberID := ""
+			if dev, err := s.store.GetDeviceIdentity(); err == nil && dev != nil {
+				creatorMemberID, _ = MemberIDForDevicePublic(dev.DevicePublic)
+			}
+			existingMembership := peerauth.Membership(*existing)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(JoinResponse{
+				Status:          room.StatusAdmitted,
+				RoomName:        roomRec.RoomName,
+				CreatorMemberID: creatorMemberID,
+				Membership:      &existingMembership,
+				Roster:          s.rosterSnapshot(roomRec.RoomID, 0, nil),
+				PeerAddresses:   s.peerAddresses(),
+			})
+			return
+		case room.StatusPending:
+			existingMembership := peerauth.Membership(*existing)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(JoinResponse{
+				Status:     room.StatusPending,
+				RoomName:   roomRec.RoomName,
+				Membership: &existingMembership,
+			})
 			return
 		case room.StatusRemoved:
 			writeJoinRejection(w, "device was removed from this room and cannot rejoin")
@@ -297,7 +322,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		RoomName:        roomRec.RoomName,
 		CreatorMemberID: creatorMemberID,
 		Membership:      &membership,
-		Roster:          s.rosterSnapshot(roomRec.RoomID, 0),
+		Roster:          s.rosterSnapshot(roomRec.RoomID, 0, nil),
 		PeerAddresses:   s.peerAddresses(),
 	})
 }
@@ -307,11 +332,15 @@ func writeJoinRejection(w http.ResponseWriter, reason string) {
 	_ = json.NewEncoder(w).Encode(JoinResponse{Status: "rejected", Reason: reason})
 }
 
-func (s *Server) rosterSnapshot(roomID string, minVersion int64) []room.Membership {
+func (s *Server) rosterSnapshot(roomID string, minVersion int64, knownVersions map[string]int64) []room.Membership {
 	members, _ := s.store.ListMembers(roomID)
 	roster := make([]room.Membership, 0, len(members))
 	for _, m := range members {
-		if m.RosterVersion <= minVersion {
+		if knownVersions != nil {
+			if kv, ok := knownVersions[m.MemberID]; ok && m.RosterVersion <= kv {
+				continue
+			}
+		} else if m.RosterVersion <= minVersion {
 			continue
 		}
 		// SigVersion travels with the signature; without it the recipient
@@ -330,11 +359,12 @@ func (s *Server) peerAddresses() []store.PeerAddressRecord {
 }
 
 type SyncRequest struct {
-	KnownVersion int64 `json:"known_version"`
+	KnownVersion  int64            `json:"known_version"`
+	KnownVersions map[string]int64 `json:"known_versions,omitempty"`
 	// TailcatAddr updates the caller's own address only. There is no member_id
 	// field: the address is bound to the authenticated TLS identity, so a
 	// member cannot rebind anyone else's address to a node it controls.
-	TailcatAddr string `json:"tailcat_addr,omitempty"`
+	TailcatAddr   string           `json:"tailcat_addr,omitempty"`
 }
 
 type SyncResponse struct {
@@ -360,7 +390,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request, caller peera
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(SyncResponse{
 		RosterVersion: roomRec.RosterVersion,
-		Members:       s.rosterSnapshot(roomRec.RoomID, req.KnownVersion),
+		Members:       s.rosterSnapshot(roomRec.RoomID, req.KnownVersion, req.KnownVersions),
 		PeerAddresses: s.peerAddresses(),
 	})
 }
