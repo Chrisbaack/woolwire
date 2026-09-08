@@ -22,6 +22,13 @@ services:
       - no-new-privileges:true
     read_only: false
     user: "1000:1000"
+    # Rootless Podman maps the container's UID 1000 to a high subordinate UID
+    # on the host, so a bind-mounted models directory or state volume owned by
+    # your own user is unreadable inside the container. Set
+    # WOOLWIRE_USERNS_MODE=keep-id:uid=1000,gid=1000 in .env to map it back to
+    # you instead. Leave it empty for Docker, which has no keep-id mode and
+    # does not need one.
+    userns_mode: ${WOOLWIRE_USERNS_MODE:-}
 
 volumes:
   woolwire_state:

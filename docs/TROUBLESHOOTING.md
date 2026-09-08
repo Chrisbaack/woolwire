@@ -63,6 +63,11 @@ Join or host a room first. Registering an external endpoint requires the model
 to be enabled and published. Managed weights must be loaded successfully, not
 just present on disk. Clear the search and Ready-only filter.
 
+Catalog refresh first synchronizes membership and peer addresses, so a host
+that joined after this client can be discovered without waiting for the
+background membership timer. My Chats refreshes its model list every 15 seconds
+after the previous refresh completes, preserving your selected model.
+
 Unavailable or stale advertisements drop out of the catalog. Check the actual
 host and runner status and refresh. Loading a different managed model replaces
 the previous one. After a runner restart, load the model again if it is not
@@ -145,6 +150,49 @@ Vite's standalone dev/preview commands do not proxy `/api` or `/v1` in the curre
 configuration. Use the [documented development loop](../CONTRIBUTING.md#frontend-development).
 
 ## Database or permission problems
+
+### Rootless Podman: the app cannot open its database, or no models are found
+
+Two symptoms with one cause:
+
+```
+failed to open database: apply migrations: unable to open database file (14)
+```
+
+and a runner that reports `ls: cannot open directory '/models': Permission denied`
+or simply discovers no weights.
+
+The containers run as UID 1000. Rootless Podman maps that to a high subordinate
+UID on the host (for example `525287`), not to your own account, so a state
+volume or a bind-mounted models directory owned by you is unreadable inside the
+container. Map UID 1000 back to yourself in the profile's `.env`:
+
+```sh
+echo 'WOOLWIRE_USERNS_MODE=keep-id:uid=1000,gid=1000' >> deploy/managed/.env
+podman compose --env-file deploy/managed/.env -f deploy/managed/compose.yaml up -d
+```
+
+Confirm it took effect -- the host UID should be yours, not a subordinate one:
+
+```sh
+ps -o user,uid,args -C woolwire,woolwire-runner
+```
+
+Leave `WOOLWIRE_USERNS_MODE` unset for Docker and rootful Podman, which map
+container UID 1000 to host UID 1000 already.
+
+If you started the stack once without this setting, Podman may have left the
+state volume owned by the subordinate UID. Change it back before restarting:
+
+```sh
+podman unshare chown -R 0:0 "$(podman volume inspect managed_woolwire_state --format '{{.Mountpoint}}')"
+```
+
+Loading a model is runtime engine state. After any runner restart, load it again
+from Settings; the runner comes back `idle` even when the app still lists the
+model.
+
+### Other ownership checks
 
 Check the state directory ownership for the container's UID/GID and account for
 rootless UID mapping and SELinux labeling. Keep SQLite WAL/SHM files with the

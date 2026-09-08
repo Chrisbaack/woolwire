@@ -63,6 +63,19 @@ You can also invoke `podman-compose` directly. Provider support for GPU device
 reservations and resource settings varies; inspect the resulting containers
 when using managed hosting. See the [Podman Compose documentation](https://docs.podman.io/en/latest/markdown/podman-compose.1.html).
 
+Rootless Podman maps the container's UID 1000 to a subordinate UID on the host,
+so a state volume or bind-mounted models directory owned by your account is
+unreadable inside the container. Set this in the profile's `.env` before the
+first `up`:
+
+```sh
+WOOLWIRE_USERNS_MODE=keep-id:uid=1000,gid=1000
+```
+
+Leave it unset for Docker. See
+[database and permission problems](TROUBLESHOOTING.md#database-or-permission-problems)
+if you have already started the stack without it.
+
 ## Managed Compose
 
 This starts the app plus an isolated runner. The supplied profile requests an

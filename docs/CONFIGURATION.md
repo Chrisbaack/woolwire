@@ -58,6 +58,7 @@ hardware-based selection; `0` requests CPU execution.
 | `WOOLWIRE_HOST_PORT` | Base, managed | `127.0.0.1:7070` | Host IP and port mapped to container `7070` |
 | `WOOLWIRE_RUNNER_TOKEN` | Managed | Required | Interpolated into both services' respective token variables |
 | `WOOLWIRE_MODELS` | Managed | `woolwire_models` named volume | Host model directory or volume source |
+| `WOOLWIRE_USERNS_MODE` | Base, managed | unset | Container user-namespace mode. Rootless Podman needs `keep-id:uid=1000,gid=1000` to reach a state volume or models directory owned by your account; leave unset for Docker |
 
 Use `--env-file` explicitly in scripts. A Compose `.env` file provides values
 for interpolation; variables reach the app only if the service environment
@@ -111,8 +112,37 @@ current Go record. These are not snake_case environment variables.
 Non-positive values are replaced with defaults when saving. Posting a partial
 object resets omitted fields to defaults, so read, edit, and send the complete
 record. Limits apply to the shared queue immediately and do not change the
-container's OS-level ceilings. Per-model context/output defaults are `4096` and
-`1024` tokens when no positive values are supplied at registration/load.
+container's OS-level ceilings. When no positive values are supplied at
+registration/load, the per-model context default is `4096` tokens and the output
+limit is derived from the context window: half of it, clamped to between `2048`
+and `4096` tokens. A fixed small default truncated reasoning models mid-answer.
+
+## Managed runner launch settings
+
+Settings → Managed models exposes these beside the model picker. The first three
+are always shown; extra arguments sit behind an "Advanced" disclosure. They take
+effect the next time a model is loaded or reloaded, which relaunches the engine.
+A reload whose settings match the running engine is a no-op rather than a
+restart.
+
+| Field | Default | Meaning |
+|---|---|---|
+| Context window | Selected model's declared size, else `4096` | `--ctx-size` for the engine |
+| CPU threads | `4` | `--threads` for the engine |
+| GPU offload | Auto | Layers to offload; `0` forces CPU. Auto lets the runner decide, since it is the container holding the GPU |
+| Extra arguments | none | Additional `llama-server` tuning flags |
+
+Extra arguments are a JSON array of strings and are passed to `exec` directly,
+never through a shell. Only an allow-list of tuning switches is accepted —
+`--batch-size`, `--ubatch-size`, `--threads-batch`, `--cache-type-k`,
+`--cache-type-v`, `--rope-scaling`, `--rope-freq-base`, `--rope-freq-scale`,
+`--defrag-thold`, `--keep`, `--prio`, `--poll`, `--flash-attn`, `--no-mmap`,
+`--mlock`, `--no-kv-offload`, and `--no-op-offload`. Flags that select a model or
+change paths, networking, or authentication are rejected with `400`, so this
+control cannot be used to repoint the runner at other files or expose it on
+another interface. A flag that needs a value takes it inline
+(`"--batch-size=512"`) or as the following array element (`"--batch-size", "512"`).
+`--flash-attn` may stand alone or use the inline form (`"--flash-attn=on"`).
 
 ## Credentials
 

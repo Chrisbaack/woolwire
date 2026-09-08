@@ -1095,8 +1095,10 @@ paths:
       description: |
         Backs the settings Runner status page. Alongside the engine's health it
         reports the launch settings in force, live queue depth, and token and
-        request counters accumulated since the engine started. Counters reset
-        whenever the engine is (re)launched.
+        request counters. The cumulative counters (requests_completed,
+        requests_failed, prompt_tokens, completion_tokens) accumulate for the
+        life of the runner process and survive a model reload; started_at and
+        the last_* fields are reset each time an engine is launched.
       responses:
         '200':
           description: Runner status.

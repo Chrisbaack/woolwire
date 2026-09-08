@@ -1,6 +1,10 @@
 # Binaries
 /woolwire
 bin/
+# Release artifacts only. web/dist is built output but is committed on purpose:
+# it is embedded into the binary by web/embed.go, so an unanchored "dist/" here
+# would silently drop the UI bundle from the repository.
+/dist/
 *.exe
 *.test
 
