@@ -434,7 +434,7 @@ func (s *Server) handleEditChatMessage(w http.ResponseWriter, r *http.Request) {
 	editIDBytes := make([]byte, 8)
 	_, _ = rand.Read(editIDBytes)
 	editedID := "msg-" + hex.EncodeToString(editIDBytes)
-	_ = s.store.SaveMessage(store.MessageRecord{
+	edited := store.MessageRecord{
 		ID:             editedID,
 		ConversationID: convID,
 		Role:           "user",
@@ -443,15 +443,23 @@ func (s *Server) handleEditChatMessage(w http.ResponseWriter, r *http.Request) {
 		ModelID:        modelID,
 		CreatedAt:      time.Now().Unix(),
 		ParentID:       target.ParentID,
-	})
+	}
+
+	// Context is the branch up to the question being replaced, with the new
+	// wording in its place. The edit is not stored yet, so it is appended to
+	// the history rather than read back out of the tree.
+	history := append(
+		s.branchContext(convID, target.ParentID),
+		hosting.ChatMessage{Role: "user", Content: body.Content},
+	)
 
 	s.streamGeneration(w, r, generation{
 		conv:         conv,
 		hostMemberID: hostMemberID,
 		modelID:      modelID,
 		myMemberID:   myMemberID,
-		history:      s.branchContext(convID, editedID),
-		parentID:     editedID,
+		history:      history,
+		pendingUser:  &edited,
 	})
 }
 
@@ -514,6 +522,11 @@ type generation struct {
 	history      []hosting.ChatMessage
 	// parentID is the message the generated answer hangs from.
 	parentID string
+	// pendingUser is a question that is only worth storing if an answer comes
+	// back. An edit writes one: storing it up front moved the conversation
+	// onto the edited branch, so a generation that then failed left the new
+	// question with no answer and hid the original exchange behind it.
+	pendingUser *store.MessageRecord
 	// noSaveTurns are appended to the in-memory transcript of a privacy-mode
 	// chat once the answer completes.
 	noSaveTurns []hosting.ChatMessage
@@ -525,16 +538,68 @@ type generation struct {
 func (s *Server) streamGeneration(w http.ResponseWriter, r *http.Request, g generation) {
 	convID := g.conv.ID
 
+	reqIDBytes := make([]byte, 8)
+	_, _ = rand.Read(reqIDBytes)
+	requestID := "req-" + hex.EncodeToString(reqIDBytes)
+
+	// Everything that can still fail with a status code is resolved before the
+	// stream opens. sse.New flushes, which commits a 200 text/event-stream
+	// response: after that http.Error can only write plain text into the event
+	// stream, and the browser reads it as a generation that produced nothing
+	// rather than as the error it is.
+	var localModel *store.HostedModelRecord
+	var peerResp *http.Response
+	var peerAddr string
+	if g.hostMemberID == g.myMemberID {
+		model, mErr := s.store.GetHostedModel(g.modelID)
+		if mErr != nil || !model.Enabled || !model.Published {
+			http.Error(w, "model not available locally", http.StatusServiceUnavailable)
+			return
+		}
+		localModel = model
+	} else {
+		peerAddr = s.peerAddress(g.hostMemberID)
+		if peerAddr == "" {
+			http.Error(w, "host address unknown", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Learn about removals before handing a peer a conversation: a host
+		// removed since the last poll must not receive this prompt.
+		s.SyncMembership(r.Context())
+
+		conn, dialErr := s.dialPeer(r.Context(), g.hostMemberID, peerAddr)
+		if dialErr != nil {
+			http.Error(w, "failed to connect to host: "+dialErr.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		defer conn.Close()
+
+		resp, reqErr := peerRoundTrip(r.Context(), conn, "POST", "/peer/v1/inference", peerapi.InferenceRequest{
+			RequestID: requestID,
+			ModelID:   g.modelID,
+			Messages:  g.history,
+		})
+		if reqErr != nil {
+			http.Error(w, reqErr.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			http.Error(w, string(b), resp.StatusCode)
+			return
+		}
+		peerResp = resp
+	}
+
 	stream, err := sse.New(w)
 	if err != nil {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
 	defer stream.Stop()
-
-	reqIDBytes := make([]byte, 8)
-	_, _ = rand.Read(reqIDBytes)
-	requestID := "req-" + hex.EncodeToString(reqIDBytes)
 
 	var assistantContent strings.Builder
 	var streamInterrupted bool
@@ -554,13 +619,7 @@ func (s *Server) streamGeneration(w http.ResponseWriter, r *http.Request, g gene
 		})
 	}
 
-	if g.hostMemberID == g.myMemberID {
-		localModel, mErr := s.store.GetHostedModel(g.modelID)
-		if mErr != nil || !localModel.Enabled || !localModel.Published {
-			http.Error(w, "model not available locally", http.StatusServiceUnavailable)
-			return
-		}
-
+	if localModel != nil {
 		// Local requests go through the same fair queue as remote ones so the
 		// owner's own usage is visible to the limits and to the queue estimate
 		// peers see in the catalog.
@@ -591,42 +650,7 @@ func (s *Server) streamGeneration(w http.ResponseWriter, r *http.Request, g gene
 			_ = stream.SendRaw("data: [DONE]\n\n")
 		}
 	} else {
-		targetAddr := s.peerAddress(g.hostMemberID)
-		if targetAddr == "" {
-			http.Error(w, "host address unknown", http.StatusServiceUnavailable)
-			return
-		}
-
-		// Learn about removals before handing a peer a conversation: a host
-		// removed since the last poll must not receive this prompt.
-		s.SyncMembership(r.Context())
-
-		conn, dialErr := s.dialPeer(r.Context(), g.hostMemberID, targetAddr)
-		if dialErr != nil {
-			http.Error(w, "failed to connect to host: "+dialErr.Error(), http.StatusServiceUnavailable)
-			return
-		}
-		defer conn.Close()
-
-		inferReq := peerapi.InferenceRequest{
-			RequestID: requestID,
-			ModelID:   g.modelID,
-			Messages:  g.history,
-		}
-		resp, reqErr := peerRoundTrip(r.Context(), conn, "POST", "/peer/v1/inference", inferReq)
-		if reqErr != nil {
-			http.Error(w, reqErr.Error(), http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			http.Error(w, string(b), resp.StatusCode)
-			return
-		}
-
-		streamInterrupted = s.relayPeerStream(r.Context(), resp.Body, emit, stream, g.hostMemberID, targetAddr)
+		streamInterrupted = s.relayPeerStream(r.Context(), peerResp.Body, emit, stream, g.hostMemberID, peerAddr)
 	}
 
 	if g.conv.NoSave {
@@ -647,6 +671,13 @@ func (s *Server) streamGeneration(w http.ResponseWriter, r *http.Request, g gene
 		if streamInterrupted {
 			content += " [interrupted]"
 		}
+		// The question and the answer land together, so a branch is never
+		// left half-written.
+		parentID := g.parentID
+		if g.pendingUser != nil {
+			_ = s.store.SaveMessage(*g.pendingUser)
+			parentID = g.pendingUser.ID
+		}
 		asstMsgIDBytes := make([]byte, 8)
 		_, _ = rand.Read(asstMsgIDBytes)
 
@@ -658,7 +689,7 @@ func (s *Server) streamGeneration(w http.ResponseWriter, r *http.Request, g gene
 			HostMemberID:   g.hostMemberID,
 			ModelID:        g.modelID,
 			CreatedAt:      time.Now().Unix(),
-			ParentID:       g.parentID,
+			ParentID:       parentID,
 		})
 	}
 }

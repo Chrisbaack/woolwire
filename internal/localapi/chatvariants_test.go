@@ -184,6 +184,90 @@ func TestEditQuestionBranchesInsteadOfOverwriting(t *testing.T) {
 	}
 }
 
+// An edit whose generation fails has to leave the conversation where it was.
+// Storing the edited question before the answer came back moved the visible
+// branch onto it, so a failure left a question with no answer on screen and
+// the original exchange hidden behind the variant arrows.
+func TestFailedEditLeavesTheOriginalBranchVisible(t *testing.T) {
+	var fail atomic.Bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			http.Error(w, "engine exploded", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"original answer\"}}]}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(backend.Close)
+
+	node := setupTestNode(t, transport.NewMemoryNetwork(), "edit-fail-node", 4303)
+	node.login(t)
+	node.hostRoom(t, "Alice", "Edit Room")
+
+	w := node.doJSON("POST", "/api/v1/hosted-models", map[string]any{
+		"name":          "Echo",
+		"endpoint_url":  backend.URL + "/v1",
+		"context_limit": 8192,
+		"max_tokens":    512,
+		"published":     true,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("register model: %d %s", w.Code, w.Body.String())
+	}
+	var model store.HostedModelRecord
+	_ = json.NewDecoder(w.Body).Decode(&model)
+	if c := node.doJSON("GET", "/api/v1/catalog", nil); c.Code != http.StatusOK {
+		t.Fatalf("catalog refresh: %d", c.Code)
+	}
+
+	w = node.doJSON("POST", "/api/v1/chats", map[string]any{"title": "Edit"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create chat: %d %s", w.Code, w.Body.String())
+	}
+	var conv store.ConversationRecord
+	_ = json.NewDecoder(w.Body).Decode(&conv)
+
+	if w = node.doJSON("POST", "/api/v1/chats/"+conv.ID+"/message", map[string]string{
+		"content":        "first wording",
+		"host_member_id": node.memberID,
+		"model_id":       model.ID,
+	}); w.Code != http.StatusOK {
+		t.Fatalf("send: %d %s", w.Code, w.Body.String())
+	}
+	branch := branchOf(t, node, conv.ID)
+	if len(branch) != 2 {
+		t.Fatalf("got %d messages, want user + assistant", len(branch))
+	}
+	questionID, _ := branch[0]["ID"].(string)
+
+	fail.Store(true)
+	node.doJSON("POST", "/api/v1/chats/"+conv.ID+"/messages/"+questionID+"/edit", map[string]string{
+		"content":        "second wording",
+		"host_member_id": node.memberID,
+		"model_id":       model.ID,
+	})
+
+	branch = branchOf(t, node, conv.ID)
+	if len(branch) != 2 {
+		t.Fatalf("got %d messages after a failed edit, want the original exchange intact", len(branch))
+	}
+	if got, _ := branch[0]["Content"].(string); got != "first wording" {
+		t.Errorf("visible question = %q, want the original wording", got)
+	}
+	if got, _ := branch[1]["Content"].(string); !strings.Contains(got, "original answer") {
+		t.Errorf("visible answer = %q, want the original answer still shown", got)
+	}
+	stored, _ := node.store.ListMessages(conv.ID)
+	if len(stored) != 2 {
+		t.Errorf("stored %d messages, want the failed edit not written at all", len(stored))
+	}
+}
+
 // A no-save chat stores nothing, so there is no branch to graft onto. The
 // endpoints must say so rather than appearing to work.
 func TestVariantEndpointsRejectNoSaveChats(t *testing.T) {
