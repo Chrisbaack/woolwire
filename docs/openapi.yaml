@@ -1229,6 +1229,116 @@ paths:
         '200': { description: Cancellation requested. }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  /api/v1/chats/{id}/messages/{msgID}/regenerate:
+    post:
+      tags: [chats]
+      summary: Generate another answer for a turn
+      description: |
+        Produces an alternative to an existing assistant message. The previous
+        answer is kept as a sibling and the new one becomes the visible take,
+        so both remain reachable through the variant navigation. The model is
+        sent the branch up to the replaced answer's parent, not the answer
+        itself. Responds as an SSE stream, exactly like sending a message.
+
+        Unavailable in a no-save conversation, which stores nothing to branch
+        from, and returns `400` there. Omit the model fields to reuse the model
+        that produced the original answer.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: msgID
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                host_member_id: { type: string }
+                model_id: { type: string }
+      responses:
+        '200':
+          description: Server-sent event stream of the new answer.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '400': { description: Not an assistant message, or a no-save conversation. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Conversation or message not found. }
+        '503': { description: The selected model is offline or the host is unreachable. }
+
+  /api/v1/chats/{id}/messages/{msgID}/edit:
+    post:
+      tags: [chats]
+      summary: Re-ask a question with new wording
+      description: |
+        Stores the edited question as a sibling of the original and generates
+        an answer beneath it. The original wording, and the exchange that
+        followed it, stay intact on their own branch.
+
+        Unavailable in a no-save conversation and returns `400` there. Responds
+        as an SSE stream.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: msgID
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string }
+                host_member_id: { type: string }
+                model_id: { type: string }
+      responses:
+        '200':
+          description: Server-sent event stream of the answer to the edited question.
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '400': { description: Not a user message, empty content, or a no-save conversation. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Conversation or message not found. }
+        '503': { description: The selected model is offline or the host is unreachable. }
+
+  /api/v1/chats/{id}/messages/{msgID}/select:
+    post:
+      tags: [chats]
+      summary: Switch which alternative of a turn is visible
+      description: |
+        Puts the named message on the visible branch in place of the sibling
+        currently holding the slot. Everything below it comes back with it, so
+        each alternative keeps its own continuation.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: msgID
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200': { description: The branch now runs through this message. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Conversation or message not found. }
+
   # ------------------------------------------------------------ community ---
   /api/v1/community/channels:
     get:

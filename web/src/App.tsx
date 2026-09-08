@@ -74,6 +74,12 @@ export const App: React.FC = () => {
   const [stateError, setStateError] = useState('')
   const [activeTab, setActiveTab] = useState<Tab>('dashboard')
   const [selectedChatModel, setSelectedChatModel] = useState<any>(null)
+  // Latches on the first visit to My Chats so the component can stay mounted
+  // afterwards without paying for its polling before the user ever opens it.
+  const [chatsOpened, setChatsOpened] = useState(false)
+  useEffect(() => {
+    if (activeTab === 'chats') setChatsOpened(true)
+  }, [activeTab])
 
   // Connect Device modal (when authenticated). It mints a fresh one-time
   // secret rather than revealing the one already in use.
@@ -331,6 +337,21 @@ export const App: React.FC = () => {
             </aside>
             <div className={`workspace-view view-${activeTab}`}>
             {/* Tab Views */}
+
+            {/* My Chats stays mounted once opened, and is hidden rather than
+                unmounted when another tab is active. Unmounting it aborted the
+                in-flight generation and threw away the model selection, so
+                stepping into Settings mid-answer killed the answer. It sits
+                outside the keyed ErrorBoundary below because that key remounts
+                its child on every tab change. */}
+            {chatsOpened && (
+              <div style={{ display: activeTab === 'chats' ? undefined : 'none' }}>
+                <ErrorBoundary>
+                  <MyChats initialModel={selectedChatModel} visible={activeTab === 'chats'} />
+                </ErrorBoundary>
+              </div>
+            )}
+
             <ErrorBoundary key={activeTab}>
               {activeTab === 'dashboard' && (
                 <Dashboard
@@ -340,10 +361,6 @@ export const App: React.FC = () => {
                   onLeaveRoom={handleLeaveRoom}
                   onSelectModelForChat={handleSelectModelForChat}
                 />
-              )}
-
-              {activeTab === 'chats' && (
-                <MyChats initialModel={selectedChatModel} />
               )}
 
               {activeTab === 'community' && (

@@ -88,11 +88,54 @@ func (s *Server) handleGetChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Only the visible branch is returned. Superseded takes stay in the store
+	// and are reachable by switching variants, but they are not part of the
+	// transcript.
+	branch := activeBranch(msgs)
+	out := make([]map[string]any, 0, len(branch))
+	for _, b := range branch {
+		out = append(out, map[string]any{
+			"ID":             b.ID,
+			"ConversationID": b.ConversationID,
+			"Role":           b.Role,
+			"Content":        b.Content,
+			"HostMemberID":   b.HostMemberID,
+			"ModelID":        b.ModelID,
+			"CreatedAt":      b.CreatedAt,
+			"ParentID":       b.ParentID,
+			"VariantIndex":   b.VariantIndex,
+			"VariantCount":   b.VariantCount,
+			"SiblingIDs":     b.SiblingIDs,
+		})
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"conversation": conv,
-		"messages":     msgs,
+		"messages":     out,
 	})
+}
+
+// handleSelectVariant switches which alternative of a turn is on the visible
+// branch. Everything below it in the tree comes back with it, so paging
+// between takes restores each one's follow-up conversation.
+func (s *Server) handleSelectVariant(w http.ResponseWriter, r *http.Request) {
+	convID := r.PathValue("id")
+	msgID := r.PathValue("msgID")
+	if convID == "" || msgID == "" {
+		http.Error(w, "conversation id and message id required", http.StatusBadRequest)
+		return
+	}
+	if _, err := s.store.GetConversation(convID); err != nil {
+		http.Error(w, "conversation not found", http.StatusNotFound)
+		return
+	}
+	if err := s.store.ActivateMessage(convID, msgID); err != nil {
+		http.Error(w, "message not found in this conversation", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
 func (s *Server) handleDeleteChat(w http.ResponseWriter, r *http.Request) {
@@ -155,6 +198,9 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		Content      string `json:"content"`
 		HostMemberID string `json:"host_member_id"`
 		ModelID      string `json:"model_id"`
+		// ParentID grafts this turn onto a specific point in the tree instead
+		// of the tip of the visible branch.
+		ParentID string `json:"parent_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -185,6 +231,18 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A turn hangs off the tip of the visible branch unless the caller names a
+	// parent, which is how a regenerate or an edit grafts an alternative onto
+	// an earlier point without disturbing what is already there.
+	parentID := strings.TrimSpace(body.ParentID)
+	if !conv.NoSave && parentID == "" {
+		if existing, lErr := s.store.ListMessages(convID); lErr == nil {
+			if branch := activeBranch(existing); len(branch) > 0 {
+				parentID = branch[len(branch)-1].ID
+			}
+		}
+	}
+
 	now := time.Now().Unix()
 	userMsgIDBytes := make([]byte, 8)
 	_, _ = rand.Read(userMsgIDBytes)
@@ -204,12 +262,268 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 			HostMemberID:   body.HostMemberID,
 			ModelID:        body.ModelID,
 			CreatedAt:      now,
+			ParentID:       parentID,
 		})
-		pastMsgs, _ := s.store.ListMessages(convID)
-		for _, m := range pastMsgs {
-			chatMsgs = append(chatMsgs, hosting.ChatMessage{Role: m.Role, Content: m.Content})
+		chatMsgs = s.branchContext(convID, userMsgID)
+	}
+
+	s.streamGeneration(w, r, generation{
+		conv:         conv,
+		hostMemberID: body.HostMemberID,
+		modelID:      body.ModelID,
+		myMemberID:   myMemberID,
+		history:      chatMsgs,
+		parentID:     userMsgID,
+		noSaveTurns:  []hosting.ChatMessage{userTurn},
+	})
+}
+
+// handleRegenerateMessage produces another answer for a turn already taken.
+// The replaced answer is kept as a sibling, so both remain readable.
+func (s *Server) handleRegenerateMessage(w http.ResponseWriter, r *http.Request) {
+	convID := r.PathValue("id")
+	msgID := r.PathValue("msgID")
+	if convID == "" || msgID == "" {
+		http.Error(w, "conversation id and message id required", http.StatusBadRequest)
+		return
+	}
+
+	conv, err := s.store.GetConversation(convID)
+	if err != nil {
+		http.Error(w, "conversation not found", http.StatusNotFound)
+		return
+	}
+	if conv.NoSave {
+		http.Error(w, "regenerate is not available in a no-save chat: nothing is stored to branch from", http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		HostMemberID string `json:"host_member_id"`
+		ModelID      string `json:"model_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	msgs, err := s.store.ListMessages(convID)
+	if err != nil {
+		http.Error(w, "failed to query messages", http.StatusInternalServerError)
+		return
+	}
+	var target *store.MessageRecord
+	for i := range msgs {
+		if msgs[i].ID == msgID {
+			target = &msgs[i]
+			break
 		}
 	}
+	if target == nil {
+		http.Error(w, "message not found in this conversation", http.StatusNotFound)
+		return
+	}
+	if target.Role != "assistant" {
+		http.Error(w, "only an assistant message can be regenerated", http.StatusBadRequest)
+		return
+	}
+
+	// Fall back to the model that produced the original answer.
+	hostMemberID := strings.TrimSpace(body.HostMemberID)
+	modelID := strings.TrimSpace(body.ModelID)
+	if hostMemberID == "" {
+		hostMemberID = target.HostMemberID
+	}
+	if modelID == "" {
+		modelID = target.ModelID
+	}
+
+	myMemberID, ok := s.resolveSelf(w)
+	if !ok {
+		return
+	}
+	if !s.modelIsServable(w, hostMemberID, modelID) {
+		return
+	}
+
+	// Context is the branch the replaced answer sits on, up to its parent --
+	// the answer itself is not shown to the model.
+	history := s.branchContext(convID, target.ParentID)
+
+	s.streamGeneration(w, r, generation{
+		conv:         conv,
+		hostMemberID: hostMemberID,
+		modelID:      modelID,
+		myMemberID:   myMemberID,
+		history:      history,
+		parentID:     target.ParentID,
+	})
+}
+
+// handleEditMessage re-asks a question with new wording. The edit becomes a
+// sibling of the original, and its answer is generated underneath it, so the
+// original question and everything it led to stay intact on the other branch.
+func (s *Server) handleEditChatMessage(w http.ResponseWriter, r *http.Request) {
+	convID := r.PathValue("id")
+	msgID := r.PathValue("msgID")
+	if convID == "" || msgID == "" {
+		http.Error(w, "conversation id and message id required", http.StatusBadRequest)
+		return
+	}
+
+	conv, err := s.store.GetConversation(convID)
+	if err != nil {
+		http.Error(w, "conversation not found", http.StatusNotFound)
+		return
+	}
+	if conv.NoSave {
+		http.Error(w, "editing is not available in a no-save chat: nothing is stored to branch from", http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		Content      string `json:"content"`
+		HostMemberID string `json:"host_member_id"`
+		ModelID      string `json:"model_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	body.Content = strings.TrimSpace(body.Content)
+	if body.Content == "" {
+		http.Error(w, "content is required", http.StatusBadRequest)
+		return
+	}
+
+	msgs, err := s.store.ListMessages(convID)
+	if err != nil {
+		http.Error(w, "failed to query messages", http.StatusInternalServerError)
+		return
+	}
+	var target *store.MessageRecord
+	for i := range msgs {
+		if msgs[i].ID == msgID {
+			target = &msgs[i]
+			break
+		}
+	}
+	if target == nil {
+		http.Error(w, "message not found in this conversation", http.StatusNotFound)
+		return
+	}
+	if target.Role != "user" {
+		http.Error(w, "only your own message can be edited", http.StatusBadRequest)
+		return
+	}
+
+	hostMemberID := strings.TrimSpace(body.HostMemberID)
+	modelID := strings.TrimSpace(body.ModelID)
+	if hostMemberID == "" {
+		hostMemberID = target.HostMemberID
+	}
+	if modelID == "" {
+		modelID = target.ModelID
+	}
+
+	myMemberID, ok := s.resolveSelf(w)
+	if !ok {
+		return
+	}
+	if !s.modelIsServable(w, hostMemberID, modelID) {
+		return
+	}
+
+	editIDBytes := make([]byte, 8)
+	_, _ = rand.Read(editIDBytes)
+	editedID := "msg-" + hex.EncodeToString(editIDBytes)
+	_ = s.store.SaveMessage(store.MessageRecord{
+		ID:             editedID,
+		ConversationID: convID,
+		Role:           "user",
+		Content:        body.Content,
+		HostMemberID:   hostMemberID,
+		ModelID:        modelID,
+		CreatedAt:      time.Now().Unix(),
+		ParentID:       target.ParentID,
+	})
+
+	s.streamGeneration(w, r, generation{
+		conv:         conv,
+		hostMemberID: hostMemberID,
+		modelID:      modelID,
+		myMemberID:   myMemberID,
+		history:      s.branchContext(convID, editedID),
+		parentID:     editedID,
+	})
+}
+
+// resolveSelf reports this node's member id, writing the error response
+// itself when the device identity is unusable.
+func (s *Server) resolveSelf(w http.ResponseWriter) (string, bool) {
+	device, err := s.store.GetDeviceIdentity()
+	if err != nil {
+		http.Error(w, "device identity missing", http.StatusInternalServerError)
+		return "", false
+	}
+	myMemberID, err := peerapi.MemberIDForDevicePublic(device.DevicePublic)
+	if err != nil {
+		http.Error(w, "device identity is malformed", http.StatusInternalServerError)
+		return "", false
+	}
+	return myMemberID, true
+}
+
+// modelIsServable repeats the staleness check the send path makes, so a
+// regenerate against a host that has since gone away fails the same way.
+func (s *Server) modelIsServable(w http.ResponseWriter, hostMemberID, modelID string) bool {
+	if hostMemberID == "" || modelID == "" {
+		http.Error(w, "host_member_id and model_id are required", http.StatusBadRequest)
+		return false
+	}
+	ad, ok := s.catalog.Get(hostMemberID, modelID)
+	if !ok || ad.Availability == "offline" {
+		http.Error(w, "selected model is offline or host is unreachable", http.StatusServiceUnavailable)
+		return false
+	}
+	return true
+}
+
+// branchContext returns the transcript to send to the model: the chain of
+// messages ending at messageID, following the branch that message is on.
+func (s *Server) branchContext(convID, messageID string) []hosting.ChatMessage {
+	if messageID == "" {
+		return nil
+	}
+	msgs, err := s.store.ListMessages(convID)
+	if err != nil {
+		return nil
+	}
+	var out []hosting.ChatMessage
+	for _, b := range branchThrough(msgs, messageID) {
+		out = append(out, hosting.ChatMessage{Role: b.Role, Content: b.Content})
+	}
+	return out
+}
+
+// generation carries everything the streaming path needs, so sending,
+// regenerating, and editing differ only in the context they assemble and the
+// parent the answer is filed under.
+type generation struct {
+	conv         *store.ConversationRecord
+	hostMemberID string
+	modelID      string
+	myMemberID   string
+	history      []hosting.ChatMessage
+	// parentID is the message the generated answer hangs from.
+	parentID string
+	// noSaveTurns are appended to the in-memory transcript of a privacy-mode
+	// chat once the answer completes.
+	noSaveTurns []hosting.ChatMessage
+}
+
+// streamGeneration runs one inference and streams it to the browser, then
+// files the answer under its parent. It is the single place that talks to a
+// local queue or a peer, so every entry point behaves identically.
+func (s *Server) streamGeneration(w http.ResponseWriter, r *http.Request, g generation) {
+	convID := g.conv.ID
 
 	stream, err := sse.New(w)
 	if err != nil {
@@ -240,8 +554,8 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if body.HostMemberID == myMemberID {
-		localModel, mErr := s.store.GetHostedModel(body.ModelID)
+	if g.hostMemberID == g.myMemberID {
+		localModel, mErr := s.store.GetHostedModel(g.modelID)
 		if mErr != nil || !localModel.Enabled || !localModel.Published {
 			http.Error(w, "model not available locally", http.StatusServiceUnavailable)
 			return
@@ -250,7 +564,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		// Local requests go through the same fair queue as remote ones so the
 		// owner's own usage is visible to the limits and to the queue estimate
 		// peers see in the catalog.
-		err = s.infer.Execute(r.Context(), myMemberID, requestID, localModel, chatMsgs, emit)
+		err = s.infer.Execute(r.Context(), g.myMemberID, requestID, localModel, g.history, emit)
 		if err != nil {
 			streamInterrupted = true
 			_ = stream.SendJSON("error", map[string]string{"error": err.Error()})
@@ -277,7 +591,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 			_ = stream.SendRaw("data: [DONE]\n\n")
 		}
 	} else {
-		targetAddr := s.peerAddress(body.HostMemberID)
+		targetAddr := s.peerAddress(g.hostMemberID)
 		if targetAddr == "" {
 			http.Error(w, "host address unknown", http.StatusServiceUnavailable)
 			return
@@ -287,7 +601,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		// removed since the last poll must not receive this prompt.
 		s.SyncMembership(r.Context())
 
-		conn, dialErr := s.dialPeer(r.Context(), body.HostMemberID, targetAddr)
+		conn, dialErr := s.dialPeer(r.Context(), g.hostMemberID, targetAddr)
 		if dialErr != nil {
 			http.Error(w, "failed to connect to host: "+dialErr.Error(), http.StatusServiceUnavailable)
 			return
@@ -296,8 +610,8 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 
 		inferReq := peerapi.InferenceRequest{
 			RequestID: requestID,
-			ModelID:   body.ModelID,
-			Messages:  chatMsgs,
+			ModelID:   g.modelID,
+			Messages:  g.history,
 		}
 		resp, reqErr := peerRoundTrip(r.Context(), conn, "POST", "/peer/v1/inference", inferReq)
 		if reqErr != nil {
@@ -312,13 +626,13 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		streamInterrupted = s.relayPeerStream(r.Context(), resp.Body, emit, stream, body.HostMemberID, targetAddr)
+		streamInterrupted = s.relayPeerStream(r.Context(), resp.Body, emit, stream, g.hostMemberID, targetAddr)
 	}
 
-	if conv.NoSave {
+	if g.conv.NoSave {
 		// The transcript stays in memory only. Nothing about a no-save chat is
 		// written to the messages table, on this node or any other.
-		s.appendNoSaveTurn(convID, userTurn)
+		s.appendNoSaveTurn(convID, g.noSaveTurns...)
 		if assistantContent.Len() > 0 {
 			s.appendNoSaveTurn(convID, hosting.ChatMessage{
 				Role:    "assistant",
@@ -341,9 +655,10 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 			ConversationID: convID,
 			Role:           "assistant",
 			Content:        content,
-			HostMemberID:   body.HostMemberID,
-			ModelID:        body.ModelID,
+			HostMemberID:   g.hostMemberID,
+			ModelID:        g.modelID,
 			CreatedAt:      time.Now().Unix(),
+			ParentID:       g.parentID,
 		})
 	}
 }

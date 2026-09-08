@@ -269,6 +269,9 @@ parameters, security overrides, and individual responses.
 | `DELETE` | `/api/v1/chats/{id}` | Delete a conversation |
 | `POST` | `/api/v1/chats/{id}/message` | Send a message and stream the reply |
 | `POST` | `/api/v1/chats/{id}/cancel` | Cancel an in-flight request |
+| `POST` | `/api/v1/chats/{id}/messages/{msgID}/regenerate` | Generate another answer for a turn |
+| `POST` | `/api/v1/chats/{id}/messages/{msgID}/edit` | Re-ask a question with new wording |
+| `POST` | `/api/v1/chats/{id}/messages/{msgID}/select` | Switch which alternative of a turn is visible |
 | `GET` | `/api/v1/community/channels` | List channels |
 | `POST` | `/api/v1/community/channels` | Create a channel |
 | `GET` | `/api/v1/community/channels/{id}/messages` | Read a channel |

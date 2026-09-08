@@ -124,3 +124,60 @@ func TestStoreMigrationsAndOperations(t *testing.T) {
 		t.Fatalf("backup store setting got %q, err %v", backupVal, err)
 	}
 }
+
+// TestMessageVariantsShareAParent covers the tree behind regenerate: a second
+// answer for the same turn must supersede the first without deleting it.
+func TestMessageVariantsShareAParent(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "woolwire.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.SaveConversation(ConversationRecord{ID: "c1", Title: "Chat"}); err != nil {
+		t.Fatalf("save conversation: %v", err)
+	}
+	save := func(id, parent, role string) {
+		t.Helper()
+		if err := s.SaveMessage(MessageRecord{
+			ID: id, ConversationID: "c1", Role: role, Content: id, ParentID: parent,
+		}); err != nil {
+			t.Fatalf("save %s: %v", id, err)
+		}
+	}
+	save("u1", "", "user")
+	save("a1", "u1", "assistant")
+	save("a2", "u1", "assistant") // a regenerated answer
+
+	msgs, err := s.ListMessages("c1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("got %d messages, want the superseded answer kept", len(msgs))
+	}
+	active := map[string]bool{}
+	for _, m := range msgs {
+		active[m.ID] = m.Active
+	}
+	if active["a1"] || !active["a2"] {
+		t.Errorf("newest answer should be active: a1=%v a2=%v", active["a1"], active["a2"])
+	}
+
+	// Paging back to the earlier take moves the flag, and only the flag.
+	if err := s.ActivateMessage("c1", "a1"); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	msgs, _ = s.ListMessages("c1")
+	for _, m := range msgs {
+		if m.ID == "a1" && !m.Active {
+			t.Error("a1 should be active after switching to it")
+		}
+		if m.ID == "a2" && m.Active {
+			t.Error("a2 should be inactive after switching away")
+		}
+		if m.ID == "u1" && !m.Active {
+			t.Error("switching an answer must not deactivate the question")
+		}
+	}
+}

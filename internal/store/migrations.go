@@ -192,4 +192,26 @@ var migrations = []string{
 
 	CREATE INDEX IF NOT EXISTS idx_community_events_channel ON community_events(channel_id, timestamp);
 	CREATE INDEX IF NOT EXISTS idx_community_events_author ON community_events(room_id, author_member_id, author_seq);`,
+
+	// Migration 006: a conversation becomes a tree instead of a list, so a
+	// message can be regenerated or edited without destroying the answer it
+	// replaces. Children of the same parent are alternative takes on the same
+	// turn; exactly one of them is active, and the active chain from the root
+	// is the transcript the reader sees and the model is sent.
+	`ALTER TABLE messages ADD COLUMN parent_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE messages ADD COLUMN active INTEGER NOT NULL DEFAULT 1;
+
+	-- Existing transcripts are linear, so each message's parent is simply the
+	-- one before it. created_at has one-second resolution and a fast exchange
+	-- can share a timestamp, so rowid breaks ties in insertion order.
+	UPDATE messages SET parent_id = COALESCE((
+		SELECT prev.id FROM messages prev
+		WHERE prev.conversation_id = messages.conversation_id
+		  AND (prev.created_at < messages.created_at
+		       OR (prev.created_at = messages.created_at AND prev.rowid < messages.rowid))
+		ORDER BY prev.created_at DESC, prev.rowid DESC
+		LIMIT 1
+	), '');
+
+	CREATE INDEX IF NOT EXISTS idx_messages_conv_parent ON messages(conversation_id, parent_id);`,
 }

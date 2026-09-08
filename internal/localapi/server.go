@@ -368,6 +368,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /api/v1/chats/{id}", s.authMiddleware(s.handleDeleteChat))
 	s.mux.HandleFunc("POST /api/v1/chats/{id}/message", s.authMiddleware(s.handleSendMessage))
 	s.mux.HandleFunc("POST /api/v1/chats/{id}/cancel", s.authMiddleware(s.handleCancelMessage))
+	s.mux.HandleFunc("POST /api/v1/chats/{id}/messages/{msgID}/regenerate", s.authMiddleware(s.handleRegenerateMessage))
+	s.mux.HandleFunc("POST /api/v1/chats/{id}/messages/{msgID}/edit", s.authMiddleware(s.handleEditChatMessage))
+	s.mux.HandleFunc("POST /api/v1/chats/{id}/messages/{msgID}/select", s.authMiddleware(s.handleSelectVariant))
 
 	// Community
 	s.mux.HandleFunc("GET /api/v1/community/channels", s.authMiddleware(s.handleListChannels))

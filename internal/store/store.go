@@ -528,8 +528,19 @@ type MessageRecord struct {
 	HostMemberID   string
 	ModelID        string
 	CreatedAt      int64
+	// ParentID is the message this one follows. Empty means the root of the
+	// conversation. Messages sharing a parent are alternative takes on the
+	// same turn -- a regenerated answer, or a re-asked question.
+	ParentID string
+	// Active marks the sibling currently on the visible branch. Exactly one
+	// child per parent is active.
+	Active bool
 }
 
+// SaveMessage inserts a message and makes it the active child of its parent,
+// so a freshly generated alternative is the one shown. The switch happens in
+// the same transaction as the insert: a parent with two active children would
+// make the transcript ambiguous.
 func (s *Store) SaveMessage(m MessageRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -539,20 +550,67 @@ func (s *Store) SaveMessage(m MessageRecord) error {
 		m.CreatedAt = now
 	}
 
-	_, err := s.db.Exec(`
-		INSERT INTO messages (id, conversation_id, role, content, host_member_id, model_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, m.ID, m.ConversationID, m.Role, m.Content, m.HostMemberID, m.ModelID, m.CreatedAt)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(`
+		UPDATE messages SET active = 0 WHERE conversation_id = ? AND parent_id = ?
+	`, m.ConversationID, m.ParentID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO messages (id, conversation_id, role, content, host_member_id, model_id, created_at, parent_id, active)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+	`, m.ID, m.ConversationID, m.Role, m.Content, m.HostMemberID, m.ModelID, m.CreatedAt, m.ParentID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
+// ActivateMessage puts a message on the visible branch in place of whichever
+// sibling currently holds the slot.
+func (s *Store) ActivateMessage(conversationID, messageID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var parentID string
+	if err := tx.QueryRow(`
+		SELECT parent_id FROM messages WHERE id = ? AND conversation_id = ?
+	`, messageID, conversationID).Scan(&parentID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		UPDATE messages SET active = 0 WHERE conversation_id = ? AND parent_id = ?
+	`, conversationID, parentID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		UPDATE messages SET active = 1 WHERE id = ? AND conversation_id = ?
+	`, messageID, conversationID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ListMessages returns every message in the conversation, including the
+// branches that are not currently visible. Callers that want the transcript
+// as read should walk the active chain.
 func (s *Store) ListMessages(conversationID string) ([]MessageRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
-		SELECT id, conversation_id, role, content, host_member_id, model_id, created_at
-		FROM messages WHERE conversation_id = ? ORDER BY created_at ASC
+		SELECT id, conversation_id, role, content, host_member_id, model_id, created_at, parent_id, active
+		FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, rowid ASC
 	`, conversationID)
 	if err != nil {
 		return nil, err
@@ -562,7 +620,7 @@ func (s *Store) ListMessages(conversationID string) ([]MessageRecord, error) {
 	var msgs []MessageRecord
 	for rows.Next() {
 		var m MessageRecord
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.HostMemberID, &m.ModelID, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.HostMemberID, &m.ModelID, &m.CreatedAt, &m.ParentID, &m.Active); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, m)

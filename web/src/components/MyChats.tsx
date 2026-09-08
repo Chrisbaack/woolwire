@@ -29,6 +29,12 @@ interface Message {
   HostMemberID: string
   ModelID: string
   CreatedAt: number
+  // Regenerating an answer or editing a question stores the new take beside
+  // the old one. These describe where this message sits among those takes.
+  ParentID?: string
+  VariantIndex?: number
+  VariantCount?: number
+  SiblingIDs?: string[]
 }
 
 export interface GenerationStats {
@@ -46,7 +52,6 @@ interface MessageContentProps {
 }
 
 export const MessageContent: React.FC<MessageContentProps> = ({ content, isStreaming }) => {
-  const [thinkExpanded, setThinkExpanded] = useState<boolean>(Boolean(isStreaming))
   const [copiedCodeIdx, setCopiedCodeIdx] = useState<number | null>(null)
 
   // Parse <think>...</think> if present
@@ -66,6 +71,8 @@ export const MessageContent: React.FC<MessageContentProps> = ({ content, isStrea
       isCurrentlyThinking = Boolean(isStreaming)
     }
   }
+
+  const [thinkExpanded, setThinkExpanded] = useState<boolean>(Boolean(isStreaming) || !mainContent)
 
   // Parse markdown code blocks ```lang\ncode\n```
   const renderTextWithCodeBlocks = (text: string) => {
@@ -207,25 +214,54 @@ export const MessageContent: React.FC<MessageContentProps> = ({ content, isStrea
 
       {mainContent ? (
         <div style={{ fontSize: '0.95rem' }}>{renderTextWithCodeBlocks(mainContent)}</div>
-      ) : isCurrentlyThinking ? (
-        <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', fontStyle: 'italic' }}>
-          Formulating answer...
+      ) : isStreaming ? (
+        <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', fontStyle: 'italic', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+          <span>{isCurrentlyThinking ? 'Thinking...' : 'Formulating answer...'}</span>
+          <span className="cursor-blink">|</span>
+        </div>
+      ) : thinkContent && !mainContent ? (
+        <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', fontStyle: 'italic', marginTop: '0.4rem', opacity: 0.85 }}>
+          (Model completed reasoning but produced no response text. This typically happens when the model exceeds its maximum token budget during reasoning.)
         </div>
       ) : null}
     </div>
   )
 }
 
-interface MyChatsProps {
-  initialModel?: ModelAd | null
+// Message actions sit under the bubble and should read as quiet affordances,
+// not as primary buttons competing with the composer.
+const msgActionStyle: React.CSSProperties = {
+  background: 'none',
+  border: 'none',
+  color: 'var(--text-secondary)',
+  cursor: 'pointer',
+  fontSize: '0.72rem',
+  padding: '0.15rem 0.4rem',
+  borderRadius: '3px',
+  lineHeight: 1.4,
 }
 
-export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
+interface MyChatsProps {
+  initialModel?: ModelAd | null
+  /** False while another tab is showing. The component stays mounted so a
+      generation in flight keeps streaming; only cosmetic work is skipped. */
+  visible?: boolean
+}
+
+export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }) => {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [activeConvId, setActiveConvId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [models, setModels] = useState<ModelAd[]>([])
-  const [selectedModelKey, setSelectedModelKey] = useState<string>('')
+  // The chosen model outlives both a reload and a catalog that briefly comes
+  // back empty. Losing it used to blank the dropdown and disable the composer.
+  const [selectedModelKey, setSelectedModelKey] = useState<string>(() => {
+    try {
+      return localStorage.getItem('woolwire_selected_model') || ''
+    } catch {
+      return ''
+    }
+  })
   const [inputContent, setInputContent] = useState('')
   const [streaming, setStreaming] = useState(false)
   const [streamingText, setStreamingText] = useState('')
@@ -243,6 +279,10 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
   const [newTitle, setNewTitle] = useState('')
   const [newNoSave, setNewNoSave] = useState(false)
   const [showNewModal, setShowNewModal] = useState(false)
+  // Which message is open for editing, and which was just copied.
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editDraft, setEditDraft] = useState('')
+  const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null)
   const [modelNameMap, setModelNameMap] = useState<Record<string, string>>(() => {
     try {
       return JSON.parse(localStorage.getItem('woolwire_model_names') || '{}')
@@ -274,12 +314,14 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
       if (res.ok) {
         const data: ModelAd[] = await res.json()
         setModels(data || [])
-        if (!selectedModelKey && data && data.length > 0) {
-          if (initialModel) {
-            setSelectedModelKey(`${initialModel.host_member_id}/${initialModel.model_id}`)
-          } else {
-            setSelectedModelKey(`${data[0].host_member_id}/${data[0].model_id}`)
-          }
+        // Only fill an empty selection. A catalog refresh that momentarily
+        // returns nothing (or drops the chosen host for one poll) must not
+        // reset what the user picked -- that is what silently deselected the
+        // model and disabled the composer on returning to this tab.
+        if (data && data.length > 0) {
+          setSelectedModelKey(current => current || (initialModel
+            ? `${initialModel.host_member_id}/${initialModel.model_id}`
+            : `${data[0].host_member_id}/${data[0].model_id}`))
         }
         if (Array.isArray(data)) {
           setModelNameMap((prev) => {
@@ -337,7 +379,17 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
 
   useEffect(() => {
     fetchConversations()
-    fetchCatalog()
+    let stopped = false
+    let timer: number | undefined
+    const refresh = async () => {
+      await fetchCatalog()
+      if (!stopped) timer = window.setTimeout(refresh, 15000)
+    }
+    void refresh()
+    return () => {
+      stopped = true
+      clearTimeout(timer)
+    }
   }, [])
 
   useEffect(() => {
@@ -348,9 +400,26 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
     }
   }, [activeConvId])
 
+  // Remember the selection across reloads and tab switches.
   useEffect(() => {
+    try {
+      if (selectedModelKey) localStorage.setItem('woolwire_selected_model', selectedModelKey)
+    } catch {}
+  }, [selectedModelKey])
+
+  // A model picked from The Meadow applies even though this component is now
+  // kept mounted, where before it only took effect on a fresh mount.
+  useEffect(() => {
+    if (initialModel?.host_member_id && initialModel?.model_id) {
+      setSelectedModelKey(`${initialModel.host_member_id}/${initialModel.model_id}`)
+    }
+  }, [initialModel])
+
+  useEffect(() => {
+    // Scrolling a hidden pane fights the visible one for the viewport.
+    if (!visible) return
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, streamingText])
+  }, [messages, streamingText, visible])
 
   const handleCreateChat = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -391,18 +460,27 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
     }
   }
 
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!inputContent.trim() || !activeConvId || streaming) return
-
-    const [hostId, modelId] = selectedModelKey.split('/')
-    if (!hostId || !modelId) {
-      setErrorMsg('Please select a valid model from the catalog')
-      return
-    }
-
-    const currentContent = inputContent.trim()
-    setInputContent('')
+  // runGeneration owns one streaming exchange with the backend. Sending,
+  // regenerating, and editing differ only in the endpoint they call and the
+  // optimistic message they show, so they all funnel through here.
+  const runGeneration = async (
+    url: string,
+    payload: Record<string, unknown>,
+    opts: {
+      hostId: string
+      modelId: string
+      optimistic?: Message
+      /** Replaces the transcript before streaming starts. Editing or
+          regenerating moves to a new branch, so the turns being superseded
+          have to leave the screen immediately -- otherwise the old thread
+          stays put and the new answer looks appended to it. */
+      baseMessages?: Message[]
+    } = { hostId: '', modelId: '' }
+  ) => {
+    const { hostId, modelId, optimistic, baseMessages } = opts
+    // Captured for rollback: a failed request must not leave the transcript
+    // truncated to a branch that was never created.
+    const snapshot = messages
     setErrorMsg('')
     setStreaming(true)
     setStreamingText('')
@@ -418,27 +496,14 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
     const activeConv = conversations.find((c) => c.ID === activeConvId)
     const isNoSave = activeConv?.NoSave || false
 
-    // Optimistically show user message in UI
-    const tempUserMsg: Message = {
-      ID: 'temp-user',
-      ConversationID: activeConvId,
-      Role: 'user',
-      Content: currentContent,
-      HostMemberID: hostId,
-      ModelID: modelId,
-      CreatedAt: Math.floor(Date.now() / 1000),
+    if (baseMessages) {
+      setMessages(optimistic ? [...baseMessages, optimistic] : baseMessages)
+    } else if (optimistic) {
+      setMessages((prev) => [...prev, optimistic])
     }
-    setMessages((prev) => [...prev, tempUserMsg])
 
     try {
-      const res = await api(`/api/v1/chats/${activeConvId}/message`, {
-        method: 'POST',
-        body: JSON.stringify({
-          content: currentContent,
-          host_member_id: hostId,
-          model_id: modelId,
-        }),
-      })
+      const res = await api(url, { method: 'POST', body: JSON.stringify(payload) })
 
       if (!res.ok) {
         const errText = await res.text()
@@ -554,7 +619,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
         const asstId = `temp-asst-${Date.now()}`
         const asstMsg: Message = {
           ID: asstId,
-          ConversationID: activeConvId,
+          ConversationID: activeConvId!,
           Role: 'assistant',
           Content: accumulated,
           HostMemberID: hostId,
@@ -574,6 +639,126 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
       setErrorMsg(err.message || 'Error communicating with model host')
       setStreaming(false)
       setLiveStats({})
+      // Put back what the turn previewed: the branch it would have created
+      // does not exist, so the superseded messages belong back on screen.
+      if (baseMessages) {
+        setMessages(snapshot)
+      } else if (optimistic) {
+        setMessages((prev) => prev.filter((m) => m.ID !== optimistic.ID))
+      }
+    }
+  }
+
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!inputContent.trim() || !activeConvId || streaming) return
+
+    const [hostId, modelId] = selectedModelKey.split('/')
+    if (!hostId || !modelId) {
+      setErrorMsg('Please select a valid model from the catalog')
+      return
+    }
+
+    const currentContent = inputContent.trim()
+    setInputContent('')
+
+    await runGeneration(
+      `/api/v1/chats/${activeConvId}/message`,
+      { content: currentContent, host_member_id: hostId, model_id: modelId },
+      {
+        hostId,
+        modelId,
+        optimistic: {
+          ID: 'temp-user',
+          ConversationID: activeConvId,
+          Role: 'user',
+          Content: currentContent,
+          HostMemberID: hostId,
+          ModelID: modelId,
+          CreatedAt: Math.floor(Date.now() / 1000),
+        },
+      }
+    )
+  }
+
+  // Ask for another answer to the same question. The previous one is kept and
+  // reachable through the variant arrows.
+  const handleRegenerate = async (m: Message) => {
+    if (!activeConvId || streaming) return
+    const [selHost, selModel] = selectedModelKey.split('/')
+    const hostId = selHost || m.HostMemberID
+    const modelId = selModel || m.ModelID
+    // The answer being replaced, and anything that followed it, leave the
+    // screen while the new one streams into their place.
+    const idx = messages.findIndex((x) => x.ID === m.ID)
+    await runGeneration(
+      `/api/v1/chats/${activeConvId}/messages/${m.ID}/regenerate`,
+      { host_member_id: hostId, model_id: modelId },
+      { hostId, modelId, baseMessages: idx >= 0 ? messages.slice(0, idx) : undefined }
+    )
+  }
+
+  // Re-ask a question with different wording. The original wording and the
+  // exchange that followed it stay on their own branch.
+  const handleSubmitEdit = async (m: Message, content: string) => {
+    if (!activeConvId || streaming) return
+    const trimmed = content.trim()
+    if (!trimmed || trimmed === m.Content) {
+      setEditingId(null)
+      return
+    }
+    const [selHost, selModel] = selectedModelKey.split('/')
+    const hostId = selHost || m.HostMemberID
+    const modelId = selModel || m.ModelID
+    setEditingId(null)
+    // Switch to the new branch straight away: the original question and
+    // everything it led to are replaced by the edited question, which then
+    // streams its own answer.
+    const idx = messages.findIndex((x) => x.ID === m.ID)
+    await runGeneration(
+      `/api/v1/chats/${activeConvId}/messages/${m.ID}/edit`,
+      { content: trimmed, host_member_id: hostId, model_id: modelId },
+      {
+        hostId,
+        modelId,
+        baseMessages: idx >= 0 ? messages.slice(0, idx) : undefined,
+        optimistic: {
+          ID: 'temp-user',
+          ConversationID: activeConvId,
+          Role: 'user',
+          Content: trimmed,
+          HostMemberID: hostId,
+          ModelID: modelId,
+          CreatedAt: Math.floor(Date.now() / 1000),
+        },
+      }
+    )
+  }
+
+  // Page between takes. Switching brings back everything that followed that
+  // take, so each branch keeps its own continuation.
+  const handleSelectVariant = async (m: Message, direction: -1 | 1) => {
+    if (!activeConvId || streaming) return
+    const siblings = m.SiblingIDs || []
+    const current = (m.VariantIndex || 1) - 1
+    const target = siblings[current + direction]
+    if (!target) return
+    try {
+      const res = await api(`/api/v1/chats/${activeConvId}/messages/${target}/select`, { method: 'POST' })
+      if (!res.ok) throw new Error('Could not switch to that version')
+      await fetchChatMessages(activeConvId)
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Could not switch to that version')
+    }
+  }
+
+  const handleCopyMessage = async (m: Message) => {
+    try {
+      await navigator.clipboard.writeText(m.Content)
+      setCopiedMsgId(m.ID)
+      setTimeout(() => setCopiedMsgId((id) => (id === m.ID ? null : id)), 2000)
+    } catch {
+      setErrorMsg('Clipboard unavailable in this browser context.')
     }
   }
 
@@ -726,15 +911,22 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
                     onChange={(e) => setSelectedModelKey(e.target.value)}
                     disabled={streaming}
                   >
-                    {models.length === 0 ? (
+                    {models.length === 0 && !selectedModelKey && (
                       <option value="">No models available</option>
-                    ) : (
-                      models.map((m) => (
-                        <option key={`${m.host_member_id}/${m.model_id}`} value={`${m.host_member_id}/${m.model_id}`}>
-                          {m.name} ({m.host_display_name})
-                        </option>
-                      ))
                     )}
+                    {/* The chosen model is kept in the list even while the
+                        catalog cannot see it, so a host that blinks out shows
+                        as unavailable instead of silently deselecting. */}
+                    {selectedModelKey && !selectedModel && (
+                      <option value={selectedModelKey}>
+                        {modelNameMap[selectedModelKey.split('/')[1]] || selectedModelKey.split('/')[1]} (unavailable)
+                      </option>
+                    )}
+                    {models.map((m) => (
+                      <option key={`${m.host_member_id}/${m.model_id}`} value={`${m.host_member_id}/${m.model_id}`}>
+                        {m.name} ({m.host_display_name})
+                      </option>
+                    ))}
                   </select>
                 </div>
               </div>
@@ -771,10 +963,104 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
                     </div>
                   )}
 
-                  {m.Role === 'user' ? (
+                  {m.Role === 'user' && editingId === m.ID ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                      <textarea
+                        className="form-control"
+                        style={{ fontSize: '0.95rem', minHeight: '4.5rem', resize: 'vertical' }}
+                        value={editDraft}
+                        autoFocus
+                        onChange={(e) => setEditDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') setEditingId(null)
+                          if (e.key === 'Enter' && !e.shiftKey) {
+                            e.preventDefault()
+                            void handleSubmitEdit(m, editDraft)
+                          }
+                        }}
+                      />
+                      <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+                        <button type="button" className="btn btn-secondary" style={msgActionStyle} onClick={() => setEditingId(null)}>
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          style={msgActionStyle}
+                          disabled={!editDraft.trim() || streaming}
+                          onClick={() => void handleSubmitEdit(m, editDraft)}
+                        >
+                          Save &amp; resend
+                        </button>
+                      </div>
+                    </div>
+                  ) : m.Role === 'user' ? (
                     <div style={{ whiteSpace: 'pre-wrap', fontSize: '0.95rem' }}>{m.Content}</div>
                   ) : (
                     <MessageContent content={m.Content} />
+                  )}
+
+                  {/* Per-message actions. Variant arrows appear only where
+                      there is more than one take to page between. */}
+                  {editingId !== m.ID && !m.ID.startsWith('temp-') && (
+                    <div
+                      style={{
+                        marginTop: '0.5rem',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.35rem',
+                        flexWrap: 'wrap',
+                        justifyContent: m.Role === 'user' ? 'flex-end' : 'flex-start',
+                      }}
+                    >
+                      {(m.VariantCount || 1) > 1 && (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.15rem', fontSize: '0.72rem', color: 'var(--text-secondary)' }}>
+                          <button
+                            type="button"
+                            style={msgActionStyle}
+                            aria-label="Previous version"
+                            disabled={streaming || (m.VariantIndex || 1) <= 1}
+                            onClick={() => void handleSelectVariant(m, -1)}
+                          >
+                            ‹
+                          </button>
+                          <span aria-live="polite">{m.VariantIndex} / {m.VariantCount}</span>
+                          <button
+                            type="button"
+                            style={msgActionStyle}
+                            aria-label="Next version"
+                            disabled={streaming || (m.VariantIndex || 1) >= (m.VariantCount || 1)}
+                            onClick={() => void handleSelectVariant(m, 1)}
+                          >
+                            ›
+                          </button>
+                        </span>
+                      )}
+                      <button type="button" style={msgActionStyle} onClick={() => void handleCopyMessage(m)}>
+                        {copiedMsgId === m.ID ? '✓ Copied' : 'Copy'}
+                      </button>
+                      {m.Role === 'user' && !activeConv?.NoSave && (
+                        <button
+                          type="button"
+                          style={msgActionStyle}
+                          disabled={streaming}
+                          onClick={() => { setEditingId(m.ID); setEditDraft(m.Content) }}
+                        >
+                          Edit
+                        </button>
+                      )}
+                      {m.Role === 'assistant' && !activeConv?.NoSave && (
+                        <button
+                          type="button"
+                          style={msgActionStyle}
+                          disabled={streaming}
+                          title="Generate another answer, keeping this one"
+                          onClick={() => void handleRegenerate(m)}
+                        >
+                          Regenerate
+                        </button>
+                      )}
+                    </div>
                   )}
 
                   {/* Generation Stats HUD */}
@@ -830,7 +1116,9 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
                     ) : null}
                   </div>
                   <MessageContent content={streamingText} isStreaming={true} />
-                  {!streamingText.includes('<think>') && <span className="cursor-blink">|</span>}
+                  {(!streamingText.includes('<think>') || (streamingText.includes('</think>') && streamingText.indexOf('</think>') + 8 < streamingText.length)) && (
+                    <span className="cursor-blink">|</span>
+                  )}
                 </div>
               )}
               <div ref={messagesEndRef} />
@@ -844,14 +1132,22 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel }) => {
                 placeholder={streaming ? 'Generating...' : 'Type a message...'}
                 value={inputContent}
                 onChange={(e) => setInputContent(e.target.value)}
-                disabled={streaming || !selectedModelKey}
+                // Only an in-flight generation blocks typing. A missing model
+                // is a reason the message cannot be sent yet, not a reason to
+                // stop someone composing it.
+                disabled={streaming}
               />
               {streaming ? (
                 <button type="button" className="btn btn-secondary" onClick={handleCancel}>
                   Cancel
                 </button>
               ) : (
-                <button type="submit" className="btn btn-primary" disabled={!inputContent.trim() || !selectedModelKey}>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={!inputContent.trim() || !selectedModelKey}
+                  title={!selectedModelKey ? 'Choose a model first' : undefined}
+                >
                   Send
                 </button>
               )}
