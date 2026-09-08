@@ -291,13 +291,30 @@ type CatalogItem struct {
 	HostDisplayName string `json:"host_display_name"`
 }
 
+// catalogSyncInterval bounds how often a catalog read refreshes membership.
+// Short enough that a member who joined moments ago is found on the next poll,
+// long enough that polling does not turn into a peer sync loop.
+const catalogSyncInterval = 20 * time.Second
+
 func (s *Server) handleGetCatalog(w http.ResponseWriter, r *http.Request) {
 	// Discovery needs the current roster and address hints before choosing
 	// hosts to query. Otherwise a member that joined after this client is
 	// invisible until the background membership timer happens to run.
-	syncCtx, cancelSync := context.WithTimeout(r.Context(), 5*time.Second)
-	s.SyncMembership(syncCtx)
-	cancelSync()
+	//
+	// Throttled, because this is a read path the UI polls: syncing on every
+	// request meant peer network I/O several times a minute per open tab, any
+	// one of which could stall the response for the full timeout.
+	s.mu.Lock()
+	staleCatalog := time.Since(s.lastCatalogSync) >= catalogSyncInterval
+	if staleCatalog {
+		s.lastCatalogSync = time.Now()
+	}
+	s.mu.Unlock()
+	if staleCatalog {
+		syncCtx, cancelSync := context.WithTimeout(r.Context(), 5*time.Second)
+		s.SyncMembership(syncCtx)
+		cancelSync()
+	}
 
 	roomRec, err := s.store.GetRoomState()
 	if err != nil || roomRec == nil {

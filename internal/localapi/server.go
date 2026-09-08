@@ -91,6 +91,10 @@ type Server struct {
 	server *http.Server
 	mu     sync.RWMutex
 
+	// lastCatalogSync throttles the membership refresh the catalog route does
+	// on the way in. Guarded by mu.
+	lastCatalogSync time.Time
+
 	bgCancel context.CancelFunc
 	bgWG     sync.WaitGroup
 }
