@@ -1131,6 +1131,12 @@ paths:
                     type: integer
                     description: Requests waiting on the runner's single engine slot.
                   requests_completed: { type: integer }
+                  requests_cancelled:
+                    type: integer
+                    description: |
+                      Requests the caller stopped. Counted apart from
+                      requests_failed: a cancel is neither a success nor an
+                      engine failure.
                   requests_failed: { type: integer }
                   prompt_tokens: { type: integer }
                   completion_tokens: { type: integer }

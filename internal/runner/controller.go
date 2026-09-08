@@ -188,6 +188,7 @@ type Controller struct {
 	pendingRequests      int
 	requestsCompleted    int
 	requestsFailed       int
+	requestsCancelled    int
 	promptTokens         int
 	completionTokens     int
 	lastPromptTokens     *int
@@ -865,9 +866,15 @@ func (c *Controller) handleInference(w http.ResponseWriter, r *http.Request) {
 		if c.status == StatusBusy {
 			c.status = StatusReady
 		}
-		if completed {
+		// A request the caller stopped is neither a success nor an engine
+		// failure. Counting a cancel as a failure made pressing Stop look like
+		// something had gone wrong on the status page.
+		switch {
+		case completed:
 			c.requestsCompleted++
-		} else {
+		case reqCtx.Err() != nil:
+			c.requestsCancelled++
+		default:
 			c.requestsFailed++
 		}
 		c.mu.Unlock()

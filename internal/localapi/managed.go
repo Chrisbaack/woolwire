@@ -322,6 +322,7 @@ func (s *Server) handleRunnerHealth(w http.ResponseWriter, r *http.Request) {
 		"queued_requests":        health.QueuedRequests,
 		"requests_completed":     health.RequestsCompleted,
 		"requests_failed":        health.RequestsFailed,
+		"requests_cancelled":     health.RequestsCancelled,
 		"prompt_tokens":          health.PromptTokens,
 		"completion_tokens":      health.CompletionTokens,
 		"last_prompt_tokens":     health.LastPromptTokens,

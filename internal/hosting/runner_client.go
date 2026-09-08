@@ -37,6 +37,7 @@ type RunnerHealth struct {
 	QueuedRequests       int        `json:"queued_requests"`
 	RequestsCompleted    int        `json:"requests_completed"`
 	RequestsFailed       int        `json:"requests_failed"`
+	RequestsCancelled    int        `json:"requests_cancelled"`
 	PromptTokens         int        `json:"prompt_tokens"`
 	CompletionTokens     int        `json:"completion_tokens"`
 	LastPromptTokens     *int       `json:"last_prompt_tokens"`
