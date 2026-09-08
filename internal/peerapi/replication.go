@@ -140,6 +140,18 @@ func (s *Server) handleCommunitySync(w http.ResponseWriter, r *http.Request, cal
 			continue
 		}
 		_ = s.store.SaveEvent(EventRecord(e, "replicated"))
+		if e.EventType == community.EventChannel {
+			var payload community.ChannelPayload
+			if json.Unmarshal([]byte(e.Content), &payload) == nil {
+				_ = s.store.SaveChannel(store.ChannelRecord{
+					ID:          e.ChannelID,
+					RoomID:      e.RoomID,
+					Name:        payload.Name,
+					Description: payload.Description,
+					CreatedAt:   e.Timestamp,
+				})
+			}
+		}
 	}
 
 	var knownMap map[string]bool

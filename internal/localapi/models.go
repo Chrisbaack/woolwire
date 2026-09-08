@@ -292,6 +292,13 @@ type CatalogItem struct {
 }
 
 func (s *Server) handleGetCatalog(w http.ResponseWriter, r *http.Request) {
+	// Discovery needs the current roster and address hints before choosing
+	// hosts to query. Otherwise a member that joined after this client is
+	// invisible until the background membership timer happens to run.
+	syncCtx, cancelSync := context.WithTimeout(r.Context(), 5*time.Second)
+	s.SyncMembership(syncCtx)
+	cancelSync()
+
 	roomRec, err := s.store.GetRoomState()
 	if err != nil || roomRec == nil {
 		w.Header().Set("Content-Type", "application/json")

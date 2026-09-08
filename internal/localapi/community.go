@@ -544,6 +544,10 @@ func (s *Server) SyncCommunityEvents(ctx context.Context) {
 			_ = s.store.SaveEvent(*rec)
 		}
 	}
+
+	// Materialize channels after syncing so any newly pulled channel events
+	// are immediately available in the local channels table.
+	s.materializeChannels(roomRec.RoomID)
 }
 
 func (s *Server) pendingLocalEvents(roomID string) []community.Event {

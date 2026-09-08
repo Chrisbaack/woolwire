@@ -41,6 +41,7 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
   const [newChanName, setNewChanName] = useState('')
   const [newChanDesc, setNewChanDesc] = useState('')
   const [showNewChanModal, setShowNewChanModal] = useState(false)
+  const [isSyncing, setIsSyncing] = useState(false)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -50,9 +51,15 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
       if (res.ok) {
         const data: Channel[] = await res.json()
         setChannels(data || [])
-        if (!activeChannelId && data && data.length > 0) {
-          setActiveChannelId(data[0].id)
-        }
+        setActiveChannelId((prev) => {
+          if (!prev && data && data.length > 0) {
+            return data[0].id
+          }
+          if (prev && data && !data.some((c) => c.id === prev) && data.length > 0) {
+            return data[0].id
+          }
+          return prev
+        })
       }
     } catch {
       // ignore
@@ -73,18 +80,26 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
 
   useEffect(() => {
     fetchChannels()
-    const interval = setInterval(() => {
-      if (activeChannelId) {
-        fetchMessages(activeChannelId)
-      }
-    }, 5000)
-    return () => clearInterval(interval)
   }, [])
 
+  // Poll channels periodically so newly created channels appear without refreshing
   useEffect(() => {
-    if (activeChannelId) {
+    const chanInterval = setInterval(() => {
+      fetchChannels()
+    }, 4000)
+    return () => clearInterval(chanInterval)
+  }, [])
+
+  // Whenever active channel changes, immediately fetch messages and poll every 2s for real-time updates
+  useEffect(() => {
+    if (!activeChannelId) return
+    fetchMessages(activeChannelId)
+
+    const msgInterval = setInterval(() => {
       fetchMessages(activeChannelId)
-    }
+    }, 2000)
+
+    return () => clearInterval(msgInterval)
   }, [activeChannelId])
 
   useEffect(() => {
@@ -190,13 +205,17 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
   }
 
   const handleManualSync = async () => {
+    setIsSyncing(true)
     try {
       await api('/api/v1/community/sync', { method: 'POST' })
+      await fetchChannels()
       if (activeChannelId) {
         await fetchMessages(activeChannelId)
       }
     } catch {
       // ignore
+    } finally {
+      setIsSyncing(false)
     }
   }
 
@@ -238,8 +257,13 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
         </div>
 
         <div style={{ marginTop: 'auto', borderTop: '1px solid var(--border-color)', paddingTop: '0.75rem' }}>
-          <button className="btn btn-secondary" style={{ width: '100%', fontSize: '0.8rem', padding: '0.4rem' }} onClick={handleManualSync}>
-            Sync Channels
+          <button
+            className="btn btn-secondary"
+            style={{ width: '100%', fontSize: '0.8rem', padding: '0.4rem' }}
+            onClick={handleManualSync}
+            disabled={isSyncing}
+          >
+            {isSyncing ? 'Syncing...' : 'Sync Channels'}
           </button>
         </div>
       </div>

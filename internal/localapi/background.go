@@ -36,6 +36,10 @@ const (
 	// retention policy: thirty days or 250 MiB, whichever binds first.
 	retentionWindow  = 30 * 24 * time.Hour
 	retentionByteCap = 250 * (1 << 20)
+
+	// communitySyncInterval exchanges community channels and messages across peers.
+	communitySyncInterval = 10 * time.Second
+	communitySyncJitter   = 5 * time.Second
 )
 
 func (s *Server) membershipLoop(ctx context.Context) {
@@ -50,6 +54,24 @@ func (s *Server) membershipLoop(ctx context.Context) {
 			return
 		case <-timer.C:
 			s.SyncMembership(ctx)
+		}
+	}
+}
+
+// communityLoop periodically exchanges community events with peers so channels
+// and messages replicate even if a direct push notification was missed.
+func (s *Server) communityLoop(ctx context.Context) {
+	s.SyncCommunityEvents(ctx)
+
+	for {
+		delay := communitySyncInterval + time.Duration(rand.Int63n(int64(communitySyncJitter)))
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			s.SyncCommunityEvents(ctx)
 		}
 	}
 }

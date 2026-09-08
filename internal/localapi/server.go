@@ -1194,7 +1194,7 @@ func (s *Server) StartBackground() {
 	s.bgCancel = cancel
 	s.mu.Unlock()
 
-	s.bgWG.Add(4)
+	s.bgWG.Add(5)
 	go func() {
 		defer s.bgWG.Done()
 		s.membershipLoop(ctx)
@@ -1210,6 +1210,10 @@ func (s *Server) StartBackground() {
 	go func() {
 		defer s.bgWG.Done()
 		s.catalogLoop(ctx)
+	}()
+	go func() {
+		defer s.bgWG.Done()
+		s.communityLoop(ctx)
 	}()
 }
 
