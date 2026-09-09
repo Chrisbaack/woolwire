@@ -44,7 +44,7 @@ synthetic digests in tests); and embedded PNG metadata in the screenshot (no
 text or EXIF chunks). Author identities were rewritten before publication;
 `refs/heads/backup/wrong-author-email` and `refs/original/refs/heads/master`
 still point at the pre-rewrite chain locally. Delete them before any
-`git push --all` or `--mirror`, or push only `master`.
+`git push --all` or `--mirror`, or push only `main`.
 
 ## After making the repository public
 
@@ -59,10 +59,11 @@ on once the repository is public. Do them in this order.
    not later.
 2. **Dependabot alerts** and **secret scanning with push protection.** Both are
    free on public repositories and neither runs Actions minutes.
-3. Confirm the default branch. It is currently `master`. Renaming it is fine;
-   the branch filter in [ci.yml](../.github/workflows/ci.yml) is the one place
-   that names it, and the links in `.github/ISSUE_TEMPLATE` use `blob/HEAD` so
-   they follow a rename on their own.
+3. Confirm the default branch. It is `main`, renamed from `master` through
+   GitHub's own rename so existing clones and links redirect. The branch filter
+   in [ci.yml](../.github/workflows/ci.yml) is the one place that names it, and
+   the links in `.github/ISSUE_TEMPLATE` use `blob/HEAD` so they followed the
+   rename on their own.
 
 Before committing:
 
