@@ -1,0 +1,69 @@
+Woolwire — quick start for a second tester
+==========================================
+
+You only need ONE file: the binary for your machine.
+
+  woolwire-linux-amd64          Linux (Intel/AMD)
+  woolwire-darwin-arm64         macOS (Apple Silicon: M1/M2/M3/M4)
+  woolwire-darwin-amd64         macOS (older Intel Macs)
+  woolwire-windows-amd64.exe    Windows
+
+No Docker, no source code, no GPU required. The web UI is built into the
+binary. You do NOT need to host a model — you can chat with one that is
+hosted by someone else in the room.
+
+--------------------------------------------------------------------
+1. Run it
+--------------------------------------------------------------------
+
+Linux / macOS — in a terminal, in the folder holding the file:
+
+    chmod +x ./woolwire-<your-platform>
+    ./woolwire-<your-platform> -state ./woolwire-state
+
+macOS extra step: the binary is unsigned, so Gatekeeper will block the
+first launch. Either right-click the file in Finder > Open > Open, or run:
+
+    xattr -d com.apple.quarantine ./woolwire-darwin-arm64
+
+Windows — in PowerShell, in the folder holding the file:
+
+    .\woolwire-windows-amd64.exe -state .\woolwire-state
+
+Windows SmartScreen may warn about an unknown publisher: choose
+"More info" > "Run anyway". Allow it through the firewall prompt if asked.
+
+Leave the terminal window open — closing it stops the app.
+
+--------------------------------------------------------------------
+2. Sign in
+--------------------------------------------------------------------
+
+The terminal prints a one-time SETUP SECRET on first start. Copy it.
+
+Open http://127.0.0.1:7070 in your browser and paste the secret.
+It works only once and is not printed again on restart.
+
+Pick a display name when asked.
+
+--------------------------------------------------------------------
+3. Join the room
+--------------------------------------------------------------------
+
+Choose "Join a room" and paste the invitation you were sent.
+
+The person who created the room must have their app running at that
+moment, or the join will fail — just retry when they are online.
+
+Treat the invitation like a password: it is what grants room access.
+
+--------------------------------------------------------------------
+Notes
+--------------------------------------------------------------------
+
+- No port forwarding or router changes are needed on either side.
+  Peers connect through relay servers on outbound HTTPS/UDP.
+- Restart later with the SAME -state folder to keep your identity,
+  room membership, and chats. Delete that folder to start over.
+- Stop the app with Ctrl+C.
+- Verify your download if you like: sha256sum -c SHA256SUMS.txt

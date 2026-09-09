@@ -27,14 +27,39 @@ The database in `state/` is local development data, not a fixture. Use a differe
 state directory for an independent identity. Never run two processes against
 the same live database or copy an identity into two simultaneously active nodes.
 
+## Build script
+
+`scripts/build.sh` runs those steps, and the container ones, in the right order.
+`scripts/build.sh --help` lists every target.
+
+```sh
+scripts/build.sh              # UI bundle, both binaries, container images, restart the stack
+scripts/build.sh binaries     # UI bundle and both binaries into bin/
+scripts/build.sh stack        # rebuild the images and restart the local Compose stack
+scripts/build.sh release      # cross-compile every published platform into dist/
+scripts/build.sh share        # assemble the tester bundle in dist/share/
+```
+
+Build output has three homes, and mixing them is the usual source of "I rebuilt
+it and nothing changed":
+
+| Path | Holds | Tracked |
+|---|---|---|
+| `web/dist` | The React bundle `web/embed.go` compiles into the binary | Yes — commit it with UI changes |
+| `bin/` | Host-native binaries for running on this machine | No |
+| `dist/` | Cross-compiled binaries, checksums, and the `share/` tester bundle | No |
+
+`dist/` uses the same file names as a tagged release, so a local build and a
+published one can be compared directly. The tester bundle's instruction sheet is
+tracked at `deploy/share/READ-ME-FIRST.txt`; the bundle itself is regenerated.
+
 ## Frontend development
 
 The working application serves React assets from the Go binary. After editing
 the UI:
 
 ```sh
-npm --prefix web run build
-CGO_ENABLED=0 go build -trimpath -o bin/woolwire ./cmd/woolwire
+scripts/build.sh binaries
 # Stop the running app, then restart this rebuilt binary with the same state.
 ./bin/woolwire -state ./state
 ```

@@ -123,6 +123,10 @@ go test -race ./...
 CGO_ENABLED=0 go build -trimpath -o bin/woolwire ./cmd/woolwire
 ```
 
+`scripts/build.sh` wraps the build half of that: it rebuilds the UI bundle and
+both binaries, and with no arguments also rebuilds the container images and
+restarts the local Compose stack. `scripts/build.sh --help` lists the targets.
+
 The Go binary embeds `web/dist`, so rebuild the frontend before rebuilding the
 binary after UI changes. See [CONTRIBUTING.md](CONTRIBUTING.md) for repository
 structure, development workflows, and documentation checks.
