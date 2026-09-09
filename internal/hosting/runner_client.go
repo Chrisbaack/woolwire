@@ -176,6 +176,7 @@ func (c *RunnerClient) StreamChat(
 	modelName string,
 	maxTokens int,
 	messages []ChatMessage,
+	thinking string,
 	onChunk func(delta string) error,
 ) error {
 	payload := map[string]any{
@@ -187,6 +188,9 @@ func (c *RunnerClient) StreamChat(
 	}
 	if maxTokens > 0 {
 		payload["max_tokens"] = maxTokens
+	}
+	if thinking != "" {
+		payload["thinking"] = thinking
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

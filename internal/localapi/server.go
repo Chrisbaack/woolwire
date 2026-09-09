@@ -94,6 +94,9 @@ type Server struct {
 	// lastCatalogSync throttles the membership refresh the catalog route does
 	// on the way in. Guarded by mu.
 	lastCatalogSync time.Time
+	// lastInventorySync throttles the managed-weights scan that every
+	// advertisement refresh would otherwise run. Guarded by mu.
+	lastInventorySync time.Time
 
 	bgCancel context.CancelFunc
 	bgWG     sync.WaitGroup
@@ -379,6 +382,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /api/v1/managed-models/artifacts/{filename...}", s.authMiddleware(s.handleDeleteArtifact))
 	s.mux.HandleFunc("GET /api/v1/managed-models/runner-health", s.authMiddleware(s.handleRunnerHealth))
 	s.mux.HandleFunc("POST /api/v1/managed-models/load", s.authMiddleware(s.handleLoadManagedModel))
+	s.mux.HandleFunc("POST /api/v1/managed-models/prepare", s.authMiddleware(s.handlePrepareManagedModel))
 	s.mux.HandleFunc("POST /api/v1/managed-models/unload", s.authMiddleware(s.handleUnloadManagedModel))
 
 	// Catalog
@@ -398,6 +402,7 @@ func (s *Server) routes() {
 	// Community
 	s.mux.HandleFunc("GET /api/v1/community/channels", s.authMiddleware(s.handleListChannels))
 	s.mux.HandleFunc("POST /api/v1/community/channels", s.authMiddleware(s.handleCreateChannel))
+	s.mux.HandleFunc("DELETE /api/v1/community/channels/{id}", s.authMiddleware(s.handleDeleteChannel))
 	s.mux.HandleFunc("GET /api/v1/community/channels/{id}/messages", s.authMiddleware(s.handleGetChannelMessages))
 	s.mux.HandleFunc("POST /api/v1/community/channels/{id}/messages", s.authMiddleware(s.handlePostMessage))
 	s.mux.HandleFunc("PUT /api/v1/community/messages/{id}", s.authMiddleware(s.handleEditMessage))
@@ -1231,10 +1236,20 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		cancel()
 	}
 	s.bgWG.Wait()
-	return s.server.Shutdown(ctx)
+	// Drain first: a graceful shutdown lets an in-flight generation finish
+	// within the caller's deadline. Closing the inference service cancels
+	// active requests, so it belongs after the drain, not before it.
+	err := s.server.Shutdown(ctx)
+	if s.infer != nil {
+		s.infer.Close()
+	}
+	return err
 }
 
 func (s *Server) Close() error {
+	if s.infer != nil {
+		s.infer.Close()
+	}
 	s.mu.Lock()
 	cancel := s.bgCancel
 	s.bgCancel = nil

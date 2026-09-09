@@ -13,6 +13,7 @@ import (
 
 	"github.com/Chrisbaack/woolwire/internal/contributions"
 	"github.com/Chrisbaack/woolwire/internal/hosting"
+	"github.com/Chrisbaack/woolwire/internal/inference"
 	"github.com/Chrisbaack/woolwire/internal/peerapi"
 	"github.com/Chrisbaack/woolwire/internal/sse"
 	"github.com/Chrisbaack/woolwire/internal/store"
@@ -201,6 +202,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		// ParentID grafts this turn onto a specific point in the tree instead
 		// of the tip of the visible branch.
 		ParentID string `json:"parent_id"`
+		Thinking string `json:"thinking"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -267,9 +269,15 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		chatMsgs = s.branchContext(convID, userMsgID)
 	}
 
+	thinking, thinkingOK := s.resolveThinking(w, body.Thinking)
+	if !thinkingOK {
+		return
+	}
+
 	s.streamGeneration(w, r, generation{
 		conv:         conv,
 		hostMemberID: body.HostMemberID,
+		thinking:     thinking,
 		modelID:      body.ModelID,
 		myMemberID:   myMemberID,
 		history:      chatMsgs,
@@ -301,6 +309,7 @@ func (s *Server) handleRegenerateMessage(w http.ResponseWriter, r *http.Request)
 	var body struct {
 		HostMemberID string `json:"host_member_id"`
 		ModelID      string `json:"model_id"`
+		Thinking     string `json:"thinking"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
@@ -347,9 +356,15 @@ func (s *Server) handleRegenerateMessage(w http.ResponseWriter, r *http.Request)
 	// the answer itself is not shown to the model.
 	history := s.branchContext(convID, target.ParentID)
 
+	thinking, thinkingOK := s.resolveThinking(w, body.Thinking)
+	if !thinkingOK {
+		return
+	}
+
 	s.streamGeneration(w, r, generation{
 		conv:         conv,
 		hostMemberID: hostMemberID,
+		thinking:     thinking,
 		modelID:      modelID,
 		myMemberID:   myMemberID,
 		history:      history,
@@ -382,6 +397,7 @@ func (s *Server) handleEditChatMessage(w http.ResponseWriter, r *http.Request) {
 		Content      string `json:"content"`
 		HostMemberID string `json:"host_member_id"`
 		ModelID      string `json:"model_id"`
+		Thinking     string `json:"thinking"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -453,9 +469,15 @@ func (s *Server) handleEditChatMessage(w http.ResponseWriter, r *http.Request) {
 		hosting.ChatMessage{Role: "user", Content: body.Content},
 	)
 
+	thinking, thinkingOK := s.resolveThinking(w, body.Thinking)
+	if !thinkingOK {
+		return
+	}
+
 	s.streamGeneration(w, r, generation{
 		conv:         conv,
 		hostMemberID: hostMemberID,
+		thinking:     thinking,
 		modelID:      modelID,
 		myMemberID:   myMemberID,
 		history:      history,
@@ -530,6 +552,21 @@ type generation struct {
 	// noSaveTurns are appended to the in-memory transcript of a privacy-mode
 	// chat once the answer completes.
 	noSaveTurns []hosting.ChatMessage
+	// thinking is how hard the requester asked the model to reason. It is the
+	// requester's choice rather than the host's, so it travels with the turn.
+	thinking inference.ThinkingLevel
+}
+
+// resolveThinking validates the reasoning level a client asked for. An
+// unrecognized value is the client's mistake and is refused here rather than
+// forwarded to an inference engine that would have to guess what it meant.
+func (s *Server) resolveThinking(w http.ResponseWriter, raw string) (inference.ThinkingLevel, bool) {
+	level, ok := inference.ParseThinkingLevel(raw)
+	if !ok {
+		http.Error(w, "thinking must be one of off, low, medium, high", http.StatusBadRequest)
+		return inference.ThinkingDefault, false
+	}
+	return level, true
 }
 
 // streamGeneration runs one inference and streams it to the browser, then
@@ -579,6 +616,7 @@ func (s *Server) streamGeneration(w http.ResponseWriter, r *http.Request, g gene
 			RequestID: requestID,
 			ModelID:   g.modelID,
 			Messages:  g.history,
+			Thinking:  string(g.thinking),
 		})
 		if reqErr != nil {
 			http.Error(w, reqErr.Error(), http.StatusBadGateway)
@@ -623,7 +661,7 @@ func (s *Server) streamGeneration(w http.ResponseWriter, r *http.Request, g gene
 		// Local requests go through the same fair queue as remote ones so the
 		// owner's own usage is visible to the limits and to the queue estimate
 		// peers see in the catalog.
-		err = s.infer.Execute(r.Context(), g.myMemberID, requestID, localModel, g.history, emit)
+		err = s.infer.Execute(r.Context(), g.myMemberID, requestID, localModel, g.history, g.thinking, emit)
 		if err != nil {
 			streamInterrupted = true
 			_ = stream.SendJSON("error", map[string]string{"error": err.Error()})

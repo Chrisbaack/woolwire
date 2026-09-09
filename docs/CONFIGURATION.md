@@ -108,6 +108,15 @@ current Go record. These are not snake_case environment variables.
 | `MaxQueuedTotal` | `10` | Waiting requests overall |
 | `QueueTimeoutSeconds` | `300` | Maximum time waiting in the queue |
 | `ExecutionTimeoutSeconds` | `600` | Maximum execution time |
+| `IdleUnloadSeconds` | `300` | How long a demand-loaded managed model stays warm |
+
+`IdleUnloadSeconds` is the one field where zero and negative are meaningful
+rather than mistakes: `-1` keeps a demand-loaded model in memory until
+something explicitly unloads it, `0` releases it as soon as the queue drains,
+and a positive value waits that many seconds after the last request. Anything
+below `-1` resets to the default. A model the owner loaded explicitly is never
+released by this timer. Changing the setting re-evaluates a release already
+scheduled under the previous one.
 
 Non-positive values are replaced with defaults when saving. Posting a partial
 object resets omitted fields to defaults, so read, edit, and send the complete

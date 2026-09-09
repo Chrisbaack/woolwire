@@ -177,3 +177,31 @@ func TestReadGGUFMetadataRejectsMalformedFiles(t *testing.T) {
 		t.Fatal("expected an error for an unsupported version")
 	}
 }
+
+// TestChatTemplateThinkingDetection pins the signal the chat UI depends on.
+// Nothing else in a GGUF header says whether a model reasons, and each family
+// spells the template branch differently.
+func TestChatTemplateThinkingDetection(t *testing.T) {
+	reasoning := map[string]string{
+		"qwen3":      `{%- if enable_thinking is defined and enable_thinking %}<think>{%- endif %}`,
+		"gpt-oss":    `{{- "Reasoning: " + reasoning_effort + "\n\n" }}`,
+		"deepseek":   `{%- if add_generation_prompt %}{{'<think>\n'}}{%- endif %}`,
+		"mixed-case": `{%- if ENABLE_THINKING %}x{%- endif %}`,
+	}
+	for name, tmpl := range reasoning {
+		if !chatTemplateSupportsThinking(tmpl) {
+			t.Errorf("%s template was not recognized as a reasoning one", name)
+		}
+	}
+
+	plain := map[string]string{
+		"llama":     `{%- for message in messages %}{{ message.content }}{%- endfor %}`,
+		"empty":     ``,
+		"near-miss": `{{ "I have been thinking about lunch" }}`,
+	}
+	for name, tmpl := range plain {
+		if chatTemplateSupportsThinking(tmpl) {
+			t.Errorf("%s template was wrongly treated as a reasoning one", name)
+		}
+	}
+}

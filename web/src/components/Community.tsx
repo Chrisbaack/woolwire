@@ -7,6 +7,7 @@ interface Channel {
   name: string
   description: string
   created_at: number
+  created_by?: string
 }
 
 interface MaterializedMessage {
@@ -42,6 +43,31 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
   const [newChanDesc, setNewChanDesc] = useState('')
   const [showNewChanModal, setShowNewChanModal] = useState(false)
   const [isSyncing, setIsSyncing] = useState(false)
+  const [deletingChannelId, setDeletingChannelId] = useState<string | null>(null)
+  const [channelError, setChannelError] = useState('')
+
+  // #general has no channel event behind it — every node derives the same
+  // fixed id — so there is nothing for a deletion to undo.
+  const canDeleteChannel = (ch: Channel) =>
+    ch.id !== 'chan-general' && (role === 'creator' || (!!currentMemberID && ch.created_by === currentMemberID))
+
+  const handleDeleteChannel = async (ch: Channel) => {
+    if (!window.confirm(`Delete #${ch.name} for everyone in the room? Its messages go with it.`)) return
+    setDeletingChannelId(ch.id)
+    setChannelError('')
+    try {
+      const res = await api(`/api/v1/community/channels/${ch.id}`, { method: 'DELETE' })
+      if (!res.ok) {
+        setChannelError((await res.text()) || 'Could not delete the channel.')
+        return
+      }
+      await fetchChannels()
+    } catch {
+      setChannelError('Could not delete the channel.')
+    } finally {
+      setDeletingChannelId(null)
+    }
+  }
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -249,12 +275,29 @@ export const Community: React.FC<CommunityProps> = ({ currentMemberID, role }) =
                 cursor: 'pointer',
                 fontWeight: activeChannelId === ch.id ? 600 : 400,
                 fontSize: '0.9rem',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '0.5rem',
               }}
             >
-              # {ch.name}
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}># {ch.name}</span>
+              {canDeleteChannel(ch) && (
+                <button
+                  className="btn btn-secondary"
+                  aria-label={`Delete channel ${ch.name}`}
+                  title="Delete this channel for everyone"
+                  disabled={deletingChannelId === ch.id}
+                  style={{ padding: '0.1rem 0.4rem', fontSize: '0.75rem', lineHeight: 1.4, flex: '0 0 auto' }}
+                  onClick={(e) => { e.stopPropagation(); handleDeleteChannel(ch) }}
+                >
+                  {deletingChannelId === ch.id ? '…' : '✕'}
+                </button>
+              )}
             </div>
           ))}
         </div>
+        {channelError && <div role="alert" className="alert alert-error" style={{ fontSize: '0.8rem' }}>{channelError}</div>}
 
         <div style={{ marginTop: 'auto', borderTop: '1px solid var(--border-color)', paddingTop: '0.75rem' }}>
           <button

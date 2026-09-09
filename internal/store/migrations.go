@@ -214,4 +214,65 @@ var migrations = []string{
 	), '');
 
 	CREATE INDEX IF NOT EXISTS idx_messages_conv_parent ON messages(conversation_id, parent_id);`,
+
+	// Migration 007: managed model load configuration. The runner may be
+	// unloaded between requests (or restarted), so the complete load request
+	// belongs with the hosted-model record rather than in process memory.
+	`ALTER TABLE hosted_models ADD COLUMN filename TEXT NOT NULL DEFAULT '';
+	ALTER TABLE hosted_models ADD COLUMN threads INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE hosted_models ADD COLUMN gpu_layers INTEGER;
+	ALTER TABLE hosted_models ADD COLUMN projector TEXT NOT NULL DEFAULT '';
+	ALTER TABLE hosted_models ADD COLUMN draft_model TEXT NOT NULL DEFAULT '';
+	ALTER TABLE hosted_models ADD COLUMN extra_args TEXT NOT NULL DEFAULT '';`,
+
+	// Migration 008: how long a demand-loaded engine stays warm. Negative
+	// keeps it loaded until an explicit unload, zero releases it as soon as
+	// the queue drains, and the default preserves the five minutes that were
+	// hardcoded before the owner could choose.
+	`ALTER TABLE host_limits ADD COLUMN idle_unload_seconds INTEGER NOT NULL DEFAULT 300;`,
+
+	// Migration 009: whether a managed model's own chat template has a
+	// reasoning path. It decides whether a requester is offered a thinking
+	// level at all, so it travels with the model rather than being re-derived
+	// from the weights on every catalog read.
+	`ALTER TABLE hosted_models ADD COLUMN supports_thinking INTEGER NOT NULL DEFAULT 0;`,
+
+	// Migration 010: a channel can be deleted. The event log is the record of
+	// what the room has, so a withdrawal has to be an event like the
+	// announcement it undoes, and community_events must admit its type. The
+	// channel's author is recorded alongside it so the local rows can answer
+	// who may delete one without replaying the log first.
+	`ALTER TABLE community_channels ADD COLUMN created_by TEXT NOT NULL DEFAULT '';
+
+	CREATE TABLE community_events_v3 (
+		id TEXT PRIMARY KEY,
+		room_id TEXT NOT NULL,
+		channel_id TEXT NOT NULL,
+		author_member_id TEXT NOT NULL,
+		author_seq INTEGER NOT NULL,
+		event_type TEXT NOT NULL CHECK (event_type IN ('message', 'edit', 'delete', 'tombstone', 'channel', 'channel_delete')),
+		target_event_id TEXT,
+		content TEXT NOT NULL,
+		timestamp INTEGER NOT NULL,
+		signature TEXT NOT NULL,
+		replicated_status TEXT NOT NULL DEFAULT 'local' CHECK (replicated_status IN ('local', 'pending', 'replicated')),
+		created_at INTEGER NOT NULL,
+		sig_version INTEGER NOT NULL DEFAULT 0
+	);
+
+	INSERT INTO community_events_v3 (
+		id, room_id, channel_id, author_member_id, author_seq, event_type,
+		target_event_id, content, timestamp, signature, replicated_status,
+		created_at, sig_version
+	)
+		SELECT id, room_id, channel_id, author_member_id, author_seq, event_type,
+		       target_event_id, content, timestamp, signature, replicated_status,
+		       created_at, sig_version
+		FROM community_events;
+
+	DROP TABLE community_events;
+	ALTER TABLE community_events_v3 RENAME TO community_events;
+
+	CREATE INDEX IF NOT EXISTS idx_community_events_channel ON community_events(channel_id, timestamp);
+	CREATE INDEX IF NOT EXISTS idx_community_events_author ON community_events(room_id, author_member_id, author_seq);`,
 }

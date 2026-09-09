@@ -117,8 +117,10 @@ in at **http://127.0.0.1:7070**. Create or join a room, then open **Settings**:
 1. Check runner status.
 2. Select discovered weights, or use the Hugging Face repository resolver to
    choose a GGUF download. Wait for the download job to complete.
-3. Load the model, setting context and generation limits that fit your hardware.
-4. Return to the Meadow and start a conversation.
+3. Prepare the model for sharing, setting context and generation limits that
+   fit your hardware. Preparing saves its configuration without loading weights.
+4. Return to the Meadow and start a conversation. An unloaded model starts on
+   its host when a request arrives; the first response includes that startup time.
 
 Both services default to a 4-CPU / 8192-MiB container ceiling in this profile.
 Larger weights or context windows may require changing those limits in Compose
@@ -322,9 +324,9 @@ docker compose -f deploy/base/compose.yaml up -d --build
 ```
 
 For managed hosting, use the same commands with
-`--env-file deploy/managed/.env -f deploy/managed/compose.yaml` and review model
-reload needs after a runner restart. Loading a model is runtime engine state;
-do not assume restarting the runner loads the previous weights automatically.
+`--env-file deploy/managed/.env -f deploy/managed/compose.yaml`. Prepared models
+retain their saved load settings across restarts. Weights load on the next
+request, so restarting the runner does not require keeping GPU memory occupied.
 
 Take a [backup](BACKUP_RESTORE.md) before an upgrade. `down` removes containers
 and networks; `down --volumes` also removes named data volumes. Retain the old

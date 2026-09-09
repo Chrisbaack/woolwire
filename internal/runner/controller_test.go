@@ -31,6 +31,11 @@ type fakeEngine struct {
 	launches   atomic.Int32
 	lastArgs   atomic.Pointer[EngineArgs]
 	lastBody   atomic.Pointer[map[string]any]
+	// stall, when non-nil, holds a completion open until it is closed, so a
+	// test can decide what arrives while the engine is mid-generation.
+	// entered reports that a request reached the engine.
+	stall   chan struct{}
+	entered chan struct{}
 }
 
 func newFakeEngine(t *testing.T, readyAfter time.Duration) *fakeEngine {
@@ -57,6 +62,18 @@ func newFakeEngine(t *testing.T, readyAfter time.Duration) *fakeEngine {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		fe.lastBody.Store(&body)
+
+		if fe.stall != nil {
+			select {
+			case fe.entered <- struct{}{}:
+			default:
+			}
+			select {
+			case <-fe.stall:
+			case <-r.Context().Done():
+				return
+			}
+		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
@@ -935,5 +952,168 @@ func TestHealthReportsInferenceStats(t *testing.T) {
 	}
 	if got["processing"] != false {
 		t.Errorf("processing = %v, want false once the request finished", got["processing"])
+	}
+}
+
+// TestLifecycleWaitsForAnActiveGeneration is the regression for swapping the
+// engine out from under a stream. An unload arriving mid-generation used to
+// stop llama-server immediately, so the request that was already streaming
+// died and reported a backend failure to the member who asked for it.
+func TestLifecycleWaitsForAnActiveGeneration(t *testing.T) {
+	fe := newFakeEngine(t, 0)
+	fe.stall = make(chan struct{})
+	fe.entered = make(chan struct{}, 1)
+	modelDir := writeDummyModel(t)
+	_, client, base := newTestController(t, fe, modelDir)
+
+	// The engine must be released however this test ends. A bail-out that left
+	// the stream stalled would hang closing the test servers instead of
+	// failing, which is the worst way for a regression to report itself.
+	// Cleanups run last-registered-first, so registering here — after the
+	// servers — means this runs before they are closed.
+	var released bool
+	release := func() {
+		if !released {
+			released = true
+			close(fe.stall)
+		}
+	}
+	t.Cleanup(release)
+
+	load := do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
+		"model_id": "m1", "filename": "tiny.gguf",
+	})
+	load.Body.Close()
+	if load.StatusCode != http.StatusOK {
+		t.Fatalf("load returned %d", load.StatusCode)
+	}
+
+	inferDone := make(chan int, 1)
+	go func() {
+		resp := do(t, client, "POST", base+"/runner/v1/inference", map[string]any{
+			"model_id": "m1", "model": "m1",
+			"messages": []map[string]string{{"role": "user", "content": "hi"}},
+		})
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		inferDone <- resp.StatusCode
+	}()
+
+	select {
+	case <-fe.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the engine")
+	}
+
+	// An unload that cannot wait must give up rather than cut the stream. It
+	// waits on its own context, so a caller that walks away is not left
+	// holding a request the engine will never answer.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	req, err := http.NewRequestWithContext(ctx, "POST", base+"/runner/v1/models/unload", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer runner-token")
+	unload, err := client.Do(req)
+	cancel()
+	if err == nil {
+		defer unload.Body.Close()
+		if unload.StatusCode != http.StatusRequestTimeout {
+			t.Fatalf("unload during a generation returned %d, want it to wait and time out", unload.StatusCode)
+		}
+	}
+
+	if fe.launches.Load() != 1 {
+		t.Fatalf("the engine was replaced %d times during a generation", fe.launches.Load())
+	}
+
+	release()
+	select {
+	case code := <-inferDone:
+		if code != http.StatusOK {
+			t.Fatalf("the generation finished with %d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the generation never finished")
+	}
+
+	// With the stream done, the same request goes through.
+	after := do(t, client, "POST", base+"/runner/v1/models/unload", nil)
+	defer after.Body.Close()
+	if after.StatusCode != http.StatusOK {
+		t.Fatalf("unload after the generation returned %d", after.StatusCode)
+	}
+}
+
+// TestInferenceForwardsTheThinkingLevel checks what actually reaches
+// llama-server. The families spell reasoning control differently, so the
+// request carries every name a template might read, and "off" must turn the
+// thinking branch off rather than ask for less of it.
+func TestInferenceForwardsTheThinkingLevel(t *testing.T) {
+	for _, tc := range []struct {
+		level          string
+		wantEffort     any
+		wantThinkingOn any
+		wantKwargs     bool
+	}{
+		{level: "", wantKwargs: false},
+		{level: "off", wantThinkingOn: false, wantKwargs: true},
+		{level: "high", wantEffort: "high", wantThinkingOn: true, wantKwargs: true},
+	} {
+		t.Run("level="+tc.level, func(t *testing.T) {
+			fe := newFakeEngine(t, 0)
+			modelDir := writeDummyModel(t)
+			_, client, base := newTestController(t, fe, modelDir)
+
+			load := do(t, client, "POST", base+"/runner/v1/models/load", map[string]any{
+				"model_id": "m1", "filename": "tiny.gguf",
+			})
+			load.Body.Close()
+
+			body := map[string]any{
+				"model_id": "m1", "model": "m1",
+				"messages": []map[string]string{{"role": "user", "content": "hi"}},
+			}
+			if tc.level != "" {
+				body["thinking"] = tc.level
+			}
+			resp := do(t, client, "POST", base+"/runner/v1/inference", body)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("inference returned %d", resp.StatusCode)
+			}
+
+			sent := fe.lastBody.Load()
+			if sent == nil {
+				t.Fatal("the engine was never called")
+			}
+			raw, hasKwargs := (*sent)["chat_template_kwargs"]
+			if hasKwargs != tc.wantKwargs {
+				t.Fatalf("chat_template_kwargs present=%v, want %v (%v)", hasKwargs, tc.wantKwargs, *sent)
+			}
+			if !tc.wantKwargs {
+				if _, ok := (*sent)["reasoning_effort"]; ok {
+					t.Fatal("a request with no thinking level asked for a reasoning effort")
+				}
+				return
+			}
+			kwargs, ok := raw.(map[string]any)
+			if !ok {
+				t.Fatalf("chat_template_kwargs is %T", raw)
+			}
+			if kwargs["enable_thinking"] != tc.wantThinkingOn || kwargs["thinking"] != tc.wantThinkingOn {
+				t.Fatalf("thinking flags = %v, want %v", kwargs, tc.wantThinkingOn)
+			}
+			if tc.wantEffort == nil {
+				if _, ok := (*sent)["reasoning_effort"]; ok {
+					t.Fatal("turning thinking off must not also ask for a reasoning effort")
+				}
+				return
+			}
+			if (*sent)["reasoning_effort"] != tc.wantEffort || kwargs["reasoning_effort"] != tc.wantEffort {
+				t.Fatalf("reasoning_effort = %v / %v, want %v", (*sent)["reasoning_effort"], kwargs["reasoning_effort"], tc.wantEffort)
+			}
+		})
 	}
 }

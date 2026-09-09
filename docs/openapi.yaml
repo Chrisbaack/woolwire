@@ -149,6 +149,24 @@ components:
         enabled: { type: boolean }
         published: { type: boolean }
         revision: { type: integer }
+        filename:
+          type: string
+          description: Saved relative weight path for managed models.
+        threads: { type: integer }
+        gpu_layers:
+          type: integer
+          description: Saved managed offload setting; omitted lets the runner choose.
+        projector: { type: string }
+        draft_model: { type: string }
+        extra_args:
+          type: array
+          items: { type: string }
+        supports_thinking:
+          type: boolean
+          description: |
+            The model's own chat template has a reasoning path, read from the
+            weights rather than configured. A request may then ask it for a
+            thinking level.
         allow_private_network:
           type: boolean
           description: |
@@ -197,9 +215,21 @@ components:
         context_limit: { type: integer }
         availability:
           type: string
-          enum: [ready, busy, offline]
+          enum: [ready, unloaded, busy, offline]
+          description: |
+            Unloaded managed models have prepared weights on disk and load on
+            demand. Ready means loaded for managed models; for external models
+            it indicates an available endpoint. Offline models are not usable.
         queue_estimate: { type: integer }
         is_managed: { type: boolean }
+        supports_thinking:
+          type: boolean
+          description: |
+            This model can be asked how hard to think. Unlike the rest of the
+            advertisement this field is outside the signed payload, so that
+            adding it did not invalidate advertisements from hosts that have
+            not updated; a catalog read accepts an advertisement only from the
+            member proven to own it.
         timestamp: { type: integer, format: int64 }
         signature: { type: string }
         sig_version: { type: integer }
@@ -732,6 +762,7 @@ paths:
                   MaxQueuedTotal: { type: integer }
                   QueueTimeoutSeconds: { type: integer }
                   ExecutionTimeoutSeconds: { type: integer }
+                  IdleUnloadSeconds: { type: integer }
         '401': { $ref: '#/components/responses/Unauthorized' }
     post:
       tags: [models]
@@ -739,6 +770,13 @@ paths:
       description: |
         Applies to the shared queue immediately. Uses PascalCase record keys.
         Omitted or non-positive fields reset to defaults; send the whole record.
+
+        IdleUnloadSeconds is the exception, because zero and negative are both
+        meaningful there: how long a demand-loaded managed model stays warm
+        once the queue drains. -1 keeps it loaded until an explicit unload, 0
+        releases it as soon as the queue drains, and a positive value waits
+        that many seconds. Anything below -1 resets to the default of 300. A
+        model an owner loaded explicitly is never released by this timer.
       parameters:
         - $ref: '#/components/parameters/csrfHeader'
       requestBody:
@@ -1181,6 +1219,64 @@ paths:
                   host_queued_requests: { type: integer }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  /api/v1/managed-models/prepare:
+    post:
+      tags: [models]
+      summary: Prepare downloaded weights for on-demand hosting
+      description: |
+        Saves the model configuration without loading weights. Enabled, published
+        models with available files appear in the catalog as unloaded until a
+        request loads them. Downloads alone do not opt a model into sharing.
+      parameters:
+        - $ref: '#/components/parameters/csrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model_id, filename]
+              properties:
+                model_id: { type: string }
+                name: { type: string }
+                filename: { type: string }
+                context_limit: { type: integer }
+                max_tokens: { type: integer }
+                threads: { type: integer }
+                gpu_layers:
+                  type: integer
+                  description: Omit for runner hardware-based offload; 0 forces CPU.
+                projector:
+                  type: string
+                  description: |
+                    Set only to override the multimodal projector; the matching
+                    companion file is looked up from the model otherwise.
+                draft_model:
+                  type: string
+                  description: Draft module for speculative decoding, looked up when omitted.
+                extra_args:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    Additional llama-server tuning flags. Only an allow-list of
+                    documented tuning switches is accepted; path, networking,
+                    authentication, and model-selection flags are rejected with
+                    400. A flag needing a value takes it inline
+                    ("--batch-size=512") or as the next element.
+                published:
+                  type: boolean
+                  description: Explicit sharing opt-in; omitted preserves an existing choice.
+      responses:
+        '200':
+          description: Successful response.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HostedModel' }
+        '400': { description: 'Missing model_id or filename, an invalid filename, or a rejected tuning flag.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: 'The model''s weights are not downloaded on this host.' }
+        '500': { description: 'The downloaded inventory could not be read, or the record could not be saved.' }
+
   /api/v1/managed-models/load:
     post:
       tags: [models]
@@ -1188,7 +1284,8 @@ paths:
       description: |
         Waits for the engine to report healthy, then creates or updates the
         hosted-model row so the model appears in the catalog and can be
-        served to peers.
+        served to peers. Other prepared models remain available for on-demand
+        loading after the current request finishes.
       parameters:
         - $ref: '#/components/parameters/csrfHeader'
       requestBody:
@@ -1217,7 +1314,9 @@ paths:
                     authentication, and model-selection flags are rejected with
                     400. A flag needing a value takes it inline
                     ("--batch-size=512") or as the next element.
-                published: { type: boolean }
+                published:
+                  type: boolean
+                  description: Explicit sharing opt-in; omitted preserves an existing choice.
       responses:
         '200':
           description: Successful response.
@@ -1231,7 +1330,11 @@ paths:
   /api/v1/managed-models/unload:
     post:
       tags: [models]
-      summary: Unload the runner's model and withdraw its advertisement
+      summary: Unload weights while retaining on-demand availability
+      description: |
+        Releases the loaded model after active inference finishes. Prepared,
+        enabled, published models remain available as unloaded. Disable or
+        unpublish a model to stop offering it.
       parameters:
         - $ref: '#/components/parameters/csrfHeader'
       responses:
@@ -1321,6 +1424,17 @@ paths:
                 content: { type: string }
                 host_member_id: { type: string }
                 model_id: { type: string }
+                parent_id:
+                  type: string
+                  description: Grafts the turn onto a specific point in the tree.
+                thinking:
+                  type: string
+                  enum: ["", off, low, medium, high]
+                  description: |
+                    How hard the model should think. Empty leaves the model's
+                    own default alone. Only meaningful for a model whose
+                    advertisement sets supports_thinking; it is dropped for
+                    any other, and an unrecognized value is a 400.
       responses:
         '200':
           description: SSE stream.
@@ -1390,13 +1504,17 @@ paths:
               properties:
                 host_member_id: { type: string }
                 model_id: { type: string }
+                thinking:
+                  type: string
+                  enum: ["", off, low, medium, high]
+                  description: How hard the model should think; see the send route.
       responses:
         '200':
           description: Server-sent event stream of the new answer.
           content:
             text/event-stream:
               schema: { type: string }
-        '400': { description: Not an assistant message, or a no-save conversation. }
+        '400': { description: 'Not an assistant message, or a no-save conversation.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: Conversation or message not found. }
         '503': { description: The selected model is offline or the host is unreachable. }
@@ -1433,13 +1551,17 @@ paths:
                 content: { type: string }
                 host_member_id: { type: string }
                 model_id: { type: string }
+                thinking:
+                  type: string
+                  enum: ["", off, low, medium, high]
+                  description: How hard the model should think; see the send route.
       responses:
         '200':
           description: Server-sent event stream of the answer to the edited question.
           content:
             text/event-stream:
               schema: { type: string }
-        '400': { description: Not a user message, empty content, or a no-save conversation. }
+        '400': { description: 'Not a user message, empty content, or a no-save conversation.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: Conversation or message not found. }
         '503': { description: The selected model is offline or the host is unreachable. }
@@ -1497,6 +1619,29 @@ paths:
       responses:
         '200': { description: Channel created. }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/community/channels/{id}:
+    delete:
+      tags: [community]
+      summary: Delete a channel
+      description: |
+        Publishes a signed `channel_delete` event, so the channel is withdrawn
+        on every node rather than only on this one. The member who created a
+        channel may delete it, and the room's creator may delete any. The
+        implicit `chan-general` channel has no announcement to undo and cannot
+        be deleted.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/csrfHeader'
+      responses:
+        '200': { description: Channel deleted. }
+        '400': { description: 'Missing channel id, or an attempt to delete the general channel.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: 'Not the channel''s author, and not the room''s creator.' }
+        '404': { description: No such channel in this room. }
 
   /api/v1/community/channels/{id}/messages:
     get:
@@ -1798,6 +1943,15 @@ paths:
                   type: array
                   items: { $ref: '#/components/schemas/ChatMessage' }
                 stream: { type: boolean }
+                reasoning_effort:
+                  type: string
+                  enum: ["", off, low, medium, high]
+                  description: |
+                    How hard the model should think. Empty leaves the model's
+                    own default alone, and the value is dropped for a model
+                    that does not advertise supports_thinking. "off" is the one
+                    spelling OpenAI does not define: it turns the model's
+                    thinking branch off rather than asking for less of it.
       responses:
         '200':
           description: A completion object, or an SSE stream when `stream` is set.

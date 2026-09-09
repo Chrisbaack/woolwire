@@ -31,6 +31,10 @@ type ChatRequest struct {
 	MaxTokens           int
 	Messages            []ChatMessage
 	AllowPrivateNetwork bool
+	// ReasoningEffort is the OpenAI spelling of a thinking level: low, medium
+	// or high. It is sent only when the requester asked for one, because a
+	// strict endpoint rejects fields it does not know.
+	ReasoningEffort string
 }
 
 // ExternalAdapter talks to owner-configured OpenAI-compatible endpoints. It
@@ -260,6 +264,9 @@ func (a *ExternalAdapter) StreamChat(
 	}
 	if req.MaxTokens > 0 {
 		reqBody["max_tokens"] = req.MaxTokens
+	}
+	if req.ReasoningEffort != "" {
+		reqBody["reasoning_effort"] = req.ReasoningEffort
 	}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {

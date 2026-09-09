@@ -499,3 +499,85 @@ func TestContributionsSyncSameTimestampAcrossPageAndOutOfOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestChannelDeletionRepliesToAuthorityAndReplicates covers the whole rule: a
+// member may withdraw the channel they announced and not someone else's, the
+// room's creator may withdraw either, the withdrawal reaches the other node,
+// and #general is not withdrawable at all because no event created it.
+func TestChannelDeletionRepliesToAuthorityAndReplicates(t *testing.T) {
+	vNet := transport.NewMemoryNetwork()
+	const peerPort = 4274
+
+	creator := setupTestNode(t, vNet, "del-a", peerPort)
+	creator.login(t)
+	_, invitation := creator.hostRoom(t, "Alice", "Deletion Room")
+
+	member := setupTestNode(t, vNet, "del-b", peerPort)
+	member.login(t)
+	if w := member.joinRoom(t, "Bob", invitation); w.Code != http.StatusOK {
+		t.Fatalf("member join failed: %d %s", w.Code, w.Body.String())
+	}
+
+	newChannel := func(node *testNode, name string) store.ChannelRecord {
+		t.Helper()
+		w := node.doJSON("POST", "/api/v1/community/channels", map[string]string{"name": name})
+		if w.Code != http.StatusOK {
+			t.Fatalf("create %s: %d %s", name, w.Code, w.Body.String())
+		}
+		var rec store.ChannelRecord
+		_ = json.NewDecoder(w.Body).Decode(&rec)
+		return rec
+	}
+	channelIDs := func(node *testNode) map[string]bool {
+		t.Helper()
+		w := node.doJSON("GET", "/api/v1/community/channels", nil)
+		var list []store.ChannelRecord
+		_ = json.NewDecoder(w.Body).Decode(&list)
+		ids := map[string]bool{}
+		for _, ch := range list {
+			ids[ch.ID] = true
+		}
+		return ids
+	}
+
+	mine := newChannel(member, "#bobs-corner")
+	theirs := newChannel(creator, "#alices-corner")
+	creator.localSrv.SyncCommunityEvents(context.Background())
+	member.localSrv.SyncCommunityEvents(context.Background())
+
+	// #general has no announcement to undo.
+	if w := member.doJSON("DELETE", "/api/v1/community/channels/chan-general", nil); w.Code != http.StatusBadRequest {
+		t.Fatalf("deleting #general returned %d, want 400", w.Code)
+	}
+
+	// A member may not withdraw a channel someone else announced.
+	if w := member.doJSON("DELETE", "/api/v1/community/channels/"+theirs.ID, nil); w.Code != http.StatusForbidden {
+		t.Fatalf("member deleting the creator's channel returned %d, want 403", w.Code)
+	}
+
+	// A member may withdraw their own, and it reaches the other node.
+	if w := member.doJSON("DELETE", "/api/v1/community/channels/"+mine.ID, nil); w.Code != http.StatusOK {
+		t.Fatalf("member deleting their own channel: %d %s", w.Code, w.Body.String())
+	}
+	if channelIDs(member)[mine.ID] {
+		t.Fatal("the author still sees the channel they deleted")
+	}
+	creator.localSrv.SyncCommunityEvents(context.Background())
+	if channelIDs(creator)[mine.ID] {
+		t.Fatal("the deletion did not replicate to the other node")
+	}
+
+	// The room's creator may withdraw a channel regardless of who made it.
+	other := newChannel(member, "#bobs-other-corner")
+	creator.localSrv.SyncCommunityEvents(context.Background())
+	if !channelIDs(creator)[other.ID] {
+		t.Fatalf("the creator never saw #bobs-other-corner")
+	}
+	if w := creator.doJSON("DELETE", "/api/v1/community/channels/"+other.ID, nil); w.Code != http.StatusOK {
+		t.Fatalf("creator deleting a member's channel: %d %s", w.Code, w.Body.String())
+	}
+	member.localSrv.SyncCommunityEvents(context.Background())
+	if channelIDs(member)[other.ID] {
+		t.Fatal("the creator's deletion did not replicate back to the author")
+	}
+}

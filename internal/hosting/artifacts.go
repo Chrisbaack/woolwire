@@ -53,6 +53,9 @@ type ArtifactManifest struct {
 	RepoID string `json:"repo_id,omitempty"`
 	// Architecture is the model family reported by the GGUF header.
 	Architecture string `json:"architecture,omitempty"`
+	// SupportsThinking reports that the model's chat template has a reasoning
+	// path, so a request may ask it to think harder or not at all.
+	SupportsThinking bool `json:"supports_thinking,omitempty"`
 	// Role separates models from the files that support one.
 	Role string `json:"role,omitempty"`
 	// Companions are the supporting files installed with this model.
@@ -831,9 +834,26 @@ func (m *ArtifactManager) ListArtifacts() ([]ArtifactManifest, error) {
 	// finds it too. Its manifest is the better record — it has the verified
 	// hash and the source URL — so it wins.
 	claimed := make(map[string]bool, len(installed))
-	for _, mf := range installed {
-		if real, err := filepath.EvalSymlinks(filepath.Join(m.modelsDir, filepath.FromSlash(mf.Path))); err == nil {
+	for i := range installed {
+		abs := filepath.Join(m.modelsDir, filepath.FromSlash(installed[i].Path))
+		if real, err := filepath.EvalSymlinks(abs); err == nil {
 			claimed[real] = true
+		}
+		// A download records what was fetched, not what the weights say, so a
+		// manifest written at install time knows nothing about the model
+		// itself. The header answers that — above all whether the model
+		// reasons — and the parse is cached per file, so asking is cheap.
+		info, statErr := os.Stat(abs)
+		if statErr != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		md, mdErr := m.ggufCache.lookup(abs, info)
+		if mdErr != nil {
+			continue
+		}
+		installed[i].SupportsThinking = md.SupportsThinking
+		if installed[i].Architecture == "" {
+			installed[i].Architecture = md.Architecture
 		}
 	}
 

@@ -63,21 +63,115 @@ func (s *Server) materializeChannels(roomID string) {
 
 	events := make([]community.Event, 0, len(records))
 	for _, rec := range records {
-		if rec.EventType != string(community.EventChannel) {
-			continue
+		switch rec.EventType {
+		case string(community.EventChannel), string(community.EventChannelDelete):
+			events = append(events, peerapi.EventFromRecord(rec))
 		}
-		events = append(events, peerapi.EventFromRecord(rec))
 	}
 
-	for _, ch := range community.Materialize(events).Channels {
+	result := community.Materialize(events)
+	for _, ch := range result.Channels {
 		_ = s.store.SaveChannel(store.ChannelRecord{
 			ID:          ch.ID,
 			RoomID:      ch.RoomID,
 			Name:        ch.Name,
 			Description: ch.Description,
 			CreatedAt:   ch.CreatedAt,
+			CreatedBy:   ch.AuthorMemberID,
 		})
 	}
+	// A withdrawal has to remove the row, not just stop adding it: the channel
+	// was already stored on every node that saw it announced.
+	for _, id := range result.DeletedChannels {
+		_ = s.store.DeleteChannel(id)
+	}
+}
+
+// generalChannelID is the room's implicit channel. It is created without an
+// event — every node derives the same fixed ID — so there is no announcement
+// for a deletion to undo, and the list would simply recreate it.
+const generalChannelID = "chan-general"
+
+// handleDeleteChannel withdraws a channel from the room. A member may delete a
+// channel they announced; the room's creator may delete any.
+func (s *Server) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("id")
+	if channelID == "" {
+		http.Error(w, "channel id required", http.StatusBadRequest)
+		return
+	}
+	if channelID == generalChannelID {
+		http.Error(w, "the general channel cannot be deleted", http.StatusBadRequest)
+		return
+	}
+
+	roomRec, err := s.store.GetRoomState()
+	if err != nil || roomRec == nil {
+		http.Error(w, "no active room", http.StatusBadRequest)
+		return
+	}
+
+	device, err := s.store.GetDeviceIdentity()
+	if err != nil || device == nil {
+		http.Error(w, "device identity missing", http.StatusInternalServerError)
+		return
+	}
+	myMemberID, err := peerapi.MemberIDForDevicePublic(device.DevicePublic)
+	if err != nil {
+		http.Error(w, "device identity is malformed", http.StatusInternalServerError)
+		return
+	}
+
+	// Fold in anything replicated since the last read, so the author this
+	// decision rests on is the one the log records rather than a stale row.
+	s.materializeChannels(roomRec.RoomID)
+	channels, err := s.store.ListChannels(roomRec.RoomID)
+	if err != nil {
+		http.Error(w, "failed to query channels", http.StatusInternalServerError)
+		return
+	}
+	var target *store.ChannelRecord
+	for i := range channels {
+		if channels[i].ID == channelID {
+			target = &channels[i]
+			break
+		}
+	}
+	if target == nil {
+		http.Error(w, "channel not found", http.StatusNotFound)
+		return
+	}
+
+	isCreator := roomRec.Role == "creator" && len(roomRec.AuthorityPrivate) > 0
+	if target.CreatedBy != myMemberID && !isCreator {
+		http.Error(w, "only the channel's author or the room's creator can delete it", http.StatusForbidden)
+		return
+	}
+
+	seq, _ := s.store.GetLatestAuthorSeq(roomRec.RoomID, myMemberID)
+	event := community.Event{
+		RoomID:         roomRec.RoomID,
+		ChannelID:      channelID,
+		AuthorMemberID: myMemberID,
+		AuthorSeq:      seq + 1,
+		EventType:      community.EventChannelDelete,
+		Content:        "",
+		Timestamp:      time.Now().Unix(),
+	}
+	if err := event.Sign(ed25519.PrivateKey(device.DevicePrivate)); err != nil {
+		http.Error(w, "sign channel deletion failed", http.StatusInternalServerError)
+		return
+	}
+	if err := s.store.SaveEvent(peerapi.EventRecord(event, "local")); err != nil {
+		http.Error(w, "failed to save channel deletion", http.StatusInternalServerError)
+		return
+	}
+
+	s.materializeChannels(roomRec.RoomID)
+	go s.SyncCommunityEvents(context.Background())
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
 // handleCreateChannel publishes a signed channel event so the channel exists
@@ -149,6 +243,7 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		Name:        cleanName,
 		Description: strings.TrimSpace(body.Description),
 		CreatedAt:   event.Timestamp,
+		CreatedBy:   myMemberID,
 	}
 	if err := s.store.SaveChannel(ch); err != nil {
 		http.Error(w, "failed to save channel", http.StatusInternalServerError)

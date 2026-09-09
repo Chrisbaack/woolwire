@@ -20,11 +20,22 @@ type ModelAd struct {
 	Name          string `json:"name"`
 	Quantization  string `json:"quantization,omitempty"`
 	ContextLimit  int    `json:"context_limit"`
-	Availability  string `json:"availability"` // "ready", "busy", "offline"
+	Availability  string `json:"availability"` // "ready", "unloaded", "busy", "offline"
 	QueueEstimate int    `json:"queue_estimate"`
 	IsManaged     bool   `json:"is_managed"`
-	Timestamp     int64  `json:"timestamp"`
-	Signature     string `json:"signature"`
+	// SupportsThinking tells a requester that this model can be asked to
+	// reason, so the chat view can offer a thinking level for it.
+	//
+	// It is deliberately outside Payload, and so unsigned. Adding a field to
+	// the canonical payload would make every advertisement from an updated
+	// host fail verification on a peer that has not updated, and the field is
+	// not worth that: a catalog read accepts an advertisement only from the
+	// member the handshake proved owns it, so nobody else is in a position to
+	// alter it, and the worst a host could do by lying is offer its own
+	// requesters a control the model ignores.
+	SupportsThinking bool   `json:"supports_thinking,omitempty"`
+	Timestamp        int64  `json:"timestamp"`
+	Signature        string `json:"signature"`
 	// SigVersion selects the signing payload format; see identity.SigningPayload.
 	SigVersion uint8 `json:"sig_version,omitempty"`
 }
@@ -122,6 +133,19 @@ func (c *Catalog) ListAvailable() []ModelAd {
 		available = append(available, ad)
 	}
 	return available
+}
+
+// List returns the current advertisements, including offline ones. Local
+// refresh uses it to publish a signed offline tombstone immediately when a
+// prepared file is removed instead of waiting for the stale-ad timeout.
+func (c *Catalog) List() []ModelAd {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]ModelAd, 0, len(c.ads))
+	for _, ad := range c.ads {
+		out = append(out, ad)
+	}
+	return out
 }
 
 func (c *Catalog) Get(hostMemberID, modelID string) (ModelAd, bool) {

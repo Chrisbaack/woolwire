@@ -105,9 +105,28 @@ is safe or that its license allows your intended use. Discovery does not hash
 every file already on disk. Downloaded models can be removed through the UI;
 models found in a shared directory are never deleted by Woolwire.
 
-Load a model to offer it. The current runner holds one loaded model at a time;
-loading another replaces it and withdraws the previous advertisement. Unload
-withdraws the model. The app and runner must see the same relative model paths.
+Prepare downloaded weights for sharing without loading them into GPU memory.
+The Meadow distinguishes loaded models from unloaded models that are ready to
+start. Sending a request to an unloaded model loads it on its host before
+generation begins, so the first response can take longer.
+
+The current runner holds one loaded model at a time; requesting another model
+switches weights after active inference finishes. Unloading frees the model's
+memory while keeping it available to load on demand. Disable or unpublish a
+model to stop offering it. Load settings are saved for later requests and app
+restarts. The app and runner must see the same relative model paths.
+Models started on demand are released again once the host's idle-unload setting
+says so: after a number of minutes, as soon as the queue drains, or never. Five
+minutes is the default. An explicit manual load keeps the model loaded until it
+is unloaded or replaced, whatever that setting says.
+
+A model whose own chat template has a reasoning path is advertised as
+supporting thinking, and the requester — not the host — chooses how hard it
+should think for each message: the model's default, off, low, medium, or high.
+Thinking is slower and spends more of the host's time, so the choice sits with
+whoever is waiting for the answer. The level is dropped for a model that does
+not advertise the capability, which is read from the weights rather than
+configured.
 Read-only storage allows discovery and serving but disables downloads.
 
 Omitting `gpu_layers` lets the runner choose offload using its hardware. Explicit
@@ -135,9 +154,13 @@ current host-limit API fields.
 
 **Community** has shared channels, signed messages, author edits/deletions,
 creator moderation, and manual synchronization. These are room messages, not
-private direct messages. Replication depends on reachable peers retaining the
-events. Default retention is 30 days or 250 MiB. Deletion cannot erase copies
-someone kept outside Woolwire.
+private direct messages. Whoever created a channel can delete it, and the
+room's creator can delete any; the deletion is itself a signed event, so the
+channel goes away on every node rather than only the one it was deleted from.
+The implicit `#general` channel is created without an event and cannot be
+deleted. Replication depends on reachable peers retaining the events. Default
+retention is 30 days or 250 MiB. Deletion cannot erase copies someone kept
+outside Woolwire.
 
 **The helping herd** recognizes shared compute with a rolling 30-day score.
 Completed, acknowledged peer requests can earn points, capped at 20 per

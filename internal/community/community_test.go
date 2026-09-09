@@ -3,6 +3,7 @@ package community
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -127,4 +128,64 @@ func TestCommunityMaterializationQuarantineAndOrdering(t *testing.T) {
 	if len(forward.ConflictedAuthors) != 1 || forward.ConflictedAuthors[0] != memberID {
 		t.Fatalf("expected the author to be flagged, got %#v", forward.ConflictedAuthors)
 	}
+}
+
+// TestChannelDeletionConvergesInEitherOrder is what makes a withdrawal safe to
+// replicate: peers receive the announcement and the deletion in whichever
+// order the network delivers them, and both have to end up with the same
+// channel list.
+func TestChannelDeletionConvergesInEitherOrder(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keep := channelEvent(t, priv, "chan-keep", "keep", 1, 100)
+	doomed := channelEvent(t, priv, "chan-doomed", "doomed", 2, 110)
+	remove := Event{
+		RoomID:         "room-1",
+		ChannelID:      "chan-doomed",
+		AuthorMemberID: "member-a",
+		AuthorSeq:      3,
+		EventType:      EventChannelDelete,
+		Timestamp:      120,
+	}
+	if err := remove.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, order := range [][]Event{
+		{keep, doomed, remove},
+		{remove, doomed, keep},
+		{doomed, remove, keep},
+	} {
+		res := Materialize(order)
+		if len(res.Channels) != 1 || res.Channels[0].ID != "chan-keep" {
+			t.Fatalf("order %d: channels after deletion = %v", i, res.Channels)
+		}
+		if len(res.DeletedChannels) != 1 || res.DeletedChannels[0] != "chan-doomed" {
+			t.Fatalf("order %d: withdrawn channels = %v", i, res.DeletedChannels)
+		}
+	}
+}
+
+func channelEvent(t *testing.T, priv ed25519.PrivateKey, id, name string, seq, ts int64) Event {
+	t.Helper()
+	payload, err := json.Marshal(ChannelPayload{Name: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := Event{
+		RoomID:         "room-1",
+		ChannelID:      id,
+		AuthorMemberID: "member-a",
+		AuthorSeq:      seq,
+		EventType:      EventChannel,
+		Content:        string(payload),
+		Timestamp:      ts,
+	}
+	if err := e.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	return e
 }

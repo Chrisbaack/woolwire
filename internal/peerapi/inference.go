@@ -20,6 +20,10 @@ type InferenceRequest struct {
 	RequestID string                `json:"request_id"`
 	ModelID   string                `json:"model_id"`
 	Messages  []hosting.ChatMessage `json:"messages"`
+	// Thinking is the reasoning level the requesting member chose. A peer
+	// that predates the control sends nothing, which leaves the model's own
+	// default alone.
+	Thinking string `json:"thinking,omitempty"`
 }
 
 func (s *Server) handleInference(w http.ResponseWriter, r *http.Request, caller peerauth.Identity) {
@@ -54,6 +58,12 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request, caller 
 		return
 	}
 
+	thinking, ok := inference.ParseThinkingLevel(req.Thinking)
+	if !ok {
+		http.Error(w, "unknown thinking level", http.StatusBadRequest)
+		return
+	}
+
 	stream, err := sse.New(w)
 	if err != nil {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -65,7 +75,7 @@ func (s *Server) handleInference(w http.ResponseWriter, r *http.Request, caller 
 	var firstTokenTime time.Time
 	var completionTokens int
 
-	err = s.infer.Execute(r.Context(), caller.MemberID, req.RequestID, model, req.Messages, func(delta string) error {
+	err = s.infer.Execute(r.Context(), caller.MemberID, req.RequestID, model, req.Messages, thinking, func(delta string) error {
 		if firstTokenTime.IsZero() {
 			firstTokenTime = time.Now()
 		}

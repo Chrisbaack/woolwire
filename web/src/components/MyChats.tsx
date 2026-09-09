@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { api } from '../api.ts'
 import { readSSEStream } from '../sse.ts'
+import { availabilityLabel, isUnavailable } from '../availability.ts'
 
 interface ModelAd {
   room_id: string
@@ -11,6 +12,8 @@ interface ModelAd {
   availability: string
   queue_estimate: number
   host_display_name: string
+  is_managed?: boolean
+  supports_thinking?: boolean
 }
 
 interface Conversation {
@@ -267,6 +270,11 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
   const [streamingText, setStreamingText] = useState('')
   const [streamingRequestId, setStreamingRequestId] = useState('')
   const [streamingHostId, setStreamingHostId] = useState('')
+  // '' leaves the model's own default alone, which is what a request without
+  // the control does. Only offered for a model that advertises it reasons.
+  const [thinkingLevel, setThinkingLevel] = useState('')
+  const [streamingModelKey, setStreamingModelKey] = useState('')
+  const [startingModelKey, setStartingModelKey] = useState('')
   const [errorMsg, setErrorMsg] = useState('')
   const [msgStats, setMsgStats] = useState<Record<string, GenerationStats>>(() => {
     try {
@@ -460,6 +468,14 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
     }
   }
 
+  // thinkingFor answers what to send for one particular model. Regenerating or
+  // editing can target the model a message was answered by rather than the one
+  // in the picker, and a level the model never offered would be refused.
+  const thinkingFor = (hostId: string, modelId: string) => {
+    const model = models.find((m) => m.host_member_id === hostId && m.model_id === modelId)
+    return model?.supports_thinking ? thinkingLevel : ''
+  }
+
   // runGeneration owns one streaming exchange with the backend. Sending,
   // regenerating, and editing differ only in the endpoint they call and the
   // optimistic message they show, so they all funnel through here.
@@ -485,6 +501,10 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
     setStreaming(true)
     setStreamingText('')
     setStreamingHostId(hostId)
+    const requestModelKey = `${hostId}/${modelId}`
+    setStreamingModelKey(requestModelKey)
+    const requestModel = models.find((model) => `${model.host_member_id}/${model.model_id}` === requestModelKey)
+    setStartingModelKey(requestModel?.availability === 'unloaded' ? requestModelKey : '')
     setLiveStats({})
 
     const startTime = performance.now()
@@ -543,6 +563,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
           try {
             const parsed = JSON.parse(data)
             if (parsed.delta) {
+              setStartingModelKey('')
               accumulated += parsed.delta
               if (!firstTokenTime) {
                 firstTokenTime = performance.now()
@@ -570,6 +591,8 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
       }
 
       setStreaming(false)
+      setStreamingModelKey('')
+      setStartingModelKey('')
       setStreamingText('')
       setStreamingRequestId('')
       setLiveStats({})
@@ -638,6 +661,8 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
     } catch (err: any) {
       setErrorMsg(err.message || 'Error communicating with model host')
       setStreaming(false)
+      setStreamingModelKey('')
+      setStartingModelKey('')
       setLiveStats({})
       // Put back what the turn previewed: the branch it would have created
       // does not exist, so the superseded messages belong back on screen.
@@ -654,8 +679,12 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
     if (!inputContent.trim() || !activeConvId || streaming) return
 
     const [hostId, modelId] = selectedModelKey.split('/')
-    if (!hostId || !modelId) {
-      setErrorMsg('Please select a valid model from the catalog')
+    if (!hostId || !modelId || !selectedModel) {
+      setErrorMsg('Choose a model that is currently advertised in the catalog')
+      return
+    }
+    if (isUnavailable(selectedModel.availability)) {
+      setErrorMsg('That model host is currently unavailable. Choose another model and try again.')
       return
     }
 
@@ -664,7 +693,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
 
     await runGeneration(
       `/api/v1/chats/${activeConvId}/message`,
-      { content: currentContent, host_member_id: hostId, model_id: modelId },
+      { content: currentContent, host_member_id: hostId, model_id: modelId, thinking: thinkingFor(hostId, modelId) },
       {
         hostId,
         modelId,
@@ -693,7 +722,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
     const idx = messages.findIndex((x) => x.ID === m.ID)
     await runGeneration(
       `/api/v1/chats/${activeConvId}/messages/${m.ID}/regenerate`,
-      { host_member_id: hostId, model_id: modelId },
+      { host_member_id: hostId, model_id: modelId, thinking: thinkingFor(hostId, modelId) },
       { hostId, modelId, baseMessages: idx >= 0 ? messages.slice(0, idx) : undefined }
     )
   }
@@ -717,7 +746,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
     const idx = messages.findIndex((x) => x.ID === m.ID)
     await runGeneration(
       `/api/v1/chats/${activeConvId}/messages/${m.ID}/edit`,
-      { content: trimmed, host_member_id: hostId, model_id: modelId },
+      { content: trimmed, host_member_id: hostId, model_id: modelId, thinking: thinkingFor(hostId, modelId) },
       {
         hostId,
         modelId,
@@ -773,6 +802,8 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
         }),
       })
       setStreaming(false)
+      setStreamingModelKey('')
+      setStartingModelKey('')
       setErrorMsg('Inference cancelled by user')
     } catch {
       // ignore
@@ -783,6 +814,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
   const selectedModel = models.find(
     (m) => `${m.host_member_id}/${m.model_id}` === selectedModelKey
   )
+  const selectedModelUnavailable = !selectedModel || isUnavailable(selectedModel.availability)
 
   const approxTokens = React.useMemo(() => {
     let chars = 0
@@ -924,13 +956,35 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
                     )}
                     {models.map((m) => (
                       <option key={`${m.host_member_id}/${m.model_id}`} value={`${m.host_member_id}/${m.model_id}`}>
-                        {m.name} ({m.host_display_name})
+                        {m.name} ({m.host_display_name}) · {availabilityLabel(m.availability, m.is_managed)}
                       </option>
                     ))}
                   </select>
                 </div>
               </div>
             </div>
+
+            {selectedModel && (
+              <div
+                role="status"
+                style={{
+                  marginBottom: '0.75rem',
+                  padding: '0.55rem 0.7rem',
+                  borderRadius: 'var(--radius)',
+                  backgroundColor: 'var(--bg-primary)',
+                  border: '1px solid var(--border-color)',
+                  color: 'var(--text-secondary)',
+                  fontSize: '0.8rem',
+                }}
+              >
+                <strong style={{ color: 'var(--text-primary)' }}>{availabilityLabel(selectedModel.availability, selectedModel.is_managed)}.</strong>{' '}
+                {selectedModel.availability === 'unloaded'
+                  ? 'This host will start the downloaded model when you send your first message; the first response may take a little longer.'
+                  : selectedModel.availability === 'ready' || selectedModel.availability === 'busy'
+                    ? selectedModel.is_managed ? 'The host already has this model loaded.' : 'This hosted endpoint is currently advertised as ready.'
+                    : 'This model cannot accept requests right now.'}
+              </div>
+            )}
 
             {errorMsg && <div className="alert alert-error">{errorMsg}</div>}
 
@@ -1108,7 +1162,7 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
                   }}
                 >
                   <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.4rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <span>Generating response...</span>
+                    <span>{startingModelKey !== '' && startingModelKey === streamingModelKey ? 'Starting downloaded model on host…' : 'Generating response...'}</span>
                     {liveStats.tps ? (
                       <span style={{ color: 'var(--accent-text)', fontWeight: 600 }}>
                         ⚡ {liveStats.tps} tok/s {liveStats.ttft_ms ? `• TTFT ${liveStats.ttft_ms}ms` : ''}
@@ -1125,10 +1179,14 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
             </div>
 
             {/* Input Form */}
-            <form onSubmit={handleSendMessage} style={{ display: 'flex', gap: '0.75rem', marginTop: 'auto' }}>
+            {/* Wraps rather than squeezing: with the thinking control in the
+                row too, a narrow window would otherwise shrink the message box
+                to a few characters. */}
+            <form onSubmit={handleSendMessage} style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', marginTop: 'auto' }}>
               <input
                 type="text"
                 className="form-control"
+                style={{ flex: '1 1 12rem' }}
                 placeholder={streaming ? 'Generating...' : 'Type a message...'}
                 value={inputContent}
                 onChange={(e) => setInputContent(e.target.value)}
@@ -1137,6 +1195,24 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
                 // stop someone composing it.
                 disabled={streaming}
               />
+              {/* The options carry the word "thinking" because the control has
+                  no label beside it: a bare "High" next to Send says nothing. */}
+              {selectedModel?.supports_thinking && (
+                <select
+                  className="form-control"
+                  aria-label="Thinking level"
+                  style={{ flex: '0 0 auto', width: 'auto', fontSize: '0.85rem' }}
+                  value={thinkingLevel}
+                  onChange={(e) => setThinkingLevel(e.target.value)}
+                  disabled={streaming}
+                >
+                  <option value="">Thinking: default</option>
+                  <option value="off">Thinking: off</option>
+                  <option value="low">Thinking: low</option>
+                  <option value="medium">Thinking: medium</option>
+                  <option value="high">Thinking: high</option>
+                </select>
+              )}
               {streaming ? (
                 <button type="button" className="btn btn-secondary" onClick={handleCancel}>
                   Cancel
@@ -1145,8 +1221,8 @@ export const MyChats: React.FC<MyChatsProps> = ({ initialModel, visible = true }
                 <button
                   type="submit"
                   className="btn btn-primary"
-                  disabled={!inputContent.trim() || !selectedModelKey}
-                  title={!selectedModelKey ? 'Choose a model first' : undefined}
+                  disabled={!inputContent.trim() || !selectedModelKey || selectedModelUnavailable}
+                  title={!selectedModelKey ? 'Choose a model first' : selectedModelUnavailable ? 'Choose an available model first' : undefined}
                 >
                   Send
                 </button>

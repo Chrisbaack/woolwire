@@ -237,6 +237,12 @@ type Controller struct {
 	// concurrent calls previously overwrote each other's cancel function, so
 	// cancelling one request stopped an unrelated one.
 	inferenceMu sync.Mutex
+	// modelMu serializes lifecycle changes with inference. Loading or unloading
+	// while llama-server is streaming would replace the process underneath a
+	// request and report a misleading backend failure. It is a one-slot
+	// semaphore rather than sync.Mutex so a request waiting behind a stream can
+	// stop waiting when its HTTP context is canceled.
+	modelMu chan struct{}
 
 	mux *http.ServeMux
 }
@@ -295,6 +301,7 @@ func NewController(cfg Config) (*Controller, error) {
 		healthCheck:   cfg.HealthCheck,
 		engineCommand: cfg.EngineCommand,
 		status:        StatusIdle,
+		modelMu:       make(chan struct{}, 1),
 		mux:           http.NewServeMux(),
 	}
 
@@ -438,6 +445,33 @@ func (c *Controller) Handler() http.Handler {
 	return c.mux
 }
 
+// acquireModel waits for exclusive ownership of the runner lifecycle. A
+// stream can legitimately hold this for a long time, so waiting must honor
+// the caller's cancellation instead of making unload/load requests hang.
+func (c *Controller) acquireModel(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case c.modelMu <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Controller) releaseModel() {
+	<-c.modelMu
+}
+
+func modelWaitError(w http.ResponseWriter, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		http.Error(w, "runner lifecycle request canceled while waiting for the active request", http.StatusRequestTimeout)
+		return
+	}
+	http.Error(w, fmt.Sprintf("runner lifecycle lock failed: %v", err), http.StatusServiceUnavailable)
+}
+
 func (c *Controller) handleHealth(w http.ResponseWriter, r *http.Request) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -512,6 +546,11 @@ func (c *Controller) defaultGPULayers() *int {
 }
 
 func (c *Controller) handleLoadModel(w http.ResponseWriter, r *http.Request) {
+	if err := c.acquireModel(r.Context()); err != nil {
+		modelWaitError(w, err)
+		return
+	}
+	defer c.releaseModel()
 	var req LoadModelRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -746,6 +785,11 @@ func (c *Controller) waitForHealthy(ctx context.Context, engineDone <-chan struc
 }
 
 func (c *Controller) handleUnloadModel(w http.ResponseWriter, r *http.Request) {
+	if err := c.acquireModel(r.Context()); err != nil {
+		modelWaitError(w, err)
+		return
+	}
+	defer c.releaseModel()
 	c.mu.Lock()
 	c.status = StatusIdle
 	c.stopEngineLocked()
@@ -771,6 +815,11 @@ func (c *Controller) stopEngineLocked() {
 }
 
 func (c *Controller) handleRestartEngine(w http.ResponseWriter, r *http.Request) {
+	if err := c.acquireModel(r.Context()); err != nil {
+		modelWaitError(w, err)
+		return
+	}
+	defer c.releaseModel()
 	c.mu.RLock()
 	args := c.loaded
 	c.mu.RUnlock()
@@ -806,6 +855,37 @@ type InferenceRequest struct {
 	Stream            bool          `json:"stream"`
 	MaxTokens         int           `json:"max_tokens,omitempty"`
 	RequesterMemberID string        `json:"requester_member_id,omitempty"`
+	// Thinking is the requester's reasoning level: off, low, medium or high.
+	// Empty leaves the model's own default alone.
+	Thinking string `json:"thinking,omitempty"`
+}
+
+// thinkingPayload renders a reasoning level into the request fields
+// llama-server passes to the chat template.
+//
+// There is no single spelling for this. Qwen3's template branches on
+// enable_thinking, gpt-oss reads reasoning_effort, and others use a bare
+// thinking flag, so every known name is supplied and a template picks out the
+// one it understands — an unused kwarg is simply not referenced when the
+// template renders. reasoning_effort is also set at the top level, where
+// newer llama.cpp builds read it; older ones ignore the unknown field.
+func thinkingPayload(level string, payload map[string]any) {
+	kwargs := map[string]any{}
+	switch level {
+	case "":
+		return
+	case "off":
+		kwargs["enable_thinking"] = false
+		kwargs["thinking"] = false
+	case "low", "medium", "high":
+		kwargs["enable_thinking"] = true
+		kwargs["thinking"] = true
+		kwargs["reasoning_effort"] = level
+		payload["reasoning_effort"] = level
+	default:
+		return
+	}
+	payload["chat_template_kwargs"] = kwargs
 }
 
 type ChatMessage struct {
@@ -831,16 +911,25 @@ func (c *Controller) handleInference(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	// One engine, one KV cache, one request at a time.
+	// One engine, one KV cache, one request at a time. The wait now happens on
+	// the lifecycle gate, so the queue depth has to be counted around that one
+	// to keep reporting anything: counting around inferenceMu, which can only
+	// be reached with the gate already held, would report zero forever.
 	c.mu.Lock()
 	c.pendingRequests++
 	c.mu.Unlock()
-	c.inferenceMu.Lock()
-	defer c.inferenceMu.Unlock()
+	waitErr := c.acquireModel(r.Context())
 	c.mu.Lock()
 	c.pendingRequests--
 	c.mu.Unlock()
+	if waitErr != nil {
+		modelWaitError(w, waitErr)
+		return
+	}
+	defer c.releaseModel()
+
+	c.inferenceMu.Lock()
+	defer c.inferenceMu.Unlock()
 
 	c.mu.RLock()
 	status := c.status
@@ -924,6 +1013,7 @@ func (c *Controller) handleInference(w http.ResponseWriter, r *http.Request) {
 	if req.MaxTokens > 0 {
 		enginePayload["max_tokens"] = req.MaxTokens
 	}
+	thinkingPayload(req.Thinking, enginePayload)
 	bodyBytes, err := json.Marshal(enginePayload)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

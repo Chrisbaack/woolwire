@@ -220,7 +220,7 @@ func TestContextLimitRejectedBeforeDispatch(t *testing.T) {
 		Content: strings.Repeat("x", 100*4), // ~100 tokens against an 80 token budget
 	}}
 
-	err := svc.Execute(context.Background(), "m-a", "req-1", model, oversized, func(string) error { return nil })
+	err := svc.Execute(context.Background(), "m-a", "req-1", model, oversized, inference.ThinkingDefault, func(string) error { return nil })
 	if err == nil {
 		t.Fatal("an oversized prompt was accepted")
 	}
@@ -233,7 +233,7 @@ func TestContextLimitRejectedBeforeDispatch(t *testing.T) {
 
 	// A prompt that fits goes through.
 	fits := []hosting.ChatMessage{{Role: "user", Content: "hello"}}
-	if err := svc.Execute(context.Background(), "m-a", "req-2", model, fits, func(string) error { return nil }); err != nil {
+	if err := svc.Execute(context.Background(), "m-a", "req-2", model, fits, inference.ThinkingDefault, func(string) error { return nil }); err != nil {
 		t.Fatalf("a prompt within the limit was refused: %v", err)
 	}
 	if backendCalls != 1 {

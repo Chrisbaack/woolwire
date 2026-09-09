@@ -43,6 +43,10 @@ type ChannelPayload struct {
 type Result struct {
 	Messages []MaterializedMessage
 	Channels []ChannelAnnouncement
+	// DeletedChannels names channels a channel_delete event withdrew. They are
+	// reported rather than merely omitted so a node that already stored one
+	// knows to drop it, not just to stop adding it.
+	DeletedChannels []string
 	// ConflictedAuthors names authors that published two different events
 	// under the same author_seq. Both events are stored; the deterministic
 	// winner is the lexically smaller event ID so every peer converges on the
@@ -57,7 +61,7 @@ func MaterializeEvents(events []Event) []MaterializedMessage {
 
 func Materialize(events []Event) Result {
 	if len(events) == 0 {
-		return Result{Messages: []MaterializedMessage{}, Channels: []ChannelAnnouncement{}}
+		return Result{Messages: []MaterializedMessage{}, Channels: []ChannelAnnouncement{}, DeletedChannels: []string{}}
 	}
 
 	// 1. Deduplicate by event ID, then resolve author-sequence conflicts.
@@ -109,6 +113,7 @@ func Materialize(events []Event) Result {
 	var orderedList []*MaterializedMessage
 	channels := make([]ChannelAnnouncement, 0)
 	seenChannels := make(map[string]bool)
+	deletedChannels := make(map[string]bool)
 
 	for _, e := range uniqueEvents {
 		switch e.EventType {
@@ -129,6 +134,18 @@ func Materialize(events []Event) Result {
 				AuthorMemberID: e.AuthorMemberID,
 				CreatedAt:      e.Timestamp,
 			})
+
+		case EventChannelDelete:
+			// Collected rather than applied here: a delete can be ordered
+			// before the announcement it undoes, and the two orders have to
+			// produce the same channel list on every peer.
+			//
+			// Who may delete is decided where the event is signed, not here,
+			// which is the same trust model the moderation tombstone above
+			// uses: the log records that a member said it, and the API refuses
+			// to say it on behalf of anyone but the channel's author or the
+			// room's creator.
+			deletedChannels[e.ChannelID] = true
 
 		case EventMessage:
 			status := e.ReplicatedStatus
@@ -180,11 +197,24 @@ func Materialize(events []Event) Result {
 		messages = append(messages, *m)
 	}
 
+	live := channels[:0]
+	for _, ch := range channels {
+		if !deletedChannels[ch.ID] {
+			live = append(live, ch)
+		}
+	}
+	channels = live
+	withdrawn := make([]string, 0, len(deletedChannels))
+	for id := range deletedChannels {
+		withdrawn = append(withdrawn, id)
+	}
+	sort.Strings(withdrawn)
+
 	authors := make([]string, 0, len(conflicted))
 	for author := range conflicted {
 		authors = append(authors, author)
 	}
 	sort.Strings(authors)
 
-	return Result{Messages: messages, Channels: channels, ConflictedAuthors: authors}
+	return Result{Messages: messages, Channels: channels, DeletedChannels: withdrawn, ConflictedAuthors: authors}
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -647,7 +648,42 @@ type HostedModelRecord struct {
 	BackendModel string `json:"backend_model"`
 	// AllowPrivateNetwork opts this one endpoint out of the private-range
 	// SSRF block. It is per-model and off by default.
-	AllowPrivateNetwork bool `json:"allow_private_network"`
+	AllowPrivateNetwork bool     `json:"allow_private_network"`
+	Filename            string   `json:"filename,omitempty"`
+	Threads             int      `json:"threads,omitempty"`
+	GPULayers           *int     `json:"gpu_layers,omitempty"`
+	Projector           string   `json:"projector,omitempty"`
+	DraftModel          string   `json:"draft_model,omitempty"`
+	ExtraArgs           []string `json:"extra_args,omitempty"`
+	// SupportsThinking reports that this model can be asked to reason, so a
+	// requester may choose how hard it should think.
+	SupportsThinking bool `json:"supports_thinking,omitempty"`
+}
+
+func nullableInt(v *int) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func encodeStringSlice(v []string) string {
+	if len(v) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func decodeStringSlice(v string) []string {
+	if v == "" {
+		return nil
+	}
+	var out []string
+	if json.Unmarshal([]byte(v), &out) != nil {
+		return nil
+	}
+	return out
 }
 
 func (s *Store) SaveHostedModel(m HostedModelRecord) error {
@@ -667,13 +703,18 @@ func (s *Store) SaveHostedModel(m HostedModelRecord) error {
 	if m.AllowPrivateNetwork {
 		allowPrivateInt = 1
 	}
+	thinkingInt := 0
+	if m.SupportsThinking {
+		thinkingInt = 1
+	}
 
 	_, err := s.db.Exec(`
 		INSERT INTO hosted_models (
 			id, name, model_type, endpoint_url, api_key, context_limit,
 			max_tokens, enabled, published, revision, backend_model,
-			allow_private_network
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			allow_private_network, filename, threads, gpu_layers, projector,
+			draft_model, extra_args, supports_thinking
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			model_type = excluded.model_type,
@@ -685,10 +726,18 @@ func (s *Store) SaveHostedModel(m HostedModelRecord) error {
 			published = excluded.published,
 			revision = excluded.revision,
 			backend_model = excluded.backend_model,
-			allow_private_network = excluded.allow_private_network
+			allow_private_network = excluded.allow_private_network,
+			filename = excluded.filename,
+			threads = excluded.threads,
+			gpu_layers = excluded.gpu_layers,
+			projector = excluded.projector,
+			draft_model = excluded.draft_model,
+			extra_args = excluded.extra_args,
+			supports_thinking = excluded.supports_thinking
 	`, m.ID, m.Name, m.ModelType, m.EndpointURL, m.APIKey, m.ContextLimit,
 		m.MaxTokens, enabledInt, publishedInt, m.Revision, m.BackendModel,
-		allowPrivateInt)
+		allowPrivateInt, m.Filename, m.Threads, nullableInt(m.GPULayers), m.Projector,
+		m.DraftModel, encodeStringSlice(m.ExtraArgs), thinkingInt)
 	return err
 }
 
@@ -697,16 +746,20 @@ func (s *Store) GetHostedModel(id string) (*HostedModelRecord, error) {
 	defer s.mu.RUnlock()
 
 	var m HostedModelRecord
-	var enabledInt, publishedInt, allowPrivateInt int
+	var enabledInt, publishedInt, allowPrivateInt, thinkingInt int
+	var gpuLayers sql.NullInt64
+	var extraArgs string
 	err := s.db.QueryRow(`
 		SELECT id, name, model_type, endpoint_url, api_key, context_limit,
 		       max_tokens, enabled, published, revision, backend_model,
-		       allow_private_network
+		       allow_private_network, filename, threads, gpu_layers, projector,
+		       draft_model, extra_args, supports_thinking
 		FROM hosted_models WHERE id = ?
 	`, id).Scan(
 		&m.ID, &m.Name, &m.ModelType, &m.EndpointURL, &m.APIKey, &m.ContextLimit,
 		&m.MaxTokens, &enabledInt, &publishedInt, &m.Revision, &m.BackendModel,
-		&allowPrivateInt,
+		&allowPrivateInt, &m.Filename, &m.Threads, &gpuLayers, &m.Projector,
+		&m.DraftModel, &extraArgs, &thinkingInt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -717,6 +770,12 @@ func (s *Store) GetHostedModel(id string) (*HostedModelRecord, error) {
 	m.Enabled = enabledInt != 0
 	m.Published = publishedInt != 0
 	m.AllowPrivateNetwork = allowPrivateInt != 0
+	m.SupportsThinking = thinkingInt != 0
+	if gpuLayers.Valid {
+		v := int(gpuLayers.Int64)
+		m.GPULayers = &v
+	}
+	m.ExtraArgs = decodeStringSlice(extraArgs)
 	return &m, nil
 }
 
@@ -727,7 +786,8 @@ func (s *Store) ListHostedModels() ([]HostedModelRecord, error) {
 	rows, err := s.db.Query(`
 		SELECT id, name, model_type, endpoint_url, api_key, context_limit,
 		       max_tokens, enabled, published, revision, backend_model,
-		       allow_private_network
+		       allow_private_network, filename, threads, gpu_layers, projector,
+		       draft_model, extra_args, supports_thinking
 		FROM hosted_models ORDER BY name ASC
 	`)
 	if err != nil {
@@ -738,17 +798,26 @@ func (s *Store) ListHostedModels() ([]HostedModelRecord, error) {
 	var models []HostedModelRecord
 	for rows.Next() {
 		var m HostedModelRecord
-		var enabledInt, publishedInt, allowPrivateInt int
+		var enabledInt, publishedInt, allowPrivateInt, thinkingInt int
+		var gpuLayers sql.NullInt64
+		var extraArgs string
 		if err := rows.Scan(
 			&m.ID, &m.Name, &m.ModelType, &m.EndpointURL, &m.APIKey, &m.ContextLimit,
 			&m.MaxTokens, &enabledInt, &publishedInt, &m.Revision, &m.BackendModel,
-			&allowPrivateInt,
+			&allowPrivateInt, &m.Filename, &m.Threads, &gpuLayers, &m.Projector,
+			&m.DraftModel, &extraArgs, &thinkingInt,
 		); err != nil {
 			return nil, err
 		}
 		m.Enabled = enabledInt != 0
 		m.Published = publishedInt != 0
 		m.AllowPrivateNetwork = allowPrivateInt != 0
+		m.SupportsThinking = thinkingInt != 0
+		if gpuLayers.Valid {
+			v := int(gpuLayers.Int64)
+			m.GPULayers = &v
+		}
+		m.ExtraArgs = decodeStringSlice(extraArgs)
 		models = append(models, m)
 	}
 	return models, rows.Err()
@@ -769,7 +838,15 @@ type HostLimitsRecord struct {
 	MaxQueuedTotal          int
 	QueueTimeoutSeconds     int
 	ExecutionTimeoutSeconds int
+	// IdleUnloadSeconds is how long a demand-loaded managed model stays warm
+	// once the queue drains. Negative never releases it, zero releases it
+	// straight away, and a positive value waits that many seconds.
+	IdleUnloadSeconds int
 }
+
+// DefaultIdleUnloadSeconds keeps an engine warm for five minutes, which is
+// what the runner did before the owner could choose.
+const DefaultIdleUnloadSeconds = 300
 
 func (s *Store) GetHostLimits() (HostLimitsRecord, error) {
 	s.mu.RLock()
@@ -778,9 +855,10 @@ func (s *Store) GetHostLimits() (HostLimitsRecord, error) {
 	var l HostLimitsRecord
 	err := s.db.QueryRow(`
 		SELECT max_active, max_queued_per_member, max_queued_total,
-		       queue_timeout_seconds, execution_timeout_seconds
+		       queue_timeout_seconds, execution_timeout_seconds, idle_unload_seconds
 		FROM host_limits WHERE id = 1
-	`).Scan(&l.MaxActive, &l.MaxQueuedPerMember, &l.MaxQueuedTotal, &l.QueueTimeoutSeconds, &l.ExecutionTimeoutSeconds)
+	`).Scan(&l.MaxActive, &l.MaxQueuedPerMember, &l.MaxQueuedTotal, &l.QueueTimeoutSeconds,
+		&l.ExecutionTimeoutSeconds, &l.IdleUnloadSeconds)
 	if errors.Is(err, sql.ErrNoRows) {
 		return HostLimitsRecord{
 			MaxActive:               1,
@@ -788,6 +866,7 @@ func (s *Store) GetHostLimits() (HostLimitsRecord, error) {
 			MaxQueuedTotal:          10,
 			QueueTimeoutSeconds:     300,
 			ExecutionTimeoutSeconds: 600,
+			IdleUnloadSeconds:       DefaultIdleUnloadSeconds,
 		}, nil
 	}
 	return l, err
@@ -800,15 +879,17 @@ func (s *Store) SaveHostLimits(l HostLimitsRecord) error {
 	_, err := s.db.Exec(`
 		INSERT INTO host_limits (
 			id, max_active, max_queued_per_member, max_queued_total,
-			queue_timeout_seconds, execution_timeout_seconds
-		) VALUES (1, ?, ?, ?, ?, ?)
+			queue_timeout_seconds, execution_timeout_seconds, idle_unload_seconds
+		) VALUES (1, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			max_active = excluded.max_active,
 			max_queued_per_member = excluded.max_queued_per_member,
 			max_queued_total = excluded.max_queued_total,
 			queue_timeout_seconds = excluded.queue_timeout_seconds,
-			execution_timeout_seconds = excluded.execution_timeout_seconds
-	`, l.MaxActive, l.MaxQueuedPerMember, l.MaxQueuedTotal, l.QueueTimeoutSeconds, l.ExecutionTimeoutSeconds)
+			execution_timeout_seconds = excluded.execution_timeout_seconds,
+			idle_unload_seconds = excluded.idle_unload_seconds
+	`, l.MaxActive, l.MaxQueuedPerMember, l.MaxQueuedTotal, l.QueueTimeoutSeconds,
+		l.ExecutionTimeoutSeconds, l.IdleUnloadSeconds)
 	return err
 }
 
@@ -819,6 +900,9 @@ type ChannelRecord struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	CreatedAt   int64  `json:"created_at"`
+	// CreatedBy is the member who announced this channel. It is who, besides
+	// the room's creator, is allowed to withdraw it.
+	CreatedBy string `json:"created_by,omitempty"`
 }
 
 func (s *Store) SaveChannel(c ChannelRecord) error {
@@ -831,12 +915,25 @@ func (s *Store) SaveChannel(c ChannelRecord) error {
 	}
 
 	_, err := s.db.Exec(`
-		INSERT INTO community_channels (id, room_id, name, description, created_at)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO community_channels (id, room_id, name, description, created_at, created_by)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
-			description = excluded.description
-	`, c.ID, c.RoomID, c.Name, c.Description, c.CreatedAt)
+			description = excluded.description,
+			-- A row written before the author was recorded learns it from the
+			-- log on the next pass, but an empty value never overwrites one.
+			created_by = CASE WHEN excluded.created_by = '' THEN created_by ELSE excluded.created_by END
+	`, c.ID, c.RoomID, c.Name, c.Description, c.CreatedAt, c.CreatedBy)
+	return err
+}
+
+// DeleteChannel removes a channel's local row. The event log remains the
+// record of what happened; this is the materialized view catching up with it.
+func (s *Store) DeleteChannel(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("DELETE FROM community_channels WHERE id = ?", id)
 	return err
 }
 
@@ -844,7 +941,7 @@ func (s *Store) ListChannels(roomID string) ([]ChannelRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rows, err := s.db.Query("SELECT id, room_id, name, description, created_at FROM community_channels WHERE room_id = ? ORDER BY created_at ASC", roomID)
+	rows, err := s.db.Query("SELECT id, room_id, name, description, created_at, created_by FROM community_channels WHERE room_id = ? ORDER BY created_at ASC", roomID)
 	if err != nil {
 		return nil, err
 	}
@@ -853,7 +950,7 @@ func (s *Store) ListChannels(roomID string) ([]ChannelRecord, error) {
 	var list []ChannelRecord
 	for rows.Next() {
 		var c ChannelRecord
-		if err := rows.Scan(&c.ID, &c.RoomID, &c.Name, &c.Description, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.RoomID, &c.Name, &c.Description, &c.CreatedAt, &c.CreatedBy); err != nil {
 			return nil, err
 		}
 		list = append(list, c)

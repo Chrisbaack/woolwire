@@ -57,6 +57,33 @@ type ggufMetadata struct {
 	// GGUF — diffusion weights, CLIP projectors, embedding-only exports. A
 	// tokenizer is what llama-server needs and what none of those carry.
 	HasTokenizer bool
+	// SupportsThinking reports whether the model's own chat template has a
+	// reasoning path. Nothing else in the header says whether a model thinks,
+	// and the template is authoritative: it is what decides, at prompt time,
+	// whether a reasoning block is opened at all.
+	SupportsThinking bool
+}
+
+// thinkingTemplateMarkers are what a reasoning model's chat template contains.
+// The families differ in how they spell it — Qwen3 branches on
+// enable_thinking, gpt-oss on reasoning_effort, DeepSeek-R1 emits the tag
+// directly — so any one of them is enough.
+var thinkingTemplateMarkers = []string{
+	"enable_thinking",
+	"reasoning_effort",
+	"reasoning_content",
+	"<think>",
+	"<|thinking|>",
+}
+
+func chatTemplateSupportsThinking(tmpl string) bool {
+	lower := strings.ToLower(tmpl)
+	for _, marker := range thinkingTemplateMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 type ggufReader struct {
@@ -289,6 +316,18 @@ func readGGUFMetadata(path string) (ggufMetadata, error) {
 			if md.Name, err = r.str(); err != nil {
 				return md, err
 			}
+		case key == "tokenizer.chat_template":
+			if typ != ggufString {
+				if err := r.skipValue(typ); err != nil {
+					return md, err
+				}
+				continue
+			}
+			tmpl, err := r.str()
+			if err != nil {
+				return md, err
+			}
+			md.SupportsThinking = chatTemplateSupportsThinking(tmpl)
 		case strings.HasSuffix(key, ".context_length"):
 			v, err := r.readUintValue(typ)
 			if err != nil {

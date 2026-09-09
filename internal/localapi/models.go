@@ -20,6 +20,7 @@ import (
 )
 
 func (s *Server) handleListHostedModels(w http.ResponseWriter, r *http.Request) {
+	s.syncManagedInventory()
 	models, err := s.store.ListHostedModels()
 	if err != nil {
 		http.Error(w, "failed to query hosted models", http.StatusInternalServerError)
@@ -31,6 +32,151 @@ func (s *Server) handleListHostedModels(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(models)
+}
+
+// inventorySyncInterval bounds how often an advertisement refresh rescans the
+// models directory.
+const inventorySyncInterval = 20 * time.Second
+
+// syncManagedInventoryThrottled is the variant for paths that run on a timer
+// or on a route the UI polls. The scan walks the models directory and writes a
+// row per new file, which is far more work than an advertisement refresh
+// should repeat several times a second.
+func (s *Server) syncManagedInventoryThrottled() {
+	s.mu.Lock()
+	stale := time.Since(s.lastInventorySync) >= inventorySyncInterval
+	if stale {
+		s.lastInventorySync = time.Now()
+	}
+	s.mu.Unlock()
+	if stale {
+		s.syncManagedInventory()
+	}
+}
+
+// syncManagedInventory creates disabled-by-default hosted rows for weights the
+// artifact manager found on disk. This keeps the sharing screen complete even
+// when a model was downloaded by an earlier session, while Published remains
+// an explicit sharing opt-in.
+func (s *Server) syncManagedInventory() {
+	if s.artifactMgr == nil {
+		return
+	}
+	// Stamp the clock here too, so that a direct call from the sharing screen
+	// also satisfies the next throttled refresh.
+	s.mu.Lock()
+	s.lastInventorySync = time.Now()
+	s.mu.Unlock()
+	artifacts, err := s.artifactMgr.ListArtifacts()
+	if err != nil {
+		return
+	}
+	seen := make(map[string]hosting.ArtifactManifest, len(artifacts))
+	seenPath := make(map[string]bool, len(artifacts))
+	for _, a := range artifacts {
+		seen[a.ID] = a
+		seenPath[a.Path] = true
+	}
+	models, err := s.store.ListHostedModels()
+	if err != nil {
+		return
+	}
+	byID := make(map[string]store.HostedModelRecord, len(models))
+	byPath := make(map[string]store.HostedModelRecord, len(models))
+	for _, m := range models {
+		byID[m.ID] = m
+		if m.ModelType == "managed" && m.Filename != "" {
+			byPath[m.Filename] = m
+		}
+	}
+	for id, a := range seen {
+		if existing, ok := byID[id]; ok {
+			if existing.ModelType != "managed" {
+				continue
+			}
+			changed := false
+			if existing.Filename == "" {
+				existing.Filename, existing.ContextLimit = a.Path, a.ContextLimit
+				if existing.ContextLimit <= 0 {
+					existing.ContextLimit = 4096
+				}
+				if existing.Name == "" {
+					existing.Name = managedDisplayName(a.Name)
+				}
+				if existing.BackendModel == "" {
+					existing.BackendModel = existing.Name
+				}
+				changed = true
+			}
+			// Whether a model reasons is read from its weights, which an older
+			// row predates and a re-quantized file can change.
+			if existing.SupportsThinking != a.SupportsThinking {
+				existing.SupportsThinking = a.SupportsThinking
+				changed = true
+			}
+			// An earlier scan named rows after the file, suffix and all.
+			// Correct that in place, but only while the stored name is still
+			// exactly what the scanner produced, so a name the owner chose is
+			// never overwritten.
+			if trimmed := managedDisplayName(a.Name); existing.Name == a.Name && trimmed != a.Name {
+				if existing.BackendModel == existing.Name {
+					existing.BackendModel = trimmed
+				}
+				existing.Name = trimmed
+				existing.Revision++
+				changed = true
+			}
+			if changed {
+				_ = s.store.SaveHostedModel(existing)
+			}
+			continue
+		}
+		// A prepared row may use an owner-chosen model ID. Reuse that row when
+		// the inventory scanner later derives its art-* ID for the same path.
+		if _, ok := byPath[a.Path]; ok {
+			continue
+		}
+		contextLimit := a.ContextLimit
+		if contextLimit <= 0 {
+			contextLimit = 4096
+		}
+		maxTokens := contextLimit / 2
+		if maxTokens < 2048 && contextLimit >= 2048 {
+			maxTokens = 2048
+		}
+		if maxTokens > 4096 {
+			maxTokens = 4096
+		}
+		if maxTokens <= 0 {
+			maxTokens = 1024
+		}
+		displayName := managedDisplayName(a.Name)
+		_ = s.store.SaveHostedModel(store.HostedModelRecord{ID: id, Name: displayName,
+			ModelType: "managed", EndpointURL: managedEndpointSentinel, BackendModel: displayName,
+			ContextLimit: contextLimit, MaxTokens: maxTokens, Enabled: true, Published: false,
+			Revision: 1, Filename: a.Path, Projector: companionPath(a, hosting.CompanionProjector),
+			DraftModel: companionPath(a, hosting.CompanionDraft), SupportsThinking: a.SupportsThinking})
+	}
+	// Rows whose source file disappeared are no longer loadable. Disable them
+	// for future requests but leave the record for the owner to inspect.
+	for _, m := range models {
+		if m.ModelType == "managed" && m.Filename != "" && s.artifactMgr != nil {
+			if !seenPath[m.Filename] && m.Enabled {
+				m.Enabled = false
+				m.Revision++
+				_ = s.store.SaveHostedModel(m)
+			}
+		}
+	}
+}
+
+func companionPath(a hosting.ArtifactManifest, kind hosting.CompanionKind) string {
+	for _, c := range a.Companions {
+		if c.Kind == kind {
+			return c.Path
+		}
+	}
+	return ""
 }
 
 func (s *Server) handleSaveHostedModel(w http.ResponseWriter, r *http.Request) {
@@ -60,26 +206,42 @@ func (s *Server) handleSaveHostedModel(w http.ResponseWriter, r *http.Request) {
 	if body.ModelType == "" {
 		body.ModelType = "external"
 	}
+	id := strings.TrimSpace(body.ID)
+	var existing *store.HostedModelRecord
+	if id != "" {
+		existing, _ = s.store.GetHostedModel(id)
+	}
+	if body.ModelType == "managed" {
+		// Managed rows can only be created through /prepare or /load, where
+		// the runner arguments are validated and persisted. Generic settings
+		// edits may change sharing flags, but must retain that configuration.
+		if existing == nil || existing.ModelType != "managed" || existing.Filename == "" {
+			http.Error(w, "managed models must be prepared before they can be edited", http.StatusBadRequest)
+			return
+		}
+		body.EndpointURL = existing.EndpointURL
+		body.APIKey = existing.APIKey
+		body.AllowPrivateNetwork = existing.AllowPrivateNetwork
+	}
 
 	// Validate endpoint destination to protect against SSRF and insecure
 	// off-machine HTTP. The authoritative check runs again at dial time
 	// against the addresses the name actually resolves to.
-	policy := hosting.DestinationPolicy{AllowPrivateNetwork: body.AllowPrivateNetwork}
-	if err := hosting.ValidateDestinationWithPolicy(body.EndpointURL, policy); err != nil {
-		http.Error(w, fmt.Sprintf("invalid endpoint destination: %v", err), http.StatusBadRequest)
-		return
+	if body.ModelType != "managed" {
+		policy := hosting.DestinationPolicy{AllowPrivateNetwork: body.AllowPrivateNetwork}
+		if err := hosting.ValidateDestinationWithPolicy(body.EndpointURL, policy); err != nil {
+			http.Error(w, fmt.Sprintf("invalid endpoint destination: %v", err), http.StatusBadRequest)
+			return
+		}
 	}
 
-	id := strings.TrimSpace(body.ID)
 	revision := 1
 	if id == "" {
 		randBytes := make([]byte, 8)
 		_, _ = rand.Read(randBytes)
 		id = "model-" + hex.EncodeToString(randBytes)
-	} else {
-		if existing, err := s.store.GetHostedModel(id); err == nil && existing != nil {
-			revision = existing.Revision + 1
-		}
+	} else if existing != nil {
+		revision = existing.Revision + 1
 	}
 
 	contextLimit := body.ContextLimit
@@ -100,6 +262,8 @@ func (s *Server) handleSaveHostedModel(w http.ResponseWriter, r *http.Request) {
 	enabled := true
 	if body.Enabled != nil {
 		enabled = *body.Enabled
+	} else if existing != nil {
+		enabled = existing.Enabled
 	}
 
 	// BackendModel defaults to the display name, which is what a discovery
@@ -123,6 +287,21 @@ func (s *Server) handleSaveHostedModel(w http.ResponseWriter, r *http.Request) {
 		Revision:            revision,
 		AllowPrivateNetwork: body.AllowPrivateNetwork,
 	}
+	if existing != nil && existing.ModelType == "managed" {
+		if body.ContextLimit <= 0 {
+			rec.ContextLimit = existing.ContextLimit
+		}
+		if body.MaxTokens <= 0 {
+			rec.MaxTokens = existing.MaxTokens
+		}
+		rec.Filename = existing.Filename
+		rec.Threads = existing.Threads
+		rec.GPULayers = existing.GPULayers
+		rec.Projector = existing.Projector
+		rec.DraftModel = existing.DraftModel
+		rec.ExtraArgs = append([]string(nil), existing.ExtraArgs...)
+		rec.SupportsThinking = existing.SupportsThinking
+	}
 
 	if err := s.store.SaveHostedModel(rec); err != nil {
 		http.Error(w, "failed to save hosted model", http.StatusInternalServerError)
@@ -131,6 +310,7 @@ func (s *Server) handleSaveHostedModel(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rec)
+	s.advertiseLocalModels()
 }
 
 func (s *Server) handleDeleteHostedModel(w http.ResponseWriter, r *http.Request) {
@@ -144,6 +324,7 @@ func (s *Server) handleDeleteHostedModel(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "failed to delete hosted model", http.StatusInternalServerError)
 		return
 	}
+	s.advertiseLocalModels()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
@@ -272,6 +453,11 @@ func (s *Server) handleSaveHostLimits(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.ExecutionTimeoutSeconds <= 0 {
 		body.ExecutionTimeoutSeconds = 600
+	}
+	// Zero and negative are both meaningful here — release straight away, and
+	// never release — so only a value below "never" is a mistake to correct.
+	if body.IdleUnloadSeconds < -1 {
+		body.IdleUnloadSeconds = store.DefaultIdleUnloadSeconds
 	}
 
 	if err := s.store.SaveHostLimits(body); err != nil {
@@ -425,20 +611,27 @@ func (s *Server) advertiseLocalModels() {
 	}
 	myPubKey := ed25519.PublicKey(pubBytes)
 	myPrivKey := ed25519.PrivateKey(device.DevicePrivate)
+	advertised := make(map[string]bool)
 
+	s.syncManagedInventoryThrottled()
 	localModels, err := s.store.ListHostedModels()
 	if err != nil {
 		return
 	}
 
-	// A managed model is only being served while the runner actually holds its
-	// weights. The hosted_models row survives a runner restart, so without
-	// asking, a refresh would keep advertising a model the runner dropped —
-	// and the refresh now runs on a timer, so it would say so indefinitely.
+	// A managed model is advertised as unloaded while its downloaded weights are
+	// available and the runner can accept a load. Only the model currently held
+	// by the runner is ready; an unreachable runner is offline.
 	loadedModelID := ""
+	runnerAvailable := false
 	if s.runnerClient != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if health, err := s.runnerClient.Health(ctx); err == nil {
+		s.infer.SetRunner(s.runnerClient)
+		if health, err := s.infer.RunnerHealth(ctx); err == nil {
+			// Answering at all is what makes a runner available. Even an error
+			// status is a reachable runner whose last engine attempt failed,
+			// and downloaded weights remain loadable on the next request.
+			runnerAvailable = true
 			loadedModelID = health.LoadedModelID
 		}
 		cancel()
@@ -448,25 +641,48 @@ func (s *Server) advertiseLocalModels() {
 		if !m.Enabled || !m.Published {
 			continue
 		}
+		advertised[m.ID] = true
 		managed := m.ModelType == "managed"
 		availability := "ready"
-		if managed && m.ID != loadedModelID {
-			availability = "offline"
+		if managed {
+			switch {
+			case m.Filename == "":
+				// Legacy rows created before load arguments were persisted cannot
+				// be demand-loaded safely after restart.
+				availability = "offline"
+			case !runnerAvailable:
+				availability = "offline"
+			case m.ID == loadedModelID:
+				availability = "ready"
+			default:
+				availability = "unloaded"
+			}
 		}
 		ad := catalog.ModelAd{
-			RoomID:        roomRec.RoomID,
-			HostMemberID:  myMemberID,
-			ModelID:       m.ID,
-			Revision:      m.Revision,
-			Name:          m.Name,
-			ContextLimit:  m.ContextLimit,
-			Availability:  availability,
-			QueueEstimate: 0,
-			IsManaged:     managed,
+			SupportsThinking: m.SupportsThinking,
+			RoomID:           roomRec.RoomID,
+			HostMemberID:     myMemberID,
+			ModelID:          m.ID,
+			Revision:         m.Revision,
+			Name:             m.Name,
+			ContextLimit:     m.ContextLimit,
+			Availability:     availability,
+			QueueEstimate:    0,
+			IsManaged:        managed,
 		}
 		if err := ad.Sign(myPrivKey); err != nil {
 			continue
 		}
 		_ = s.catalog.Upsert(ad, myPubKey)
+	}
+	for _, old := range s.catalog.List() {
+		if old.HostMemberID != myMemberID || advertised[old.ModelID] || old.Availability == "offline" {
+			continue
+		}
+		old.Availability = "offline"
+		old.Revision++
+		if old.Sign(myPrivKey) == nil {
+			_ = s.catalog.Upsert(old, myPubKey)
+		}
 	}
 }

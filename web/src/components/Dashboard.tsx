@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { api } from '../api.ts'
+import { availabilityColor, availabilityLabel, isUnavailable } from '../availability.ts'
 
 interface ModelAd {
   room_id: string
@@ -10,7 +11,7 @@ interface ModelAd {
   availability: string
   queue_estimate: number
   host_display_name: string
-  is_managed: boolean
+  is_managed?: boolean
 }
 
 interface LeaderboardEntry {
@@ -42,7 +43,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const [leaderboardError, setLeaderboardError] = useState('')
   const [leaveError, setLeaveError] = useState('')
   const [search, setSearch] = useState('')
-  const [readyOnly, setReadyOnly] = useState(false)
+  const [usableOnly, setUsableOnly] = useState(false)
 
   const fetchCatalog = async () => {
     try {
@@ -84,7 +85,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
     return () => clearInterval(interval)
   }, [])
 
-  const visibleModels = catalog.filter(m => (!readyOnly || m.availability === 'ready') && `${m.name} ${m.host_display_name}`.toLowerCase().includes(search.toLowerCase()))
+  // Filtering on 'ready' would hide exactly the models this room now offers
+  // on demand, so the filter asks whether a model can take a request at all:
+  // a downloaded one its host will load counts.
+  const visibleModels = catalog.filter(m => (!usableOnly || !isUnavailable(m.availability)) && `${m.name} ${m.host_display_name}`.toLowerCase().includes(search.toLowerCase()))
 
   return (
     <div className="dashboard-layout">
@@ -98,7 +102,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
       </section>
       <div className="room-stats" aria-label="Room overview">
         <div><strong>{catalog.length}</strong><span>Models in the meadow</span></div>
-        <div><strong>{catalog.filter(m => m.availability === 'ready').length}</strong><span>Ready to chat</span></div>
+        <div><strong>{catalog.filter(m => !isUnavailable(m.availability)).length}</strong><span>Usable by peers</span></div>
+        <div><strong>{catalog.filter(m => m.availability === 'ready').length}</strong><span>Ready now</span></div>
         <div><strong>{new Set(catalog.map(m => m.host_member_id)).size}</strong><span>Hosts sharing models</span></div>
       </div>
       <div className="card model-catalog">
@@ -109,7 +114,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
           </button>
         </div>
 
-        <div className="catalog-tools"><input className="form-control" aria-label="Search models or hosts" placeholder="Find a model or a friend…" value={search} onChange={e => setSearch(e.target.value)} /><label><input type="checkbox" checked={readyOnly} onChange={e => setReadyOnly(e.target.checked)} /> Ready only</label></div>
+        <div className="catalog-tools"><input className="form-control" aria-label="Search models or hosts" placeholder="Find a model or a friend…" value={search} onChange={e => setSearch(e.target.value)} /><label title="Hides models whose host is offline. Downloaded models that load on request are still shown."><input type="checkbox" checked={usableOnly} onChange={e => setUsableOnly(e.target.checked)} /> Usable only</label></div>
+        <p style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', margin: '0 0 1rem' }}>
+          Models marked <strong>Ready</strong> are currently advertised by their host. Downloaded managed models marked <strong>Starts on request</strong> are ready to use too; their host loads them when your first message arrives.
+        </p>
         {catalogError && <div role="alert" className="alert alert-error">{catalogError}</div>}
         {loading ? (
           <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>Discovering models from peers...</p>
@@ -122,7 +130,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
           </div>
         ) : (
           <div className="model-grid">
-            {visibleModels.length === 0 && <p className="empty-state">No models match. Try another search or turn off “Ready only”.</p>}
+            {visibleModels.length === 0 && <p className="empty-state">No models match. Try another search or turn off “Usable only”.</p>}
             {visibleModels.map((m) => (
               <div
                 className="model-tile"
@@ -138,16 +146,20 @@ export const Dashboard: React.FC<DashboardProps> = ({
                 }}
               >
                 <div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.5rem' }}>
+                  {/* The status badge cannot shrink, so on a narrow tile it
+                      would squeeze a long model name into a one-character
+                      column. Let it drop to its own line instead. */}
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.5rem' }}>
                     <h3 style={{ fontSize: '1.1rem', fontWeight: 600 }}>{m.name}</h3>
                     <span
                       className="badge"
                       style={{
-                        backgroundColor: m.availability === 'ready' ? 'var(--accent-success)' : 'var(--border-color)',
+                        backgroundColor: availabilityColor(m.availability),
                         fontSize: '0.7rem',
                       }}
+                      aria-label={`Model status: ${availabilityLabel(m.availability, m.is_managed)}`}
                     >
-                      {m.availability}
+                      {availabilityLabel(m.availability, m.is_managed)}
                     </span>
                   </div>
 
@@ -168,14 +180,21 @@ export const Dashboard: React.FC<DashboardProps> = ({
                       </span>
                     )}
                   </div>
+                  {m.availability === 'unloaded' && (
+                    <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', margin: '0 0 1rem' }}>
+                      The host keeps this downloaded model ready on disk and will load it when you send your first message.
+                    </p>
+                  )}
                 </div>
 
                 <button
                   className="btn btn-primary"
                   style={{ width: '100%', fontSize: '0.9rem', padding: '0.5rem' }}
                   onClick={() => onSelectModelForChat(m)}
+                  disabled={isUnavailable(m.availability)}
+                  title={isUnavailable(m.availability) ? 'This host is currently unavailable' : undefined}
                 >
-                  Start a conversation ↗
+                  {isUnavailable(m.availability) ? 'Unavailable' : 'Start a conversation ↗'}
                 </button>
               </div>
             ))}

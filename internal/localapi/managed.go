@@ -2,7 +2,6 @@ package localapi
 
 import (
 	"context"
-	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,11 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Chrisbaack/woolwire/internal/catalog"
 	"github.com/Chrisbaack/woolwire/internal/hosting"
-	"github.com/Chrisbaack/woolwire/internal/identity"
 	"github.com/Chrisbaack/woolwire/internal/modelpath"
-	"github.com/Chrisbaack/woolwire/internal/peerapi"
 	"github.com/Chrisbaack/woolwire/internal/runner"
 	"github.com/Chrisbaack/woolwire/internal/store"
 )
@@ -297,7 +293,8 @@ func (s *Server) handleRunnerHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	health, err := s.runnerClient.Health(r.Context())
+	s.infer.SetRunner(s.runnerClient)
+	health, err := s.infer.RunnerHealth(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -344,56 +341,36 @@ func (s *Server) handleRunnerHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleLoadManagedModel(w http.ResponseWriter, r *http.Request) {
-	if s.runnerClient == nil {
-		http.Error(w, "runner companion container not configured", http.StatusServiceUnavailable)
-		return
-	}
+type managedModelRequest struct {
+	ModelID      string   `json:"model_id"`
+	Name         string   `json:"name"`
+	Filename     string   `json:"filename"`
+	ContextLimit int      `json:"context_limit"`
+	MaxTokens    int      `json:"max_tokens"`
+	Threads      int      `json:"threads"`
+	GPULayers    *int     `json:"gpu_layers"`
+	Projector    string   `json:"projector,omitempty"`
+	DraftModel   string   `json:"draft_model,omitempty"`
+	ExtraArgs    []string `json:"extra_args"`
+	Published    *bool    `json:"published"`
+}
 
-	var body struct {
-		ModelID      string `json:"model_id"`
-		Name         string `json:"name"`
-		Filename     string `json:"filename"`
-		ContextLimit int    `json:"context_limit"`
-		MaxTokens    int    `json:"max_tokens"`
-		Threads      int    `json:"threads"`
-		// GPULayers is optional: omitted, the runner decides, since it is the
-		// container holding the GPU.
-		GPULayers *int     `json:"gpu_layers"`
-		ExtraArgs []string `json:"extra_args"`
-		Published *bool    `json:"published"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ModelID == "" || body.Filename == "" {
-		http.Error(w, "model_id and filename required", http.StatusBadRequest)
-		return
+func (s *Server) decodeManagedModelRequest(w http.ResponseWriter, r *http.Request) (managedModelRequest, hosting.LoadRequest, error) {
+	var body managedModelRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil || body.ModelID == "" || body.Filename == "" {
+		return body, hosting.LoadRequest{}, errors.New("model_id and filename required")
 	}
 	if err := runner.ValidateExtraArgs(body.ExtraArgs); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return body, hosting.LoadRequest{}, err
 	}
-
-	// The reference may name a file inside a subdirectory of the models
-	// directory — that is where a Hugging Face cache keeps them — but it must
-	// not point outside it.
 	ref, err := modelpath.Clean(body.Filename)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return body, hosting.LoadRequest{}, err
 	}
 	body.Filename = ref
-
-	// The model's companions are looked up rather than asked for. Which
-	// projector or draft module goes with a model follows from the model, and
-	// making someone choose one is how they end up with a vision model that
-	// cannot see.
-	load := hosting.LoadRequest{
-		ModelID:      body.ModelID,
-		Filename:     body.Filename,
-		ContextLimit: body.ContextLimit,
-		Threads:      body.Threads,
-		GPULayers:    body.GPULayers,
-		ExtraArgs:    body.ExtraArgs,
-	}
+	load := hosting.LoadRequest{ModelID: body.ModelID, Filename: body.Filename, ContextLimit: body.ContextLimit,
+		Threads: body.Threads, GPULayers: body.GPULayers, Projector: body.Projector,
+		DraftModel: body.DraftModel, ExtraArgs: body.ExtraArgs}
 	if s.artifactMgr != nil {
 		for _, c := range s.artifactMgr.CompanionsFor(body.Filename) {
 			switch c.Kind {
@@ -404,19 +381,36 @@ func (s *Server) handleLoadManagedModel(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 	}
+	return body, load, nil
+}
 
-	if err := s.runnerClient.LoadModel(r.Context(), load); err != nil {
-		s.withdrawManagedModels("")
-		http.Error(w, fmt.Sprintf("failed to load model in runner: %v", err), http.StatusInternalServerError)
-		return
+// modelSupportsThinking asks the weights, not the caller: whether a model
+// reasons is a property of its chat template, and a client has no business
+// claiming otherwise.
+func (s *Server) modelSupportsThinking(filename string) bool {
+	if s.artifactMgr == nil {
+		return false
 	}
+	artifacts, err := s.artifactMgr.ListArtifacts()
+	if err != nil {
+		return false
+	}
+	for _, a := range artifacts {
+		if a.Path == filename {
+			return a.SupportsThinking
+		}
+	}
+	return false
+}
 
-	// Withdraw any other managed models that were replaced by the newly loaded model.
-	s.withdrawManagedModels(body.ModelID)
+// managedDisplayName turns a weights path into a name to show a person. The
+// .gguf suffix is noise in a list where every entry carries it, and a cached
+// model's path is a long nested one nobody wants to read.
+func managedDisplayName(weightsPath string) string {
+	return strings.TrimSuffix(path.Base(strings.TrimSpace(weightsPath)), ".gguf")
+}
 
-	// Loading weights into the runner is only half the job. Without a
-	// hosted_models row the model was never advertised in the catalog and no
-	// peer could ever request it, so managed models were unreachable.
+func (s *Server) managedRecord(body managedModelRequest, load hosting.LoadRequest) store.HostedModelRecord {
 	contextLimit := body.ContextLimit
 	if contextLimit <= 0 {
 		contextLimit = 4096
@@ -431,95 +425,130 @@ func (s *Server) handleLoadManagedModel(w http.ResponseWriter, r *http.Request) 
 			maxTokens = 4096
 		}
 	}
-
 	name := strings.TrimSpace(body.Name)
 	if name == "" {
-		name = strings.TrimSuffix(path.Base(body.Filename), ".gguf")
+		name = managedDisplayName(body.Filename)
+	}
+	return store.HostedModelRecord{ID: body.ModelID, Name: name, ModelType: "managed",
+		SupportsThinking: s.modelSupportsThinking(body.Filename),
+		EndpointURL:      managedEndpointSentinel, BackendModel: name, ContextLimit: contextLimit,
+		MaxTokens: maxTokens, Enabled: true, Published: body.Published != nil && *body.Published,
+		Filename: body.Filename, Threads: load.Threads, GPULayers: load.GPULayers,
+		Projector: load.Projector, DraftModel: load.DraftModel, ExtraArgs: append([]string(nil), load.ExtraArgs...)}
+}
+
+// managedRecordFor builds the row to persist for a prepare or a load. It
+// merges onto any existing row, so a field the caller omitted keeps its stored
+// value instead of reverting to a default and silently discarding an earlier
+// choice. preserveEnabled applies to prepare: re-describing a model nobody is
+// sharing must not quietly re-enable a row that was disabled, whereas loading
+// one is an explicit request to serve it.
+func (s *Server) managedRecordFor(body managedModelRequest, load hosting.LoadRequest, preserveEnabled bool) store.HostedModelRecord {
+	rec := s.managedRecord(body, load)
+	rec.Revision = 1
+	existing, err := s.store.GetHostedModel(body.ModelID)
+	if err != nil || existing == nil {
+		return rec
+	}
+	rec.Revision = existing.Revision + 1
+	if body.ContextLimit <= 0 {
+		rec.ContextLimit = existing.ContextLimit
+	}
+	if body.MaxTokens <= 0 {
+		rec.MaxTokens = existing.MaxTokens
+	}
+	if strings.TrimSpace(body.Name) == "" {
+		rec.Name, rec.BackendModel = existing.Name, existing.BackendModel
+	}
+	if body.Published == nil {
+		rec.Published = existing.Published
+	}
+	if preserveEnabled && !rec.Published {
+		rec.Enabled = existing.Enabled
+	}
+	return rec
+}
+
+// weightsAreDownloaded reports whether the artifact manager can see the file a
+// managed row names. A model can only be prepared for on-demand loading once
+// its weights are actually on this host.
+func (s *Server) weightsAreDownloaded(filename string) (bool, error) {
+	if s.artifactMgr == nil {
+		return true, nil
+	}
+	artifacts, err := s.artifactMgr.ListArtifacts()
+	if err != nil {
+		return false, err
+	}
+	for _, a := range artifacts {
+		if a.Path == filename {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *Server) handlePrepareManagedModel(w http.ResponseWriter, r *http.Request) {
+	body, load, err := s.decodeManagedModelRequest(w, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	downloaded, listErr := s.weightsAreDownloaded(body.Filename)
+	if listErr != nil {
+		http.Error(w, "failed to read the downloaded model inventory", http.StatusInternalServerError)
+		return
+	}
+	if !downloaded {
+		http.Error(w, "model weights are not downloaded on this host", http.StatusConflict)
+		return
 	}
 
-	revision := 1
-	if existing, err := s.store.GetHostedModel(body.ModelID); err == nil && existing != nil {
-		revision = existing.Revision + 1
+	rec := s.managedRecordFor(body, load, true)
+	if err := s.store.SaveHostedModel(rec); err != nil {
+		http.Error(w, "failed to record managed model", http.StatusInternalServerError)
+		return
+	}
+	// Advertise immediately rather than waiting for the refresh tick, so a
+	// prepared model is offered to peers as soon as the owner shares it.
+	s.advertiseLocalModels()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(rec)
+}
+
+func (s *Server) handleLoadManagedModel(w http.ResponseWriter, r *http.Request) {
+	if s.runnerClient == nil {
+		http.Error(w, "runner companion container not configured", http.StatusServiceUnavailable)
+		return
 	}
 
-	rec := store.HostedModelRecord{
-		ID:        body.ModelID,
-		Name:      name,
-		ModelType: "managed",
-		// Managed models are served through the runner client, not dialed, so
-		// the endpoint column carries a sentinel rather than a URL.
-		EndpointURL:  managedEndpointSentinel,
-		BackendModel: name,
-		ContextLimit: contextLimit,
-		MaxTokens:    maxTokens,
-		Enabled:      true,
-		Published:    body.Published == nil || *body.Published,
-		Revision:     revision,
+	body, load, err := s.decodeManagedModelRequest(w, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
+	s.infer.SetRunner(s.runnerClient)
+	if err := s.infer.LoadManagedModel(r.Context(), load); err != nil {
+		// Keep prepared rows and their sharing choices intact; refresh the ad so
+		// peers see the runner's actual state after a failed replacement.
+		s.advertiseLocalModels()
+		http.Error(w, fmt.Sprintf("failed to load model in runner: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Loading is also a convenient way to prepare a model. It publishes only
+	// when the caller explicitly supplied published=true; downloaded inventory
+	// is otherwise opt-in through /prepare.
+	rec := s.managedRecordFor(body, load, false)
 	if err := s.store.SaveHostedModel(rec); err != nil {
 		http.Error(w, "failed to record managed model", http.StatusInternalServerError)
 		return
 	}
 
-	// Advertise it immediately rather than waiting for the refresh tick, so
-	// the model is selectable the moment the UI reloads the catalog.
 	s.advertiseLocalModels()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rec)
-}
-
-func (s *Server) withdrawManagedModels(exceptModelID string) {
-	models, err := s.store.ListHostedModels()
-	if err != nil {
-		return
-	}
-
-	roomRec, _ := s.store.GetRoomState()
-	device, _ := s.store.GetDeviceIdentity()
-	var myMemberID string
-	var myPubKey ed25519.PublicKey
-	var myPrivKey ed25519.PrivateKey
-	if device != nil {
-		myMemberID, _ = peerapi.MemberIDForDevicePublic(device.DevicePublic)
-		if pubBytes, err := identity.DecodeToken(device.DevicePublic, ed25519.PublicKeySize); err == nil {
-			myPubKey = ed25519.PublicKey(pubBytes)
-		}
-		if len(device.DevicePrivate) == ed25519.PrivateKeySize {
-			myPrivKey = ed25519.PrivateKey(device.DevicePrivate)
-		}
-	}
-
-	for _, m := range models {
-		if m.ModelType != "managed" {
-			continue
-		}
-		if exceptModelID != "" && m.ID == exceptModelID {
-			continue
-		}
-		if !m.Enabled {
-			continue
-		}
-		m.Enabled = false
-		m.Revision++
-		_ = s.store.SaveHostedModel(m)
-
-		if s.catalog != nil && roomRec != nil && myPubKey != nil && myPrivKey != nil {
-			ad := catalog.ModelAd{
-				RoomID:        roomRec.RoomID,
-				HostMemberID:  myMemberID,
-				ModelID:       m.ID,
-				Revision:      m.Revision,
-				Name:          m.Name,
-				ContextLimit:  m.ContextLimit,
-				Availability:  "offline",
-				QueueEstimate: 0,
-				IsManaged:     true,
-			}
-			_ = ad.Sign(myPrivKey)
-			_ = s.catalog.Upsert(ad, myPubKey)
-		}
-	}
 }
 
 // managedEndpointSentinel marks a hosted_models row that is served by the
@@ -532,12 +561,15 @@ func (s *Server) handleUnloadManagedModel(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := s.runnerClient.UnloadModel(r.Context()); err != nil {
+	s.infer.SetRunner(s.runnerClient)
+	if err := s.infer.UnloadManagedModel(r.Context()); err != nil {
 		http.Error(w, fmt.Sprintf("failed to unload model: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	s.withdrawManagedModels("")
+	// Explicit unload leaves the model published and therefore visible as
+	// unloaded in the room; only the runner's weights have been released.
+	s.advertiseLocalModels()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})

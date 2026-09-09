@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Chrisbaack/woolwire/internal/hosting"
+	"github.com/Chrisbaack/woolwire/internal/inference"
 	"github.com/Chrisbaack/woolwire/internal/peerapi"
 	"github.com/Chrisbaack/woolwire/internal/sse"
 )
@@ -112,6 +113,9 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 		Model    string                `json:"model"`
 		Messages []hosting.ChatMessage `json:"messages"`
 		Stream   bool                  `json:"stream"`
+		// ReasoningEffort is the OpenAI spelling of a thinking level, so a
+		// client already written against that API asks for one the usual way.
+		ReasoningEffort string `json:"reasoning_effort"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -119,6 +123,10 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 	}
 	if len(req.Messages) == 0 {
 		http.Error(w, "messages are required", http.StatusBadRequest)
+		return
+	}
+	thinking, thinkingOK := s.resolveThinking(w, req.ReasoningEffort)
+	if !thinkingOK {
 		return
 	}
 
@@ -171,7 +179,7 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	runErr := s.runOpenAIRequest(r, myMemberID, matchedHostID, matchedModelID, requestID, req.Messages, emit)
+	runErr := s.runOpenAIRequest(r, myMemberID, matchedHostID, matchedModelID, requestID, req.Messages, thinking, emit)
 
 	if req.Stream {
 		if runErr != nil {
@@ -221,6 +229,7 @@ func (s *Server) runOpenAIRequest(
 	r *http.Request,
 	myMemberID, hostMemberID, modelID, requestID string,
 	messages []hosting.ChatMessage,
+	thinking inference.ThinkingLevel,
 	emit func(string) error,
 ) error {
 	if hostMemberID == myMemberID {
@@ -230,7 +239,7 @@ func (s *Server) runOpenAIRequest(
 		}
 		// The owner's own OpenAI-compatible traffic occupies the same slots as
 		// remote members', so local usage is visible to the fairness limits.
-		return s.infer.Execute(r.Context(), myMemberID, requestID, localModel, messages, emit)
+		return s.infer.Execute(r.Context(), myMemberID, requestID, localModel, messages, thinking, emit)
 	}
 
 	targetAddr := s.peerAddress(hostMemberID)
@@ -253,6 +262,7 @@ func (s *Server) runOpenAIRequest(
 		RequestID: requestID,
 		ModelID:   modelID,
 		Messages:  messages,
+		Thinking:  string(thinking),
 	})
 	if err != nil {
 		return err

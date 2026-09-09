@@ -302,7 +302,7 @@ input[type=checkbox] { accent-color: #8ead80; }
 .moon { position: absolute; color: #e8d99f; right: 65px; top: 30px; font-size: 45px; }
 .sheep { position: absolute; bottom: 35px; right: 73px; font-size: 62px; transform: rotate(-8deg); }
 .flower { position: absolute; bottom: 10px; right: 25px; color: #eed39c; font-size: 30px; }
-.room-stats { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--border-color); border-radius: 12px; background: #1d2a24; padding: 18px 0; }
+.room-stats { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--border-color); border-radius: 12px; background: #1d2a24; padding: 18px 0; }
 .room-stats > div { padding: 0 24px; display: flex; gap: 14px; align-items: center; }
 .room-stats > div + div { border-left: 1px solid var(--border-color); }
 .room-stats strong { font: 29px Georgia, serif; color: #e5d9af; }
@@ -314,7 +314,7 @@ input[type=checkbox] { accent-color: #8ead80; }
 .model-tile { min-width: 0; gap: 10px; transition: border-color .15s; }
 .model-tile:hover { border-color: #859574 !important; }
 .model-tile h3 { overflow-wrap: anywhere; }
-.model-tile .badge { margin-left: 8px; }
+.model-tile .badge { flex: 0 0 auto; }
 .contribution-panel { align-self: start; min-width: 0; }
 .contribution-panel > div:first-child { flex-wrap: wrap; gap: 10px; }
 .contribution-panel table { font-size: 12px !important; }
@@ -366,6 +366,7 @@ input[type=checkbox] { accent-color: #8ead80; }
   .moon { right: 8px; font-size: 28px; }
   .hero-caption { max-width: 80%; font-size: 9px; }
   .room-stats > div { padding: 0 12px; flex-direction: column; gap: 3px; align-items: flex-start; }
+  .room-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .room-stats span { font-size: 10px; }
   .catalog-tools { flex-wrap: wrap; gap: 10px; }
   .conversation-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: 155px minmax(360px, 1fr); height: calc(100dvh - 180px); min-height: 540px; gap: 12px; }

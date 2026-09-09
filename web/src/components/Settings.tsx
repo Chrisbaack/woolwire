@@ -14,6 +14,12 @@ interface HostedModel {
   enabled: boolean
   published: boolean
   revision: number
+  filename?: string
+  threads?: number
+  gpu_layers?: number | null
+  projector?: string
+  draft_model?: string
+  extra_args?: string[]
 }
 
 interface HostLimits {
@@ -22,6 +28,9 @@ interface HostLimits {
   MaxQueuedTotal: number
   QueueTimeoutSeconds: number
   ExecutionTimeoutSeconds: number
+  // Negative never releases a demand-loaded model, zero releases it as soon
+  // as the queue drains, positive waits that many seconds.
+  IdleUnloadSeconds: number
 }
 
 interface HardwareProfile {
@@ -306,14 +315,26 @@ export const Settings: React.FC = () => {
   const [runnerFlags, setRunnerFlags] = useState<RunnerExtraFlag[]>([])
   const [managedConfigError, setManagedConfigError] = useState('')
   const managedConfigHydrated = useRef(false)
+  const managedArtifactConfigHydrated = useRef('')
+  const managedConfigEdited = useRef(false)
+  const managedPublicationEdited = useRef(false)
   const [models, setModels] = useState<HostedModel[]>([])
+  const [modelsFetched, setModelsFetched] = useState(false)
+  const [runnerDataFetched, setRunnerDataFetched] = useState(false)
+  // The stored policy is one number; the form shows it as a choice plus a
+  // minute count, so both are derived rather than held as separate state that
+  // could disagree with what will be saved.
   const [limits, setLimits] = useState<HostLimits>({
     MaxActive: 1,
     MaxQueuedPerMember: 1,
     MaxQueuedTotal: 10,
     QueueTimeoutSeconds: 300,
     ExecutionTimeoutSeconds: 600,
+    IdleUnloadSeconds: 300,
   })
+  const idleUnloadSeconds = limits?.IdleUnloadSeconds ?? 300
+  const idleUnloadChoice = idleUnloadSeconds < 0 ? 'never' : idleUnloadSeconds === 0 ? 'immediately' : 'after'
+  const idleUnloadMinutes = idleUnloadSeconds > 0 ? Math.max(1, Math.round(idleUnloadSeconds / 60)) : 5
   const [hardware, setHardware] = useState<HardwareProfile | null>(null)
 
   const [runner, setRunner] = useState<RunnerHealth | null>(null)
@@ -331,9 +352,17 @@ export const Settings: React.FC = () => {
   // reports healthy, so that wait has to be visible.
   const [selectedArtifactID, setSelectedArtifactID] = useState<string>('')
   const [loadingModelID, setLoadingModelID] = useState<string>('')
+  const [preparingModelID, setPreparingModelID] = useState<string>('')
+  // Downloading a model and making it available to peers are separate from
+  // loading it into the runner. Sharing remains an explicit opt-in.
+  const [managedPublished, setManagedPublished] = useState(false)
   const selectedArtifact = (artifacts || []).find((a) => a.id === selectedArtifactID) || null
   const selectedIsLoaded = !!selectedArtifact && runner?.loaded_file === (selectedArtifact.path || selectedArtifact.filename)
+  const selectedHostedModel = models.find((model) => model.id === selectedArtifactID)
+  const selectedIsPrepared = Boolean(selectedHostedModel)
   const loadingModel = loadingModelID !== ''
+  const preparingModel = preparingModelID !== ''
+  const modelActionInFlight = loadingModel || preparingModel
   const loadingName = (artifacts || []).find((a) => a.id === loadingModelID)?.name || 'the model'
   // What the runner is serving, named rather than pathed: a Hugging Face
   // cache path is long enough to swamp anything shown beside it.
@@ -530,6 +559,8 @@ export const Settings: React.FC = () => {
       }
     } catch {
       // ignore
+    } finally {
+      setModelsFetched(true)
     }
   }
 
@@ -561,7 +592,7 @@ export const Settings: React.FC = () => {
         // number reads back as zero, which would show "0 threads" and then be
         // rejected by this form's own validation. Hydration is a one-shot so
         // polling never overwrites what the user is typing.
-        if (!managedConfigHydrated.current && Number(nextRunner.context_limit) > 0) {
+        if (!managedConfigHydrated.current && !managedConfigEdited.current && Number(nextRunner.context_limit) > 0) {
           setManagedContextLimit(Number(nextRunner.context_limit))
           if (Number(nextRunner.threads) > 0) setManagedThreads(Number(nextRunner.threads))
           // The dropdown only offers auto / 0 / custom, so any other layer
@@ -604,6 +635,8 @@ export const Settings: React.FC = () => {
       }
     } catch {
       // ignore
+    } finally {
+      setRunnerDataFetched(true)
     }
   }
 
@@ -630,15 +663,72 @@ export const Settings: React.FC = () => {
     })
   }, [artifacts, runner?.loaded_file])
 
-  // A model's own context limit is the right default for it. The engine's
-  // live value wins for the model already loaded, and this deliberately does
-  // not re-run on every keystroke, so a typed value survives polling.
+  const resetManagedConfig = (artifact: ArtifactManifest | null) => {
+    setManagedContextLimit(artifact?.context_limit || 4096)
+    setManagedThreads(4)
+    setManagedGpuLayers('auto')
+    setManagedCustomGpuLayers('0')
+    setManagedExtraArgs('[]')
+  }
+
+  const applyRunnerConfig = (health: RunnerHealth, artifact: ArtifactManifest | null) => {
+    setManagedContextLimit(Number(health.context_limit) > 0 ? Number(health.context_limit) : artifact?.context_limit || 4096)
+    setManagedThreads(Number(health.threads) > 0 ? Number(health.threads) : 4)
+    if (health.gpu_layers == null) {
+      setManagedGpuLayers('auto')
+    } else if (Number(health.gpu_layers) === 0) {
+      setManagedGpuLayers('0')
+    } else {
+      setManagedGpuLayers('custom')
+      setManagedCustomGpuLayers(String(health.gpu_layers))
+    }
+    setManagedExtraArgs(JSON.stringify(health.extra_args || [], null, 2))
+  }
+
+  // Reset immediately when the selection changes. The saved model or live
+  // runner settings are applied once both async inventories have arrived.
   useEffect(() => {
-    const artifact = (artifacts || []).find((a) => a.id === selectedArtifactID)
-    if (!artifact) return
-    if ((artifact.path || artifact.filename) === runner?.loaded_file && Number(runner?.context_limit) > 0) return
-    setManagedContextLimit(artifact.context_limit || 4096)
+    if (!selectedArtifactID) return
+    managedArtifactConfigHydrated.current = ''
+    managedConfigEdited.current = false
+    managedPublicationEdited.current = false
+    resetManagedConfig(selectedArtifact)
+    setManagedPublished(false)
   }, [selectedArtifactID])
+
+  useEffect(() => {
+    if (!selectedArtifactID || !selectedArtifact || !modelsFetched || !runnerDataFetched) return
+    if (managedArtifactConfigHydrated.current === selectedArtifactID) return
+
+    const hosted = models.find((model) => model.id === selectedArtifactID)
+    const isLoaded = selectedArtifact.path === runner?.loaded_file || selectedArtifact.filename === runner?.loaded_file
+    if (!managedPublicationEdited.current) setManagedPublished(Boolean(hosted?.published))
+
+    // A prepared model may be unloaded, so use its persisted launch request.
+    // If the runner currently serves it, the live runner settings win.
+    // The initial API calls can finish after someone starts editing. Preserve
+    // those edits instead of letting late runner/catalog data rewrite them.
+    if (!managedConfigEdited.current) {
+      if (isLoaded && Number(runner?.context_limit) > 0) {
+        applyRunnerConfig(runner!, selectedArtifact)
+      } else if (hosted) {
+        setManagedContextLimit(Number(hosted.context_limit) > 0 ? Number(hosted.context_limit) : selectedArtifact.context_limit || 4096)
+        setManagedThreads(Number(hosted.threads) > 0 ? Number(hosted.threads) : 4)
+        if (hosted.gpu_layers == null) {
+          setManagedGpuLayers('auto')
+        } else if (Number(hosted.gpu_layers) === 0) {
+          setManagedGpuLayers('0')
+        } else {
+          setManagedGpuLayers('custom')
+          setManagedCustomGpuLayers(String(hosted.gpu_layers))
+        }
+        setManagedExtraArgs(JSON.stringify(hosted.extra_args || [], null, 2))
+      } else {
+        resetManagedConfig(selectedArtifact)
+      }
+    }
+    managedArtifactConfigHydrated.current = selectedArtifactID
+  }, [selectedArtifactID, selectedArtifact, modelsFetched, runnerDataFetched, models, runner?.loaded_file, runner?.context_limit])
 
   // The textarea is the source of truth; parsing it is how a click knows what
   // to append. Null means it does not currently hold a JSON array of strings,
@@ -656,12 +746,17 @@ export const Settings: React.FC = () => {
     if (extraArgsList === null) return
     const entry = flag.value === 'required' ? `${flag.flag}=` : flag.flag
     if (extraArgsList.some((item) => item === flag.flag || item.startsWith(`${flag.flag}=`))) return
+    managedConfigEdited.current = true
     setManagedExtraArgs(JSON.stringify([...extraArgsList, entry], null, 2))
     setManagedConfigError('')
   }
 
   const handleSelectArtifact = (id: string) => {
     setSelectedArtifactID(id)
+    managedConfigEdited.current = false
+    managedPublicationEdited.current = false
+    const hosted = models.find((model) => model.id === id)
+    setManagedPublished(Boolean(hosted?.published))
     setLoadError('')
     setLoadSuccess('')
     setManagedConfigError('')
@@ -986,20 +1081,17 @@ export const Settings: React.FC = () => {
     setHfResolveMsg(`Filled in the form for ${file.filename}`)
   }
 
-  const handleLoadArtifactIntoRunner = async (artifact: ArtifactManifest) => {
-    setLoadError('')
-    setLoadSuccess('')
+  const managedModelRequestBody = (artifact: ArtifactManifest): Record<string, unknown> | null => {
     setManagedConfigError('')
     const selectedContext = Number(managedContextLimit) || artifact.context_limit || 4096
     if (!Number.isInteger(selectedContext) || selectedContext < 256) {
       setManagedConfigError('Context window must be a whole number of at least 256 tokens.')
-      return
+      return null
     }
     if (!Number.isInteger(managedThreads) || managedThreads < 1) {
       setManagedConfigError('CPU threads must be a positive whole number.')
-      return
+      return null
     }
-    const calculatedMaxTokens = Math.min(4096, Math.max(256, Math.floor(selectedContext / 2)), selectedContext)
     let extraArgs: string[] = []
     try {
       const parsed = JSON.parse(managedExtraArgs)
@@ -1009,13 +1101,34 @@ export const Settings: React.FC = () => {
       extraArgs = parsed
     } catch (err: any) {
       setManagedConfigError(err.message || 'Extra arguments must be valid JSON.')
-      return
+      return null
     }
     const gpuLayers = managedGpuLayers === 'auto' ? undefined : Number(managedGpuLayers === 'custom' ? managedCustomGpuLayers : managedGpuLayers)
     if (gpuLayers !== undefined && (!Number.isInteger(gpuLayers) || gpuLayers < 0)) {
       setManagedConfigError('GPU offload must be Auto or a non-negative whole number of layers.')
-      return
+      return null
     }
+    return {
+      // The artifact id is stable and safe in a URL segment; the path it
+      // was found at is not, and two models in different directories can
+      // share a filename.
+      model_id: artifact.id,
+      name: artifact.name,
+      filename: artifact.path || artifact.filename,
+      context_limit: selectedContext,
+      max_tokens: Math.min(4096, Math.max(256, Math.floor(selectedContext / 2)), selectedContext),
+      threads: Number(managedThreads) || 4,
+      ...(gpuLayers !== undefined ? { gpu_layers: gpuLayers } : {}),
+      extra_args: extraArgs,
+      published: managedPublished,
+    }
+  }
+
+  const handleLoadArtifactIntoRunner = async (artifact: ArtifactManifest) => {
+    setLoadError('')
+    setLoadSuccess('')
+    const body = managedModelRequestBody(artifact)
+    if (!body) return
     // The request is held open until the engine reports healthy, which for a
     // large model is a minute or more, so the button and the panel below it
     // show the wait instead of looking inert.
@@ -1023,27 +1136,12 @@ export const Settings: React.FC = () => {
     try {
       const res = await api('/api/v1/managed-models/load', {
         method: 'POST',
-        body: JSON.stringify({
-          // The artifact id is stable and safe in a URL segment; the path it
-          // was found at is not, and two models in different directories can
-          // share a filename.
-          model_id: artifact.id,
-          name: artifact.name,
-          filename: artifact.path || artifact.filename,
-          context_limit: selectedContext,
-          max_tokens: calculatedMaxTokens,
-          threads: Number(managedThreads) || 4,
-          ...(gpuLayers !== undefined ? { gpu_layers: gpuLayers } : {}),
-          extra_args: extraArgs,
-          published: models.find((model) => model.id === artifact.id)?.published ?? true,
-        }),
+        body: JSON.stringify(body),
       })
       if (res.ok) {
-        // Loading now also creates the hosted-model row, so the catalog
-        // reflects it immediately.
         await fetchModels()
         await fetchHardwareAndRunner()
-        setLoadSuccess(`${artifact.name} is loaded and serving.`)
+        setLoadSuccess(`${artifact.name} is loaded and serving${managedPublished ? ' to room members' : ' privately'}.`)
         // The runner status tab is where the freshly started engine can
         // actually be watched, so the load ends there.
         setActiveTab('status')
@@ -1054,6 +1152,35 @@ export const Settings: React.FC = () => {
       setLoadError(err.message)
     } finally {
       setLoadingModelID('')
+    }
+  }
+
+  const handlePrepareArtifactForSharing = async (artifact: ArtifactManifest) => {
+    setLoadError('')
+    setLoadSuccess('')
+    const body = managedModelRequestBody(artifact)
+    if (!body) return
+    setPreparingModelID(artifact.id)
+    try {
+      const res = await api('/api/v1/managed-models/prepare', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      if (res.ok) {
+        await fetchModels()
+        await fetchHardwareAndRunner()
+        setLoadSuccess(
+          managedPublished
+            ? `${artifact.name} configuration saved and shared. The current runner state is unchanged; the host will load it when a peer starts a request.`
+            : `${artifact.name} configuration saved privately. The current runner state is unchanged; enable sharing above when you want peers to use it.`,
+        )
+      } else {
+        setLoadError(await res.text())
+      }
+    } catch (err: any) {
+      setLoadError(err.message)
+    } finally {
+      setPreparingModelID('')
     }
   }
 
@@ -1085,6 +1212,7 @@ export const Settings: React.FC = () => {
         return
       }
       await fetchHardwareAndRunner()
+      await fetchModels()
     } catch {
       // ignore
     }
@@ -1335,14 +1463,14 @@ export const Settings: React.FC = () => {
         )}
       </div>
 
-      {/* Loading a model is its own job: pick one of the models on disk, set
-          the launch parameters, then start the engine. Downloading weights is
-          a different job and lives in its own card below. */}
+      {/* A downloaded model can be prepared for peer use without occupying
+          the runner. Loading remains an explicit, immediate-start action. */}
       <div className="card" id="model-loader">
-        <h2>Load a Model</h2>
+        <h2>Prepare or Load a Model</h2>
         <p className="settings-lede">
-          Choose one of the GGUF models on this node, set how it should run, and start the
-          engine. Loading replaces whatever the runner is serving now.
+          Choose one of the GGUF models on this node and set how it should run. Preparing saves
+          the configuration without changing the runner's current load state; loading starts it
+          now and replaces whatever the runner is serving.
         </p>
 
         {!runner?.configured ? (
@@ -1378,7 +1506,7 @@ export const Settings: React.FC = () => {
                 className="form-control"
                 value={selectedArtifactID}
                 onChange={(event) => handleSelectArtifact(event.target.value)}
-                disabled={loadingModel}
+                disabled={modelActionInFlight}
               >
                 {(artifacts || []).map((a) => (
                   <option key={a.id} value={a.id}>
@@ -1386,7 +1514,11 @@ export const Settings: React.FC = () => {
                     {' — '}
                     {(a.size_bytes / (1024 * 1024 * 1024)).toFixed(2)} GB
                     {a.architecture ? ` · ${a.architecture}` : ''}
-                    {runner?.loaded_file === (a.path || a.filename) ? ' · loaded now' : ''}
+                    {runner?.loaded_file === (a.path || a.filename)
+                      ? ' · loaded now'
+                      : models.some((model) => model.id === a.id)
+                        ? models.find((model) => model.id === a.id)?.published ? ' · prepared & shared' : ' · prepared privately'
+                        : ' · downloaded'}
                   </option>
                 ))}
               </select>
@@ -1402,8 +1534,8 @@ export const Settings: React.FC = () => {
                   min={256}
                   step={256}
                   value={managedContextLimit}
-                  onChange={(event) => setManagedContextLimit(Number(event.target.value))}
-                  disabled={loadingModel}
+                  onChange={(event) => { managedConfigEdited.current = true; setManagedContextLimit(Number(event.target.value)) }}
+                  disabled={modelActionInFlight}
                   aria-describedby="managed-context-help"
                 />
                 <small id="managed-context-help">Tokens the engine keeps in memory. Larger windows cost more RAM or VRAM.</small>
@@ -1416,8 +1548,8 @@ export const Settings: React.FC = () => {
                   type="number"
                   min={1}
                   value={managedThreads}
-                  onChange={(event) => setManagedThreads(Number(event.target.value))}
-                  disabled={loadingModel}
+                  onChange={(event) => { managedConfigEdited.current = true; setManagedThreads(Number(event.target.value)) }}
+                  disabled={modelActionInFlight}
                   aria-describedby="managed-threads-help"
                 />
                 <small id="managed-threads-help">
@@ -1430,8 +1562,8 @@ export const Settings: React.FC = () => {
                   id="managed-gpu-layers"
                   className="form-control"
                   value={managedGpuLayers}
-                  onChange={(event) => setManagedGpuLayers(event.target.value)}
-                  disabled={loadingModel}
+                  onChange={(event) => { managedConfigEdited.current = true; setManagedGpuLayers(event.target.value) }}
+                  disabled={modelActionInFlight}
                   aria-describedby="managed-gpu-help"
                 >
                   <option value="auto">Auto (recommended)</option>
@@ -1445,8 +1577,8 @@ export const Settings: React.FC = () => {
                     min={0}
                     aria-label="Custom GPU layers"
                     value={managedCustomGpuLayers}
-                    onChange={(event) => setManagedCustomGpuLayers(event.target.value)}
-                    disabled={loadingModel}
+                    onChange={(event) => { managedConfigEdited.current = true; setManagedCustomGpuLayers(event.target.value) }}
+                    disabled={modelActionInFlight}
                     style={{ marginTop: '0.35rem' }}
                   />
                 )}
@@ -1471,7 +1603,7 @@ export const Settings: React.FC = () => {
                         key={flag.flag}
                         type="button"
                         className="extra-flag-chip"
-                        disabled={loadingModel || extraArgsList === null}
+                        disabled={modelActionInFlight || extraArgsList === null}
                         title={
                           flag.value === 'none'
                             ? 'Stands alone; takes no value'
@@ -1500,8 +1632,8 @@ export const Settings: React.FC = () => {
                   className="form-control settings-code-input"
                   rows={3}
                   value={managedExtraArgs}
-                  onChange={(event) => setManagedExtraArgs(event.target.value)}
-                  disabled={loadingModel}
+                  onChange={(event) => { managedConfigEdited.current = true; setManagedExtraArgs(event.target.value) }}
+                  disabled={modelActionInFlight}
                   aria-describedby="managed-extra-help"
                 />
                 <small id="managed-extra-help">
@@ -1513,14 +1645,50 @@ export const Settings: React.FC = () => {
               </div>
             </details>
 
+            <div className="form-group" style={{ display: 'flex', alignItems: 'flex-start', gap: '0.5rem', marginTop: '1rem' }}>
+              <input
+                type="checkbox"
+                id="managed-share-check"
+                checked={managedPublished}
+                onChange={(event) => { managedPublicationEdited.current = true; setManagedPublished(event.target.checked) }}
+                disabled={modelActionInFlight}
+                style={{ marginTop: '0.25rem' }}
+              />
+              <label htmlFor="managed-share-check" style={{ marginBottom: 0, cursor: modelActionInFlight ? 'default' : 'pointer' }}>
+                Share this downloaded model with room members
+                <small style={{ display: 'block', color: 'var(--text-secondary)', fontSize: '0.8rem', fontWeight: 400 }}>
+                  Sharing is opt-in. When enabled, peers can select this model while it is unloaded;
+                  the runner starts it when the first request arrives. This choice is saved when you
+                  choose Prepare unloaded model (or Save model settings while loaded) or Load Model.
+                  Leave it off to keep the model private.
+                </small>
+              </label>
+            </div>
+
             {managedConfigError && <div className="alert alert-error" role="alert" style={{ fontSize: '0.8rem' }}>{managedConfigError}</div>}
 
             <div className="model-loader-actions">
               <button
                 type="button"
+                className="btn btn-secondary"
+                onClick={() => selectedArtifact && handlePrepareArtifactForSharing(selectedArtifact)}
+                disabled={modelActionInFlight || !selectedArtifact}
+                title="Save this model's settings without changing the runner's current load state"
+              >
+                {preparingModel ? (
+                  <>
+                    <span className="model-loader-spinner" aria-hidden="true" />
+                    Preparing…
+                  </>
+                ) : (
+                  selectedIsLoaded ? 'Save model settings' : 'Prepare unloaded model'
+                )}
+              </button>
+              <button
+                type="button"
                 className="btn btn-primary"
                 onClick={() => selectedArtifact && handleLoadArtifactIntoRunner(selectedArtifact)}
-                disabled={loadingModel || !selectedArtifact}
+                disabled={modelActionInFlight || !selectedArtifact}
               >
                 {loadingModel ? (
                   <>
@@ -1534,7 +1702,7 @@ export const Settings: React.FC = () => {
                 )}
               </button>
               {runner?.loaded_model_id && (
-                <button type="button" className="btn btn-secondary" onClick={handleUnloadRunner} disabled={loadingModel}>
+                <button type="button" className="btn btn-secondary" onClick={handleUnloadRunner} disabled={modelActionInFlight}>
                   Unload current model
                 </button>
               )}
@@ -1544,15 +1712,36 @@ export const Settings: React.FC = () => {
                   className="btn btn-secondary"
                   style={{ color: 'var(--accent-danger)' }}
                   onClick={() => handleDeleteArtifact(selectedArtifact)}
-                  disabled={loadingModel}
+                  disabled={modelActionInFlight}
                 >
                   Delete weights
                 </button>
               )}
-              {selectedIsLoaded && !loadingModel && (
+              {selectedIsLoaded && !modelActionInFlight && (
                 <span className="badge" style={{ backgroundColor: 'var(--accent-success)' }}>Loaded</span>
               )}
+              {selectedArtifact && !selectedIsLoaded && !modelActionInFlight && selectedIsPrepared && (
+                <span className="badge" style={{ backgroundColor: selectedHostedModel?.published ? 'var(--accent-primary)' : 'var(--border-color)' }}>
+                  {selectedHostedModel?.published ? 'Prepared · shared · unloaded' : 'Prepared · private · unloaded'}
+                </span>
+              )}
+              {selectedArtifact && !selectedIsLoaded && !modelActionInFlight && !selectedIsPrepared && (
+                <span className="badge" style={{ backgroundColor: 'var(--border-color)' }}>Downloaded · unprepared</span>
+              )}
             </div>
+
+            {preparingModel && (
+              <div className="model-loader-progress" role="status" aria-live="polite">
+                <div className="model-loader-bar"><span /></div>
+                <p>
+                  Saving the launch settings and refreshing the room advertisement. The current runner load state stays unchanged.
+                </p>
+              </div>
+            )}
+
+            <p className="settings-muted" style={{ marginTop: '0.75rem' }}>
+              On-demand models are released after five minutes of inactivity so the GPU is available for other work. Use Load Model when you want to keep one running manually.
+            </p>
 
             {/* The load request does not return until the engine reports
                 healthy, so the wait is real and needs to be visible. */}
@@ -1714,7 +1903,7 @@ export const Settings: React.FC = () => {
                             style={{ flex: 1, padding: '0.35rem', fontSize: '0.8rem' }}
                             onClick={() => installed && handleRevealInLoader(installed)}
                           >
-                            Downloaded — select to load
+                            Downloaded — select to prepare or load
                           </button>
                         ) : (
                           <>
@@ -2247,6 +2436,44 @@ export const Settings: React.FC = () => {
                 min={30}
               />
             </div>
+          </div>
+
+          <div className="form-group" style={{ marginTop: '1rem' }}>
+            <label htmlFor="idle-unload">Release a loaded model</label>
+            <select
+              id="idle-unload"
+              className="form-control"
+              value={idleUnloadChoice}
+              onChange={(e) => {
+                const choice = e.target.value
+                if (choice === 'never') setLimits({ ...limits, IdleUnloadSeconds: -1 })
+                else if (choice === 'immediately') setLimits({ ...limits, IdleUnloadSeconds: 0 })
+                else setLimits({ ...limits, IdleUnloadSeconds: idleUnloadMinutes * 60 })
+              }}
+            >
+              <option value="after">After a period of inactivity</option>
+              <option value="immediately">Immediately after each request</option>
+              <option value="never">Never — keep it loaded</option>
+            </select>
+            {idleUnloadChoice === 'after' && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem' }}>
+                <input
+                  type="number"
+                  aria-label="Minutes of inactivity before the model is released"
+                  className="form-control"
+                  style={{ maxWidth: '7rem' }}
+                  value={idleUnloadMinutes}
+                  onChange={(e) => setLimits({ ...limits, IdleUnloadSeconds: Math.max(1, Number(e.target.value)) * 60 })}
+                  min={1}
+                />
+                <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>minutes</span>
+              </div>
+            )}
+            <p style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', marginTop: '0.4rem' }}>
+              Applies to managed models the runner loaded on demand. Keeping one loaded holds its
+              weights in memory but answers the next request immediately; releasing frees the memory
+              and costs a load on the next request. A model you loaded yourself stays until you unload it.
+            </p>
           </div>
 
           <button type="submit" className="btn btn-primary" style={{ marginTop: '0.5rem' }}>

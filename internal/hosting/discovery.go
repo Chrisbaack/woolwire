@@ -232,17 +232,18 @@ func (m *ArtifactManager) discoverModels() []ArtifactManifest {
 		}
 
 		found = append(found, ArtifactManifest{
-			ID:           discoveredArtifactID(rel),
-			Name:         displayName(d.Name(), md),
-			Filename:     d.Name(),
-			Path:         rel,
-			RepoID:       hfRepoID(rel),
-			Architecture: md.Architecture,
-			Source:       SourceCache,
-			Role:         RoleModel,
-			SizeBytes:    size,
-			ContextLimit: defaultContextLimit(md),
-			InstalledAt:  info.ModTime().Unix(),
+			ID:               discoveredArtifactID(rel),
+			Name:             displayName(d.Name(), md),
+			Filename:         d.Name(),
+			Path:             rel,
+			RepoID:           hfRepoID(rel),
+			Architecture:     md.Architecture,
+			SupportsThinking: md.SupportsThinking,
+			Source:           SourceCache,
+			Role:             RoleModel,
+			SizeBytes:        size,
+			ContextLimit:     defaultContextLimit(md),
+			InstalledAt:      info.ModTime().Unix(),
 		})
 		return nil
 	})

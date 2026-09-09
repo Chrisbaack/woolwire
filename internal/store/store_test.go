@@ -181,3 +181,39 @@ func TestMessageVariantsShareAParent(t *testing.T) {
 		}
 	}
 }
+
+func TestManagedLoadConfigurationSurvivesRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "woolwire.db")
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers := 17
+	expected := HostedModelRecord{
+		ID: "managed-1", Name: "Vision", ModelType: "managed", EndpointURL: "runner://managed",
+		BackendModel: "Vision", ContextLimit: 8192, MaxTokens: 2048, Enabled: true, Published: true,
+		Revision: 3, Filename: "hub/models--org--vision/snapshots/r1/model.gguf", Threads: 8,
+		GPULayers: &layers, Projector: "hub/models--org--vision/mmproj.gguf", DraftModel: "draft.gguf",
+		ExtraArgs: []string{"--flash-attn=on", "--batch-size=512"},
+	}
+	if err := s.SaveHostedModel(expected); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+
+	reopened, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, err := reopened.GetHostedModel(expected.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Filename != expected.Filename || got.Threads != expected.Threads || got.Projector != expected.Projector || got.DraftModel != expected.DraftModel {
+		t.Fatalf("managed load paths did not survive restart: %#v", got)
+	}
+	if got.GPULayers == nil || *got.GPULayers != layers || len(got.ExtraArgs) != 2 || got.ExtraArgs[1] != expected.ExtraArgs[1] {
+		t.Fatalf("managed load tuning did not survive restart: %#v", got)
+	}
+}

@@ -70,7 +70,7 @@ func TestOwnModelStaysReachableWhileTheRunnerServesIt(t *testing.T) {
 	node.localSrv.runnerClient = hosting.NewRunnerClient(runnerSrv.URL, "")
 
 	if w := node.doJSON("POST", "/api/v1/managed-models/load", map[string]any{
-		"model_id": "art-abc", "name": "Qwen", "filename": "m.gguf", "context_limit": 8192,
+		"model_id": "art-abc", "name": "Qwen", "filename": "m.gguf", "context_limit": 8192, "published": true,
 	}); w.Code != http.StatusOK {
 		t.Fatalf("load model: %d %s", w.Code, w.Body.String())
 	}
@@ -118,7 +118,7 @@ func TestCatalogLoopRefreshesOwnAdvertisements(t *testing.T) {
 	node.localSrv.runnerClient = hosting.NewRunnerClient(runnerSrv.URL, "")
 
 	if w := node.doJSON("POST", "/api/v1/managed-models/load", map[string]any{
-		"model_id": "art-abc", "name": "Qwen", "filename": "m.gguf", "context_limit": 8192,
+		"model_id": "art-abc", "name": "Qwen", "filename": "m.gguf", "context_limit": 8192, "published": true,
 	}); w.Code != http.StatusOK {
 		t.Fatalf("load model: %d %s", w.Code, w.Body.String())
 	}
@@ -158,10 +158,10 @@ func TestCatalogLoopRefreshesOwnAdvertisements(t *testing.T) {
 	}
 }
 
-// TestManagedModelIsWithdrawnWhenTheRunnerDropsIt is the other half of keeping
-// advertisements honest: the hosted_models row outlives a runner restart, so a
-// refresh that trusted the row alone would advertise weights nothing holds.
-func TestManagedModelIsWithdrawnWhenTheRunnerDropsIt(t *testing.T) {
+// TestManagedModelBecomesUnloadedWhenTheRunnerDropsIt keeps the downloaded
+// model discoverable after a runner restart while accurately showing that its
+// weights are no longer resident.
+func TestManagedModelBecomesUnloadedWhenTheRunnerDropsIt(t *testing.T) {
 	vNet := transport.NewMemoryNetwork()
 	node := setupTestNode(t, vNet, "node-1", 4242)
 	node.login(t)
@@ -183,7 +183,7 @@ func TestManagedModelIsWithdrawnWhenTheRunnerDropsIt(t *testing.T) {
 	node.localSrv.runnerClient = hosting.NewRunnerClient(runnerSrv.URL, "")
 
 	if w := node.doJSON("POST", "/api/v1/managed-models/load", map[string]any{
-		"model_id": "art-abc", "name": "Qwen", "filename": "m.gguf", "context_limit": 8192,
+		"model_id": "art-abc", "name": "Qwen", "filename": "m.gguf", "context_limit": 8192, "published": true,
 	}); w.Code != http.StatusOK {
 		t.Fatalf("load model: %d %s", w.Code, w.Body.String())
 	}
@@ -200,7 +200,7 @@ func TestManagedModelIsWithdrawnWhenTheRunnerDropsIt(t *testing.T) {
 	if !ok {
 		t.Fatal("the advertisement disappeared entirely")
 	}
-	if ad.Availability != "offline" {
+	if ad.Availability != "unloaded" {
 		t.Fatalf("a model the runner no longer holds reads as %q", ad.Availability)
 	}
 }

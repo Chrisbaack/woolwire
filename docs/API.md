@@ -194,11 +194,15 @@ manage their own retention explicitly.
   repository weight choices. The current route exposes only the repo query.
 - `POST /api/v1/managed-models/download` starts a job. Poll `/downloads` and use
   `/downloads/{id}/cancel` to cancel. Downloads do not load a model automatically.
-- `POST /api/v1/managed-models/load` needs `model_id` and `filename`; optional
-  `name`, `context_limit`, `max_tokens`, `threads`, `gpu_layers`, and `published`
-  control loading/registration. Loading defaults to published.
-- `POST /api/v1/managed-models/unload` removes the runner's loaded model and its
-  advertisement.
+- `POST /api/v1/managed-models/prepare` needs `model_id` and `filename`; optional
+  `name`, `context_limit`, `max_tokens`, `threads`, `gpu_layers`, `extra_args`, and
+  `published` control registration. It saves settings without loading weights.
+  Published models appear as `unloaded` and load when a request reaches the host.
+- `POST /api/v1/managed-models/load` accepts the same fields and also loads the
+  weights immediately. New models require `published: true` to opt into sharing;
+  omitting it on an existing model preserves its sharing choice.
+- `POST /api/v1/managed-models/unload` frees the runner's loaded model while
+  preserving its on-demand availability. Disable or unpublish it to stop sharing.
 - Artifact deletion uses a trailing wildcard. Escape each path segment, preserving
   `/` separators. Discovered shared-cache files are refused with 403.
 - `GET /api/v1/metrics` is owner-authenticated **JSON**, not Prometheus exposition.
@@ -270,8 +274,9 @@ parameters, security overrides, and individual responses.
 | `GET` | `/api/v1/managed-models/downloads` | Download job status |
 | `POST` | `/api/v1/managed-models/downloads/{id}/cancel` | Cancel a download job |
 | `GET` | `/api/v1/managed-models/runner-health` | Runner companion status |
+| `POST` | `/api/v1/managed-models/prepare` | Prepare downloaded weights for on-demand hosting |
 | `POST` | `/api/v1/managed-models/load` | Load weights into the runner and advertise them |
-| `POST` | `/api/v1/managed-models/unload` | Unload the runner's model and withdraw its advertisement |
+| `POST` | `/api/v1/managed-models/unload` | Unload weights while retaining on-demand availability |
 | `GET` | `/api/v1/chats` | List conversations |
 | `POST` | `/api/v1/chats` | Create a conversation |
 | `GET` | `/api/v1/chats/{id}` | Read a conversation and its messages |
@@ -283,6 +288,7 @@ parameters, security overrides, and individual responses.
 | `POST` | `/api/v1/chats/{id}/messages/{msgID}/select` | Switch which alternative of a turn is visible |
 | `GET` | `/api/v1/community/channels` | List channels |
 | `POST` | `/api/v1/community/channels` | Create a channel |
+| `DELETE` | `/api/v1/community/channels/{id}` | Delete a channel |
 | `GET` | `/api/v1/community/channels/{id}/messages` | Read a channel |
 | `POST` | `/api/v1/community/channels/{id}/messages` | Post to a channel |
 | `POST` | `/api/v1/community/channels/{id}/read` | Update local read and mute state |

@@ -22,6 +22,10 @@ const (
 	// the same signed log as messages instead of existing only on the node
 	// that created it.
 	EventChannel EventType = "channel"
+	// EventChannelDelete withdraws a channel. It replicates like the
+	// announcement it undoes, so a channel deleted on one node disappears
+	// everywhere rather than lingering on every peer that saw it created.
+	EventChannelDelete EventType = "channel_delete"
 )
 
 type Event struct {
