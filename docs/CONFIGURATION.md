@@ -18,6 +18,7 @@ Source: [cmd/woolwire/main.go](../cmd/woolwire/main.go).
 | `-runner-token` | `WOOLWIRE_RUNNER_TOKEN` | Empty | App's bearer token for the configured runner |
 | `-allowed-hosts` | `WOOLWIRE_ALLOWED_HOSTS` | Empty | Comma-separated additional HTTP hostnames |
 | `-setup-token` | `WOOLWIRE_SETUP_TOKEN` | Empty | Explicit owner pairing secret, at least 12 characters |
+| `-version` | None | Off | Print the build version and exit |
 
 `-setup-token` is an owner recovery/bootstrap override: leaving it configured
 re-arms that same pairing secret on every process restart. Remove it after
@@ -45,6 +46,7 @@ Source: [cmd/woolwire-runner/main.go](../cmd/woolwire-runner/main.go).
 | `-token` | `RUNNER_TOKEN` | Empty; required | Bearer token on every runner route, including health |
 | `-engine-path` | `ENGINE_PATH` | `llama-server` | Engine executable; container sets `/app/llama-server` |
 | `-engine-port` | None | `8081` | Internal loopback engine port |
+| `-version` | None | Off | Print the build version and exit |
 
 The app uses `WOOLWIRE_RUNNER_TOKEN`; the runner uses `RUNNER_TOKEN`. They must
 contain the same value. The runner accepts load parameters through its API,
