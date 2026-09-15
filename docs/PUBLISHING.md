@@ -1,8 +1,9 @@
 # Publication checklist
 
 The repository can be prepared for public review before claiming a production
-release. This checklist records the remaining decisions and verification; it
-does not mean the repository has been pushed, made public, or tagged.
+release. This checklist records the decisions and verification behind that.
+The repository was made public on September 15, 2026, and the post-publication
+settings below were enabled the same day; it has not been tagged or released.
 
 ## Repository preparation
 
@@ -50,8 +51,9 @@ holds rewrite leftovers should not be pushed with `git push --all` or
 
 ## After making the repository public
 
-These settings do not exist on a private repository, so they can only be turned
-on once the repository is public. Do them in this order.
+These settings do not exist on a private repository, so they could only be
+turned on once the repository was public. They were done in this order on
+September 15, 2026, and each was read back to confirm it took effect.
 
 1. **Private vulnerability reporting.** Settings → Advanced Security → Private
    vulnerability reporting → Enable, or
