@@ -111,13 +111,22 @@ synthetic data for screenshots and fixtures.
   to a **draft** GitHub Release. Nothing is public at this point.
 - [ ] Review the draft and publish it from the GitHub UI. Publishing runs
   [`.github/workflows/images.yml`](../.github/workflows/images.yml), which
-  builds and pushes both container images to `ghcr.io/<owner>/woolwire` and
-  `ghcr.io/<owner>/woolwire-runner`, tagged `X.Y.Z`, `X.Y`, and (for a
-  non-prerelease) `latest`. Deleting the draft instead leaves nothing in the
+  builds and pushes both container images to `ghcr.io/<owner>/woolwire`
+  (linux/amd64 and linux/arm64) and `ghcr.io/<owner>/woolwire-runner`
+  (linux/amd64; its CUDA base has no arm64 build), tagged `X.Y.Z`, `X.Y`, and
+  (for a non-prerelease) `latest`. The Compose profiles and the README quick
+  start pull the `X.Y` tag, so bump their default when a new minor version is
+  released. Deleting the draft instead leaves nothing in the
   registry. Publish by hand: a release published with a workflow's own
   `GITHUB_TOKEN` does not trigger other workflows.
 - [ ] After the first image push, confirm both GHCR packages are public and
   linked to this repository.
+
+The pipeline was first exercised with `v0.0.0-rc1` on September 15, 2026: the
+tag gate, CI, all five binary builds, and the draft release succeeded; the
+downloaded assets matched `SHA256SUMS.txt` and reported the tagged version; and
+publishing the draft as a prerelease pushed both images, which anonymous pulls
+confirmed are public.
 
 Neither workflow triggers between releases, so they cost nothing then; on a
 public repository they cost nothing at all (unlimited Actions minutes and

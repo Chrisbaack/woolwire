@@ -1,8 +1,9 @@
 services:
   woolwire:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
+    # The published image. WOOLWIRE_IMAGE_TAG picks a release (X.Y follows
+    # patch releases within that minor version, X.Y.Z pins one). To build from
+    # a checkout instead, add compose.source.yaml: see that file.
+    image: ghcr.io/chrisbaack/woolwire:${WOOLWIRE_IMAGE_TAG:-0.1}
     container_name: woolwire-app
     # Default to 127.0.0.1:7070 for loopback isolation.
     # Set WOOLWIRE_HOST_PORT=0.0.0.0:7070 (or edit directly) to allow LAN device access.

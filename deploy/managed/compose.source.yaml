@@ -1,0 +1,26 @@
+# Build this profile from the checkout instead of pulling published images.
+# Layer it over compose.yaml, keeping compose.yaml first so the project name,
+# and with it the named volumes, stays the same:
+#
+#   docker compose --env-file deploy/managed/.env -f deploy/managed/compose.yaml -f deploy/managed/compose.source.yaml up -d --build
+#
+# Local builds are tagged :local so they are never mistaken for, or pushed
+# over, a published ghcr.io image. WOOLWIRE_VERSION sets the version they
+# report (default "dev"). scripts/build.sh uses this file and sets it.
+
+services:
+  woolwire:
+    image: woolwire:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${WOOLWIRE_VERSION:-dev}
+
+  runner:
+    image: woolwire-runner:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile.runner
+      args:
+        VERSION: ${WOOLWIRE_VERSION:-dev}
