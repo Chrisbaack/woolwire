@@ -12,7 +12,7 @@ an actual generated SBOM.
 | Go | [go.mod](../go.mod), `go 1.27.1` | Backend and controller toolchain |
 | Tailcat | `github.com/tailscale/tailcat v0.6.0` in go.mod | Peer transport |
 | SQLite driver | `modernc.org/sqlite v1.58.0` in go.mod | Embedded pure-Go SQLite |
-| x/crypto | `golang.org/x/crypto v0.55.0` in go.mod | Backup encryption/key derivation |
+| x/crypto | `golang.org/x/crypto v0.56.0` in go.mod | Backup encryption/key derivation |
 | x/term | `golang.org/x/term v0.45.0` in go.mod | Interactive backup decryption prompt |
 | React / React DOM | `18.3.1` in [package-lock.json](../web/package-lock.json) | UI |
 | Vite | `5.4.21` in package-lock.json | Frontend build |
