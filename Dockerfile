@@ -28,6 +28,6 @@ WORKDIR /home/woolwire
 
 COPY --from=go-builder /app/bin/woolwire /usr/local/bin/woolwire
 
-EXPOSE 7070 4242
+EXPOSE 7070
 ENTRYPOINT ["/usr/local/bin/woolwire"]
 CMD ["-listen", "0.0.0.0:7070", "-state", "/state"]

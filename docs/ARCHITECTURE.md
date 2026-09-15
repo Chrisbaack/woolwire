@@ -36,7 +36,7 @@ See [the standalone diagram](architecture.svg) and [editable Mermaid source](arc
 
 Tailcat documents account-free userspace operation, saved keys, direct encrypted connections, DERP fallback, and configurable relays. Those are transport capabilities, not room membership or administration. Woolwire implements the latter. The first milestone verifies the exact pinned library API and behavior inside a container before dependent implementation. Podman is the accepted validation runtime; a separate Docker Engine/Desktop run is not required for M0. [Tailcat README](https://github.com/tailscale/tailcat/blob/main/README.md)
 
-DERP operators can observe connection metadata even though application traffic is encrypted. Public relays have capacity limits; expose a custom relay setting in advanced configuration and qualify the relay used for any pilot. No promise of anonymity or public relay service availability. [Tailcat service description](https://tailscale.com/tailcat)
+DERP operators can observe connection metadata even though application traffic is encrypted. Public relays have capacity limits; expose a custom relay setting in advanced configuration and qualify the relay used for any pilot. That setting is not implemented as of September 2026; see [STATUS.md](STATUS.md). No promise of anonymity or public relay service availability. [Tailcat service description](https://tailscale.com/tailcat)
 
 ## 3. Joining, identity and discovery
 
@@ -127,7 +127,7 @@ Contribution receipts are jointly signed by requester and host, with a random re
 - The local UI requires local-owner authentication. Bootstrap with a one-time setup secret shown locally, exchange it for an HttpOnly SameSite session cookie, then invalidate it. Pin Host/Origin, check CSRF and avoid permissive CORS. Bootstrap secrets are the exception to ordinary secret-free logs and must be printed only in the explicitly local setup output, never shared telemetry.
 - Local-owner and peer HTTP routers use distinct listeners. Room-admin methods additionally check possession of the creator authority; UI hiding is not authorization.
 - Sanitize Markdown; disable raw HTML, remote image loading and executable tool output. No shell/tool execution, MCP, browsing, attachments or arbitrary file fetches in v1.
-- Rate-limit bootstrap, peer sessions, requests, event synchronization and downloads. Bound decoded message size, queue size, fan-out, stream duration and storage before costly work.
+- Rate-limit bootstrap, peer sessions, requests, event synchronization and downloads. Only the owner setup-secret exchange has an attempt limiter as of September 2026; see [STATUS.md](STATUS.md). Bound decoded message size, queue size, fan-out, stream duration and storage before costly work.
 - Protect persisted keys through filesystem permissions and encrypted backups; recommend host full-disk encryption. Disable telemetry and payload-bearing crash dumps by default; do not claim that app file permissions protect against host administrators.
 - Pin reviewed dependencies and images, publish signed artifacts and an SBOM, scan advisories, and provide backup/rollback instructions. Tailcat is a deliberate early dependency; do not silently substitute a different transport if validation fails.
 

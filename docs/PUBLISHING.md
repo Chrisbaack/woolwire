@@ -41,10 +41,12 @@ Hugging Face and Tailscale key formats, PEM private key blocks, and quoted
 credential assignments (all hits are documentation snippets that generate a
 random token, or test fixtures such as `runner-token`); long hex strings (all
 synthetic digests in tests); and embedded PNG metadata in the screenshot (no
-text or EXIF chunks). Author identities were rewritten before publication;
-`refs/heads/backup/wrong-author-email` and `refs/original/refs/heads/master`
-still point at the pre-rewrite chain locally. Delete them before any
-`git push --all` or `--mirror`, or push only `main`.
+text or EXIF chunks). Author identities were rewritten before publication, and
+the backup and `refs/original/` refs the rewrite left behind were deleted
+afterwards, so there is nothing left to hunt for: `git for-each-ref` lists only
+`main` and its remote counterparts. As general practice, a checkout that still
+holds rewrite leftovers should not be pushed with `git push --all` or
+`--mirror`, which would publish them; push only `main`.
 
 ## After making the repository public
 

@@ -47,18 +47,20 @@ graph TD
     G --> H[ArtifactManager.StartDownload with verified SHA256]
 ```
 
-#### Curated Model Catalog Tiering (September 2026 SOTA):
+#### Curated Model Catalog Tiering:
 1. **Lightweight & Fast (Edge / CPU / 4GB-8GB RAM)**:
-   * **Ministral 3 3B Instruct** (`Q4_K_M`, ~2.1 GB) — Mistral AI ultra-efficient edge architecture for fast, low-latency assistance.
-   * **Ornith 1.5 9B Instruct** (`Q4_K_M`, ~5.8 GB) — High-efficiency dense 9B workhorse beating previous-gen 14B models on consumer hardware.
+   * A small instruct model (`Q4_K_M`, ~2-4 GB) — fast, low-latency assistance on a CPU-only machine.
+   * A mid-small dense instruct model (`Q4_K_M`, ~5-7 GB) — the largest that still leaves room for the rest of a desktop's memory use.
 2. **Standard & High-Capability Workhorses (8GB-16GB RAM / 8GB-16GB VRAM)**:
-   * **Ministral 3 14B Instruct** (`Q4_K_M`, ~8.2 GB) — Specialized for multi-step agentic workflows and advanced programming.
-   * **DeepSeek-V4 Flash 0731** (`Q8_0`, ~10.9 GB) — DeepSeek V4 Flash generation with native chain-of-thought logic.
-   * **Qwen3.8 27B Instruct** (`UD-Q4_K_M`, ~16.5 GB) — The open-weight dense SOTA benchmark leader with 10M+ downloads, featuring unsloth dynamic quants.
+   * A mid-size instruct model (`Q4_K_M`, ~8-11 GB) — general chat and coding at full GPU offload on a 12-16 GB card.
+   * A reasoning-oriented model at a higher quantization (`Q8_0`, ~10-12 GB) — chain-of-thought quality where the weights still fit.
+   * A larger dense instruct model (`Q4_K_M`, ~14-17 GB) — the top of what a 16 GB card holds with its KV cache.
 3. **MoE & High-VRAM Flagships (24GB+ VRAM / 32GB-64GB+ RAM)**:
-   * **Ornith 1.5 35B (A3B)** (`Q4_K_M`, ~21.7 GB) — Breakthrough 35B MoE with 3B active parameters (A3B); ultra-fast generation with 35B reasoning depth.
-   * **Qwen3.8 Flash Next** (`Q3_K_XL`, ~64.8 GB) — Next-gen 131B MoE with 6B active parameters (A6B) providing frontier-grade intelligence.
-   * **GLM 5.3 Flash** (`REAP50-IQ3_M`, ~72.1 GB) — Zhipu AI open-weight flagship multimodal & reasoning architecture with 131k context.
+   * A sparse MoE model with a small active-parameter count (`Q4_K_M`, ~20-24 GB) — small-model generation speed with a larger model's depth.
+   * A large MoE model at a low-bit quantization (~60-70 GB) — frontier-scale capability for a workstation with large system RAM.
+   * A long-context flagship at a low-bit quantization (~70+ GB) — needs multiple GPUs or heavy CPU offload.
+
+These entries are placeholders describing the shape of each tier, not a shipping list. The actual catalog — specific repositories, quantizations, file sizes, and SHA-256 digests — would be chosen and verified against live Hugging Face releases at implementation time.
 
 ### 2.3 Dynamic Hardware & Memory Fit Estimator ("Will It Run?")
 Using the existing [hosting.HardwareProfile](../internal/hosting/hardware.go) (`total_ram_mb`, `has_nvidia_gpu`, `gpu_name`):

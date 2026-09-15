@@ -31,6 +31,15 @@ multiple rooms per installation, and automatic administrator succession are
 not current public interfaces. The host-limit record exposes queue and timeout
 settings, not schedules or a full resource-policy engine.
 
+Two controls described in [the architecture reference](ARCHITECTURE.md) are not
+implemented. There is no custom DERP relay setting: the transport uses the
+default DERP map and pins whatever region it resolved into the stored address,
+which is also what the invitation code carries. Rate limiting exists only on the
+owner setup-secret exchange, which backs off failed attempts and answers 429
+with `Retry-After`; bootstrap join, peer synchronization, and downloads rely on
+request-body caps, server read timeouts, and a 32-byte random admission secret
+rather than an attempt limiter.
+
 Context and generation statistics include approximations. No-save mode prevents
 transcript-body writes by Woolwire but does not hide a request from its selected
 host or impose retention on external servers.
