@@ -3,17 +3,44 @@ name: Release
 # Runs only for an actual release tag (vX.Y.Z), never on ordinary pushes or
 # pull requests, so it costs nothing between releases. See
 # docs/PUBLISHING.md before pushing the first tag.
+#
+# A tag produces a **draft** GitHub Release and nothing else. Container images
+# are pushed by images.yml only once that draft is published, so a discarded
+# draft leaves nothing public behind.
 on:
   push:
     tags:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  on-main:
+    name: Tag is on main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # A tag can be pushed on any commit, including one from a branch that
+      # never passed review. Only release what main already contains.
+      - name: Tagged commit is reachable from main
+        run: |
+          commit=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points at ${commit}, which is not on main."
+            exit 1
+          fi
+
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
   binaries:
     name: Build binaries (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: [on-main, ci]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -41,13 +68,26 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           ext=""
           [ "$GOOS" = "windows" ] && ext=".exe"
+          ldflags="-s -w -X github.com/Chrisbaack/woolwire/internal/buildinfo.version=${VERSION}"
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o "dist/woolwire-${GOOS}-${GOARCH}${ext}" ./cmd/woolwire
-          go build -trimpath -ldflags="-s -w" -o "dist/woolwire-runner-${GOOS}-${GOARCH}${ext}" ./cmd/woolwire-runner
+          go build -trimpath -ldflags="$ldflags" -o "dist/woolwire-${GOOS}-${GOARCH}${ext}" ./cmd/woolwire
+          go build -trimpath -ldflags="$ldflags" -o "dist/woolwire-runner-${GOOS}-${GOARCH}${ext}" ./cmd/woolwire-runner
+
+      # The runner can execute the binaries built for its own platform, so
+      # check the stamp actually took on those.
+      - name: Version stamp
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          set -euo pipefail
+          for cmd in woolwire woolwire-runner; do
+            got=$("dist/${cmd}-linux-amd64" -version)
+            [ "$got" = "${cmd} ${GITHUB_REF_NAME}" ] || { echo "::error::${cmd} reports '${got}'"; exit 1; }
+          done
 
       - name: Checksums
         working-directory: dist
@@ -59,9 +99,11 @@ jobs:
           path: dist/*
 
   release:
-    name: Publish release
+    name: Draft release
     needs: binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -79,43 +121,3 @@ jobs:
           draft: true
           files: dist/*
           generate_release_notes: true
-
-  images:
-    name: Build and push container images
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      matrix:
-        include:
-          - image: woolwire
-            dockerfile: Dockerfile
-          - image: woolwire-runner
-            dockerfile: Dockerfile.runner
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/metadata-action@v6
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-
-      - uses: docker/setup-buildx-action@v4
-
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}

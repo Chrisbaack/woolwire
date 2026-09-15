@@ -102,15 +102,26 @@ synthetic data for screenshots and fixtures.
 - [ ] Review dependency/model licenses and current vulnerability advisories.
 - [ ] Choose a release version, build immutable artifacts, record checksums and
   provenance, and publish release notes describing tested scope and limitations.
-- [ ] Push a `vX.Y.Z` tag to run [`.github/workflows/release.yml`](../.github/workflows/release.yml),
-  which cross-builds both binaries for linux/darwin/windows on amd64/arm64,
-  attaches them with a combined `SHA256SUMS.txt` to a **draft** GitHub Release
-  for review before publishing, and builds and pushes both container images to
-  `ghcr.io/<owner>/woolwire` and `ghcr.io/<owner>/woolwire-runner`. It only
-  triggers on a version tag, so it costs nothing between releases; on a public
-  repository it costs nothing at all (unlimited Actions minutes and Packages
-  storage). On a private repository it draws from the free plan's 2,000
-  minutes/month and 500MB Packages storage.
+- [ ] Push a `vX.Y.Z` tag on a commit already on `main` to run
+  [`.github/workflows/release.yml`](../.github/workflows/release.yml). It
+  refuses a tag that is not on `main`, reruns the full
+  [CI workflow](../.github/workflows/ci.yml) on the tagged commit, cross-builds
+  both binaries for linux/darwin/windows on amd64/arm64 with the tag stamped
+  in (`woolwire -version`), and attaches them with a combined `SHA256SUMS.txt`
+  to a **draft** GitHub Release. Nothing is public at this point.
+- [ ] Review the draft and publish it from the GitHub UI. Publishing runs
+  [`.github/workflows/images.yml`](../.github/workflows/images.yml), which
+  builds and pushes both container images to `ghcr.io/<owner>/woolwire` and
+  `ghcr.io/<owner>/woolwire-runner`, tagged `X.Y.Z`, `X.Y`, and (for a
+  non-prerelease) `latest`. Deleting the draft instead leaves nothing in the
+  registry. Publish by hand: a release published with a workflow's own
+  `GITHUB_TOKEN` does not trigger other workflows.
+- [ ] After the first image push, confirm both GHCR packages are public and
+  linked to this repository.
+
+Neither workflow triggers between releases, so they cost nothing then; on a
+public repository they cost nothing at all (unlimited Actions minutes and
+Packages storage).
 
 [STATUS.md](STATUS.md) is the source for current validation claims.
 [SBOM.md](SBOM.md) is a dependency inventory, not a generated, complete SBOM or

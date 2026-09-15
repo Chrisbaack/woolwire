@@ -4,10 +4,14 @@ name: CI
 # default branch and every pull request. Real-network acceptance
 # (test/integration) is deliberately excluded: it needs public relay
 # infrastructure and minutes, and is run deliberately, not per commit.
+#
+# The release workflow also calls this one, so a tag cannot publish anything
+# the contributor checks would have rejected.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
