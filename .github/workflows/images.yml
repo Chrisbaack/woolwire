@@ -23,10 +23,15 @@ jobs:
     strategy:
       matrix:
         include:
+          # The app is pure Go, so it ships for both architectures and Apple
+          # Silicon hosts run it natively. The runner is built on the CUDA
+          # llama.cpp image, which is amd64-only.
           - image: woolwire
             dockerfile: Dockerfile
+            platforms: linux/amd64,linux/arm64
           - image: woolwire-runner
             dockerfile: Dockerfile.runner
+            platforms: linux/amd64
     steps:
       - uses: actions/checkout@v7
         with:
@@ -63,12 +68,17 @@ jobs:
             type=semver,pattern={{version}},value=${{ github.event.release.tag_name }}
             type=semver,pattern={{major}}.{{minor}},value=${{ github.event.release.tag_name }}
 
+      # Only the final stage of a foreign platform is emulated; the Dockerfile
+      # cross-compiles everything else on the runner's own architecture.
+      - uses: docker/setup-qemu-action@v4
+
       - uses: docker/setup-buildx-action@v4
 
       - uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
           push: true
           build-args: |
             VERSION=${{ github.event.release.tag_name }}
