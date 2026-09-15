@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/Chrisbaack/woolwire/internal/buildinfo"
 	"github.com/Chrisbaack/woolwire/internal/runner"
 )
 
@@ -24,7 +25,13 @@ func main() {
 	runnerToken := flag.String("token", getEnv("RUNNER_TOKEN", ""), "authentication token for runner controller")
 	enginePath := flag.String("engine-path", getEnv("ENGINE_PATH", "llama-server"), "path to llama-server binary")
 	enginePort := flag.Int("engine-port", 8081, "port for internal llama-server")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("woolwire-runner %s\n", buildinfo.Version())
+		return
+	}
 
 	if *modelsDir == "" {
 		fmt.Fprintf(os.Stderr, "models directory is required\n")
@@ -56,7 +63,7 @@ func main() {
 	}
 	defer l.Close()
 
-	fmt.Printf("Woolwire Runner Controller listening on %s (models: %s)\n", *listenAddr, *modelsDir)
+	fmt.Printf("Woolwire Runner Controller %s listening on %s (models: %s)\n", buildinfo.Version(), *listenAddr, *modelsDir)
 
 	go func() {
 		if err := ctrl.Serve(l); err != nil {

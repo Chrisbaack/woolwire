@@ -37,6 +37,8 @@
 #
 # Environment:
 #   WOOLWIRE_PROFILE   same as --profile
+#   WOOLWIRE_VERSION   version stamped into release and share binaries
+#                      (default: git describe --tags --always --dirty)
 
 set -euo pipefail
 
@@ -87,13 +89,20 @@ out_name() {
 	printf '%s-%s-%s%s' "$cmd" "$goos" "$goarch" "$ext"
 }
 
+# The version stamped into what ships. Host-native builds are not stamped:
+# Go already records the checkout's commit as a pseudo-version, which is what
+# -version reports for them.
+version=${WOOLWIRE_VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
+version_pkg=github.com/Chrisbaack/woolwire/internal/buildinfo
+
 build_go() { # build_go <cmd> <output path> [GOOS] [GOARCH]
 	local cmd=$1 out=$2 goos=${3:-} goarch=${4:-}
 	# -trimpath everywhere so the binary does not carry this machine's paths;
-	# -s -w only for what ships, matching the release workflow.
+	# -s -w and the version stamp only for what ships, matching the release
+	# workflow.
 	if [ -n "$goos" ]; then
 		CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch \
-			go build -trimpath -ldflags="-s -w" -o "$out" "./cmd/$cmd"
+			go build -trimpath -ldflags="-s -w -X $version_pkg.version=$version" -o "$out" "./cmd/$cmd"
 	else
 		CGO_ENABLED=0 go build -trimpath -o "$out" "./cmd/$cmd"
 	fi
@@ -187,7 +196,7 @@ target_stack() {
 }
 
 target_release() {
-	say "Cross-compiling release binaries into dist/"
+	say "Cross-compiling release binaries ($version) into dist/"
 	# Clear only what this target owns. dist/share is a separate bundle and a
 	# blanket rm here would quietly delete it.
 	rm -f dist/woolwire-* dist/SHA256SUMS*.txt

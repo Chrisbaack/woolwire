@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Chrisbaack/woolwire/internal/buildinfo"
 	"github.com/Chrisbaack/woolwire/internal/identity"
 	"github.com/Chrisbaack/woolwire/internal/localapi"
 	"github.com/Chrisbaack/woolwire/internal/peerapi"
@@ -129,7 +130,13 @@ func main() {
 	runnerToken := flag.String("runner-token", getEnv("WOOLWIRE_RUNNER_TOKEN", ""), "runner authorization token")
 	allowedHostsStr := flag.String("allowed-hosts", getEnv("WOOLWIRE_ALLOWED_HOSTS", ""), "comma-separated extra allowed hostnames for local API")
 	setupTokenFlag := flag.String("setup-token", getEnv("WOOLWIRE_SETUP_TOKEN", ""), "custom setup secret (optional, minimum 12 characters)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("woolwire %s\n", buildinfo.Version())
+		return
+	}
 
 	if err := os.MkdirAll(*stateDir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create state dir: %v\n", err)
@@ -221,7 +228,7 @@ func main() {
 	}
 
 	fmt.Printf("\n======================================================\n")
-	fmt.Printf("Woolwire started successfully!\n")
+	fmt.Printf("Woolwire %s started successfully!\n", buildinfo.Version())
 	fmt.Printf("Web Interface: http://%s\n", *listenAddr)
 	fmt.Printf("Transport Address: %s\n", trans.Address())
 	if freshSecret != "" {
