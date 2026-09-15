@@ -1,24 +1,29 @@
 # Getting started
 
-Woolwire runs one app per participant. All commands below start in the repository
-root unless a `cd` is shown. Container examples build local images; they do not
-assume a published image or binary release exists.
+Woolwire runs one app per participant. Container examples run the published
+images from `ghcr.io/chrisbaack`; [building them from source](#building-images-from-source)
+is covered separately. Commands start in the repository root unless a `cd` is
+shown, except the [single container](#single-container) route, which needs no
+checkout at all.
 
 ## Prerequisites
 
 | Route | Requirements |
 |---|---|
-| Base container | Git; Docker with Compose or Podman with a Compose provider; persistent disk space |
-| Managed container | Base requirements plus RAM for your chosen model; NVIDIA driver and Container Toolkit for the supplied GPU reservation |
+| Single container | Docker or Podman on linux/amd64 or linux/arm64 (Docker Desktop on Apple Silicon included); persistent disk space |
+| Base Compose | Git; Docker with Compose or Podman with a Compose provider; persistent disk space |
+| Managed Compose | Base requirements on **amd64** (the CUDA runner image has no arm64 build), RAM for your chosen model, and the NVIDIA driver and Container Toolkit for the supplied GPU reservation |
 | Native source build | Git, Go **1.27.1** (see `go.mod`), Node.js **22.6+**, npm |
 | Native managed runner | Native build requirements plus your own working `llama-server` executable |
 
-Initial builds fetch Go/npm dependencies and base images. App startup initializes
+The first start pulls the images: under 20 MB to download for the app, and several GB for
+the managed runner's CUDA image. App startup initializes
 Tailcat and needs access to its rendezvous/DERP services, even if you intend to
 start by using a local model. See [networking](M0_NETWORKING.md) for the transport
 background. A host GPU is optional when requesting models from friends.
 
-Clone once:
+The Compose profiles and example environment files live in the repository, so
+clone once:
 
 ```sh
 git clone https://github.com/Chrisbaack/woolwire.git
@@ -30,7 +35,7 @@ cd woolwire
 ### Docker
 
 ```sh
-docker compose -f deploy/base/compose.yaml up -d --build
+docker compose -f deploy/base/compose.yaml up -d
 docker compose -f deploy/base/compose.yaml logs -f woolwire
 ```
 
@@ -46,7 +51,7 @@ To customize the published address, copy `deploy/base/.env.example` to
 `deploy/base/.env`, edit it, and pass it explicitly:
 
 ```sh
-docker compose --env-file deploy/base/.env -f deploy/base/compose.yaml up -d --build
+docker compose --env-file deploy/base/.env -f deploy/base/compose.yaml up -d
 ```
 
 ### Podman
@@ -55,7 +60,7 @@ docker compose --env-file deploy/base/.env -f deploy/base/compose.yaml up -d --b
 such as `podman-compose` first, then use:
 
 ```sh
-podman compose -f deploy/base/compose.yaml up -d --build
+podman compose -f deploy/base/compose.yaml up -d
 podman compose -f deploy/base/compose.yaml logs -f woolwire
 ```
 
@@ -79,7 +84,8 @@ if you have already started the stack without it.
 ## Managed Compose
 
 This starts the app plus an isolated runner. The supplied profile requests an
-NVIDIA GPU and builds a CUDA-based llama.cpp image. Configure the host using
+NVIDIA GPU and pulls the CUDA-based llama.cpp runner image, which is published
+for amd64 only. Configure the host using
 [NVIDIA's Container Toolkit documentation](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 and [Docker's GPU Compose guide](https://docs.docker.com/compose/how-tos/gpu-support/).
 
@@ -107,7 +113,7 @@ collection world-writable to work around an ownership mismatch.
 ### Start and load a model
 
 ```sh
-docker compose --env-file deploy/managed/.env -f deploy/managed/compose.yaml up -d --build
+docker compose --env-file deploy/managed/.env -f deploy/managed/compose.yaml up -d
 docker compose --env-file deploy/managed/.env -f deploy/managed/compose.yaml logs -f woolwire runner
 ```
 
@@ -141,7 +147,7 @@ In the copy, remove the runner's `deploy.resources.reservations` block containin
 `deploy.resources.limits`. Then start with:
 
 ```sh
-docker compose --env-file deploy/managed/.env -f deploy/managed/compose.cpu.local.yaml up -d --build
+docker compose --env-file deploy/managed/.env -f deploy/managed/compose.cpu.local.yaml up -d
 ```
 
 The CUDA image can fall back to CPU when no GPU is exposed, but the unmodified
@@ -168,23 +174,52 @@ your host; they are not recorded as a tested hardware matrix.
 
 ## Single container
 
-Build and run the base image directly with Docker:
+Run the published base image directly. No checkout is needed:
 
 ```sh
-docker build -t woolwire:local .
-docker volume create woolwire_state
-docker run -d --name woolwire-app \
+docker run -d --name woolwire-app --restart unless-stopped \
   -p 127.0.0.1:7070:7070 \
   -v woolwire_state:/state \
   --security-opt no-new-privileges=true \
-  woolwire:local
+  ghcr.io/chrisbaack/woolwire:0.1
 docker logs -f woolwire-app
 ```
 
-Use `podman` in place of `docker` for an equivalent base-container workflow.
-Stop/start this container with `docker stop woolwire-app` and
-`docker start woolwire-app`. For managed hosting, prefer the Compose profile,
-which defines the runner's separate network, token, and model mount.
+This is the [README quick start](../README.md#quick-start) with the
+`no-new-privileges` hardening the Compose profiles also apply. Use `podman` in
+place of `docker` for the same workflow; the named volume is created owned by
+the container user, so rootless Podman needs no UID mapping here. Stop and start
+the container with `docker stop woolwire-app` and `docker start woolwire-app`.
+
+`:0.1` follows patch releases of 0.1, `:0.1.0` pins exactly one release, and
+`:latest` follows the newest release of any version. To upgrade, pull and
+recreate the container; the `woolwire_state` volume carries your data across:
+
+```sh
+docker pull ghcr.io/chrisbaack/woolwire:0.1
+docker rm -f woolwire-app
+# then rerun the docker run command above
+```
+
+For managed hosting, prefer the Compose profile, which defines the runner's
+separate network, token, and model mount.
+
+## Building images from source
+
+Each Compose profile has a `compose.source.yaml` that builds the images from
+your checkout (tagged `woolwire:local` and `woolwire-runner:local`) instead of
+pulling them. Layer it after `compose.yaml` so the project name, and with it
+your named volumes, stays the same:
+
+```sh
+docker compose -f deploy/base/compose.yaml -f deploy/base/compose.source.yaml up -d --build
+docker compose --env-file deploy/managed/.env \
+  -f deploy/managed/compose.yaml -f deploy/managed/compose.source.yaml up -d --build
+```
+
+`scripts/build.sh stack` does this for you. For a single container, build with
+`docker build -t woolwire:local .` and run `woolwire:local` in place of the
+published image name.
 
 ## Native binary
 
@@ -319,8 +354,10 @@ For a base installation:
 docker compose -f deploy/base/compose.yaml stop
 # Restart the existing containers:
 docker compose -f deploy/base/compose.yaml start
-# After reviewing and updating your source checkout:
-docker compose -f deploy/base/compose.yaml up -d --build
+# Upgrade: pull the newest image for your tag, then recreate the container.
+git pull
+docker compose -f deploy/base/compose.yaml pull
+docker compose -f deploy/base/compose.yaml up -d
 ```
 
 For managed hosting, use the same commands with
@@ -328,9 +365,17 @@ For managed hosting, use the same commands with
 retain their saved load settings across restarts. Weights load on the next
 request, so restarting the runner does not require keeping GPU memory occupied.
 
+The profiles default to the `0.1` tag, which follows patch releases. To move to
+a new minor version, or to pin an exact one such as `0.1.0`, set
+`WOOLWIRE_IMAGE_TAG` in the profile's `.env`. If you built from source, upgrade
+with the [source build](#building-images-from-source) command after updating
+your checkout.
+
 Take a [backup](BACKUP_RESTORE.md) before an upgrade. `down` removes containers
-and networks; `down --volumes` also removes named data volumes. Retain the old
-source/image and matching backup for rollback; database migration downgrade is
-not a supported operation.
+and networks; `down --volumes` also removes named data volumes. For rollback,
+keep the backup together with the exact version you upgraded from, and set
+`WOOLWIRE_IMAGE_TAG` back to it; database migration downgrade is not a
+supported operation, so restore that backup rather than running old code on a
+migrated database.
 
 [Configuration reference](CONFIGURATION.md) · [Troubleshooting](TROUBLESHOOTING.md)

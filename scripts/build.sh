@@ -16,8 +16,11 @@
 #              release produce the same file names.
 #
 # Container images are not written to any of those. They are built by the
-# compose profile itself from the Dockerfiles, which compile their own copies
-# of the web bundle and the binaries inside the image.
+# compose profile from the Dockerfiles, which compile their own copies of the
+# web bundle and the binaries inside the image. The profile's compose.yaml
+# alone pulls published images; this script always layers compose.source.yaml
+# over it, so the stack it restarts runs what this checkout builds (tagged
+# :local).
 #
 # Usage:
 #   scripts/build.sh                 web + binaries + images + restart the stack
@@ -89,9 +92,10 @@ out_name() {
 	printf '%s-%s-%s%s' "$cmd" "$goos" "$goarch" "$ext"
 }
 
-# The version stamped into what ships. Host-native builds are not stamped:
-# Go already records the checkout's commit as a pseudo-version, which is what
-# -version reports for them.
+# The version stamped into what ships and into locally built images.
+# Host-native builds are not stamped: Go already records the checkout's commit
+# as a pseudo-version, which is what -version reports for them. Images cannot
+# do that, because .git is not in their build context.
 version=${WOOLWIRE_VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
 version_pkg=github.com/Chrisbaack/woolwire/internal/buildinfo
 
@@ -131,6 +135,7 @@ target_binaries() {
 compose_dir() {
 	local dir="deploy/$profile"
 	[ -f "$dir/compose.yaml" ] || die "no compose profile at $dir (expected deploy/<name>/compose.yaml)"
+	[ -f "$dir/compose.source.yaml" ] || die "no source build override at $dir/compose.source.yaml"
 	printf '%s' "$dir"
 }
 
@@ -142,7 +147,7 @@ compose_dir() {
 compose() {
 	local dir
 	dir=$(compose_dir)
-	(cd "$dir" && "${compose_cmd[@]}" "$@")
+	(cd "$dir" && WOOLWIRE_VERSION=$version "${compose_cmd[@]}" -f compose.yaml -f compose.source.yaml "$@")
 }
 
 resolve_compose() {

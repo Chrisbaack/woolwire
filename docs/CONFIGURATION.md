@@ -59,6 +59,7 @@ hardware-based selection; `0` requests CPU execution.
 |---|---|---|---|
 | `WOOLWIRE_HOST_PORT` | Base, managed | `127.0.0.1:7070` | Host IP and port mapped to container `7070` |
 | `WOOLWIRE_RUNNER_TOKEN` | Managed | Required | Interpolated into both services' respective token variables |
+| `WOOLWIRE_IMAGE_TAG` | Base, managed | `0.1` | Published image tag for the app and runner; ignored when building with `compose.source.yaml` |
 | `WOOLWIRE_MODELS` | Managed | `woolwire_models` named volume | Host model directory or volume source |
 | `WOOLWIRE_USERNS_MODE` | Base, managed | unset | Container user-namespace mode. Rootless Podman needs `keep-id:uid=1000,gid=1000` to reach a state volume or models directory owned by your account; leave unset for Docker |
 

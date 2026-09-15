@@ -36,23 +36,24 @@ inference traffic.
 [Feature guide](docs/FEATURES.md) · [Getting started](docs/GETTING_STARTED.md) ·
 [API reference](docs/API.md) · [All documentation](docs/README.md)
 
-## Quick start: Docker Compose
+## Quick start
 
-This builds the app from source. You do not need Go, Node.js, or a GPU on the
-host for the base container installation. You do need Git, Docker Engine or
-Docker Desktop with Compose, and outbound access for dependency downloads and
-Tailcat connectivity.
+One line, with Docker:
 
 ```sh
-git clone https://github.com/Chrisbaack/woolwire.git
-cd woolwire
-docker compose -f deploy/base/compose.yaml up -d --build
-docker compose -f deploy/base/compose.yaml logs woolwire
+docker run -d --name woolwire-app --restart unless-stopped -p 127.0.0.1:7070:7070 -v woolwire_state:/state ghcr.io/chrisbaack/woolwire:0.1 && docker logs -f woolwire-app
 ```
 
-1. Open **http://127.0.0.1:7070**.
-2. Enter the **one-time setup secret** from the first-start logs. Keep those logs
-   private; the secret gives owner access until redeemed.
+That pulls the published image, starts the app in the background, and follows
+its logs. Podman works the same with `podman` in place of `docker`. You do not
+need Git, Go, Node.js, or a GPU; you do need Docker or Podman on a 64-bit
+x86 or ARM machine (Apple Silicon included), and outbound access for Tailcat
+connectivity.
+
+1. Copy the **one-time setup secret** from the logs, then press Ctrl+C to stop
+   following them; the app keeps running. Keep those logs private; the secret
+   gives owner access until redeemed.
+2. Open **http://127.0.0.1:7070** and enter the secret.
 3. Choose a display name, then **Host a room** or **Join a room**.
 4. Select a model in **The Meadow**, or add one in **Settings**.
 
@@ -61,8 +62,14 @@ creator to be online. To pair another browser with *your installation*, use
 **Connect Device**; give friends the *room invitation* so they can join from
 their own installations.
 
-Stop with `docker compose -f deploy/base/compose.yaml down`. The state volume
-survives; adding `--volumes` deletes it.
+Stop with `docker stop woolwire-app` and start again with
+`docker start woolwire-app`. Your identity, rooms, and chats live in the
+`woolwire_state` volume, which survives removing the container;
+`docker volume rm woolwire_state` deletes them.
+
+`0.1` follows the latest 0.1.x release, and `latest` the newest release of
+any version. Compose profiles, model hosting, and upgrades are covered in
+[Getting started](docs/GETTING_STARTED.md).
 
 ## Choose how to run
 
@@ -70,7 +77,7 @@ survives; adding `--volumes` deletes it.
 |---|---|---|
 | Docker or Podman Compose, base | Request models from friends or connect an existing model server | [Base installation](docs/GETTING_STARTED.md#base-compose) |
 | Managed Compose, NVIDIA | Run GGUF weights in a companion container | [Managed installation](docs/GETTING_STARTED.md#managed-compose) |
-| Single container | Integrate Woolwire into your own container setup | [Container commands](docs/GETTING_STARTED.md#single-container) |
+| Single container | The quick start above, or your own container setup | [Container commands](docs/GETTING_STARTED.md#single-container) |
 | Native Go binary | Run without a container engine | [Build and run](docs/GETTING_STARTED.md#native-binary) |
 | Native app plus runner | Use a locally installed `llama-server`, including CPU inference | [Native runner](docs/GETTING_STARTED.md#native-runner) |
 | Development checkout | Change the Go backend or React UI | [Contributing](CONTRIBUTING.md) |
